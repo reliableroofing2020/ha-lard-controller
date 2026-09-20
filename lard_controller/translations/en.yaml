@@ -1,0 +1,45 @@
+configuration:
+  miner_url:
+    name: Miner URL
+    description: Braiins OS+ REST base (no trailing slash required). Default is the S19j Pro on the LAN.
+  poll_seconds:
+    name: Poll interval (seconds)
+    description: Main control loop period. Health is 200 while the last loop is newer than 2× this value.
+  board_wait_seconds:
+    name: Board wait (seconds)
+    description: How long to poll GET hashboards after a PATCH 200 (accepted, not applied). Minimum enforced wait is 60s.
+  ha_base_url:
+    name: Home Assistant URL
+    description: Leave empty to use the Supervisor proxy (http://supervisor/core). Set a URL only for local/dev.
+  enable_writes:
+    name: Enable Braiins writes
+    description: Leave false until recovery tests pass. Writes also require input_boolean.lard_board_priority_enable to be on.
+  power_target_w:
+    name: Power target (W)
+    description: Braiins floor used for all non-paused modes. v1 stays at 944 W.
+  braiins_username:
+    name: Braiins username
+    description: Usually root. Password is not stored in git — use this option, /data/secrets.json, or BRAIINS_PASSWORD.
+  braiins_password:
+    name: Braiins password
+    description: Miner login password. Prefer this secret field or /data/secrets.json. Never commit it.
+  ha_token:
+    name: Long-lived HA token
+    description: Only for local/dev. As an add-on, SUPERVISOR_TOKEN is used automatically.
+  mqtt_host:
+    name: MQTT broker host
+    description: Optional. Empty tries Supervisor Mosquitto discovery (mqtt:want), then falls back to HA REST entity writes.
+  mqtt_port:
+    name: MQTT port
+    description: Broker port when mqtt_host is set.
+  mqtt_username:
+    name: MQTT username
+    description: Optional broker user.
+  mqtt_password:
+    name: MQTT password
+    description: Optional broker password.
+  timezone:
+    name: Timezone
+    description: Used only for human log timestamps. Heartbeat last_seen is UTC ISO-8601.
+network:
+  8099/tcp: Health and status HTTP (no miner writes)

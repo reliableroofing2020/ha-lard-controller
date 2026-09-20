@@ -1,0 +1,3 @@
+# Stdlib covers HA REST, Braiins REST, and the health server.
+# paho-mqtt is optional MQTT discovery / LWT for heartbeat entities.
+paho-mqtt==2.1.0

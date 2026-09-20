@@ -1,0 +1,75 @@
+name: LARD Controller
+version: "0.1.0"
+slug: lard_controller
+description: >
+  Supervises the LARD board-priority Braiins actuator. Observe-and-publish
+  always; miner writes stay off until enable_writes and the HA master gate
+  are both on. Never reboots the miner. Never touches SRNE, BMS, or grid.
+  Never turns on switch.solar_miner_auto_enable.
+url: https://github.com/reliableroofing2020/ha-lard-controller
+arch:
+  - amd64
+  - aarch64
+  - armv7
+startup: application
+boot: auto
+init: false
+host_network: true
+hassio_api: true
+homeassistant_api: true
+hassio_role: default
+stage: stable
+timeout: 60
+watchdog: http://[HOST]:[PORT:8099]/health
+webui: http://[HOST]:[PORT:8099]/
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: Controller health and status (no Braiins writes)
+map:
+  - type: homeassistant_config
+    read_only: false
+    path: /config
+  - type: share
+    read_only: false
+    path: /share
+  - type: ssl
+    read_only: true
+    path: /ssl
+services:
+  - mqtt:want
+backup_exclude:
+  - "*.log"
+  - "status.json"
+options:
+  miner_url: "http://192.168.1.113"
+  poll_seconds: 10
+  board_wait_seconds: 60
+  ha_base_url: ""
+  enable_writes: false
+  power_target_w: 944
+  braiins_username: "root"
+  braiins_password: ""
+  ha_token: ""
+  mqtt_host: ""
+  mqtt_port: 1883
+  mqtt_username: ""
+  mqtt_password: ""
+  timezone: "America/Chicago"
+schema:
+  miner_url: str
+  poll_seconds: int(5,300)
+  board_wait_seconds: int(30,300)
+  ha_base_url: str?
+  enable_writes: bool
+  power_target_w: int(100,5000)
+  braiins_username: str
+  braiins_password: password
+  ha_token: password
+  mqtt_host: str?
+  mqtt_port: port
+  mqtt_username: str?
+  mqtt_password: password
+  timezone: str
+environment:
+  LARD_HEALTH_PORT: "8099"

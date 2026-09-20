@@ -1,0 +1,1338 @@
+#!/usr/bin/env python3
+"""LARD board-priority controller (Supervisor add-on).
+
+Observe+publish always. Braiins writes ONLY when BOTH:
+  - add-on option enable_writes is true, AND
+  - input_boolean.lard_board_priority_enable is ON.
+
+Never reboot miner. Never touch SRNE charge/BMS/grid.
+Never turn on switch.solar_miner_auto_enable.
+Never nohup / pgrep / detached keep-alive — this process runs in the
+foreground; a crash exits non-zero so Supervisor restarts the container.
+"""
+from __future__ import annotations
+
+import json
+import os
+import socket
+import threading
+import time
+import traceback
+import urllib.error
+import urllib.request
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from typing import Any
+from zoneinfo import ZoneInfo
+
+# ---------------------------------------------------------------------------
+# Probed live entities — do not guess
+# ---------------------------------------------------------------------------
+ENT_ENABLE = "input_boolean.lard_board_priority_enable"
+ENT_MODE_REQ = "input_select.lard_miner_mode_request"
+ENT_DESIRED_HA = "sensor.lard_miner_mode_desired_ha"
+ENT_SOC = "sensor.srne_12k_pro_1_battery"
+ENT_SOLAR_AVAIL = "sensor.solar_miner_solar_available"
+ENT_PV = "sensor.srne_12k_pro_1_pv_power"
+ENT_SOC_STATE = "sensor.solar_miner_soc_state"
+ENT_FAULT = "sensor.solar_miner_fault_reason"
+ENT_STALE = "binary_sensor.solar_miner_critical_stale"
+ENT_HB = "binary_sensor.lard_api_heartbeat"
+ENT_OLD_AUTO = "switch.solar_miner_auto_enable"
+
+# Heartbeat / health entities published every loop (not /local JSON)
+ENT_CTRL_ONLINE = "binary_sensor.lard_controller_online"
+ENT_CTRL_LAST_SEEN = "sensor.lard_controller_last_seen"
+ENT_CTRL_REQUESTED = "sensor.lard_controller_requested_mode"
+ENT_CTRL_ACTUAL = "sensor.lard_controller_actual_mode"
+ENT_CTRL_ERROR = "sensor.lard_controller_error"
+ENT_CTRL_FAILS = "sensor.lard_controller_api_fail_count"
+ENT_CTRL_BRAIINS_OK = "sensor.lard_controller_last_braiins_ok"
+ENT_CTRL_POWER = "sensor.lard_controller_power_w"
+ENT_CTRL_BOARDS = "sensor.lard_controller_boards"
+
+# Entities this process must never write
+FORBIDDEN_HA_WRITES = frozenset(
+    {
+        ENT_OLD_AUTO,
+        "switch.solar_miner_auto_enable",
+        "number.lard_power_target",
+        "number.lard",
+    }
+)
+
+MODES = ("PAUSED", "ONE_BOARD", "TWO_BOARD", "THREE_BOARD")
+BOARD_MAP = {
+    "PAUSED": ["1"],
+    "ONE_BOARD": ["1"],
+    "TWO_BOARD": ["1", "2"],
+    "THREE_BOARD": ["1", "2", "3"],
+}
+RANK = {"PAUSED": 0, "ONE_BOARD": 1, "TWO_BOARD": 2, "THREE_BOARD": 3}
+
+# Policy timings from the uploaded actuator — do not invent a new energy policy
+BOARD_POLL_S = 5
+WARMUP_S = 30
+ANTI_FLAP_UP_S = 10 * 60
+ANTI_FLAP_DOWN_S = 5 * 60
+SETTLE_AFTER_BOARD_S = 15 * 60
+SOLAR_AVG_WINDOW_S = 12 * 60
+TWO_HOLD_S = 10 * 60
+THREE_HOLD_S = 10 * 60
+DOWN_HOLD_S = 5 * 60
+
+BRAIINS_DENY_PATHS = (
+    "/reboot",
+    "/restart",
+    "/factory",
+    "/reset",
+    "/system/reboot",
+    "/actions/reboot",
+    "/actions/restart",
+)
+
+
+# ---------------------------------------------------------------------------
+# Settings / secrets
+# ---------------------------------------------------------------------------
+@dataclass
+class Settings:
+    miner_url: str = "http://192.168.1.113"
+    poll_seconds: int = 10
+    board_wait_seconds: int = 60
+    ha_base_url: str = ""
+    enable_writes: bool = False
+    power_target_w: int = 944
+    braiins_username: str = "root"
+    braiins_password: str = ""
+    ha_token: str = ""
+    mqtt_host: str = ""
+    mqtt_port: int = 1883
+    mqtt_username: str = ""
+    mqtt_password: str = ""
+    timezone: str = "America/Chicago"
+    health_port: int = 8099
+    data_dir: Path = field(default_factory=lambda: Path("/data"))
+    share_dir: Path = field(default_factory=lambda: Path("/share"))
+
+    def tz(self) -> ZoneInfo:
+        try:
+            return ZoneInfo(self.timezone)
+        except Exception:
+            return ZoneInfo("America/Chicago")
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        if path.is_file():
+            return json.loads(path.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _truthy(val) -> bool:
+    if isinstance(val, bool):
+        return val
+    return str(val).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def load_settings() -> Settings:
+    """Resolve config: add-on options, /data/secrets.json, then env.
+
+    Password/token never have a compiled-in default.
+    """
+    s = Settings()
+    options = _read_json(Path(os.environ.get("LARD_OPTIONS", "/data/options.json")))
+    secrets = _read_json(Path(os.environ.get("LARD_SECRETS", "/data/secrets.json")))
+    if not secrets:
+        # Local/dev fallback next to the script
+        secrets = _read_json(Path(__file__).resolve().parent / "secrets.json")
+
+    def pick(*names, default=""):
+        for name in names:
+            if name in options and options[name] not in (None, ""):
+                return options[name]
+            if name in secrets and secrets[name] not in (None, ""):
+                return secrets[name]
+            env = os.environ.get(name)
+            if env not in (None, ""):
+                return env
+        return default
+
+    s.miner_url = str(pick("miner_url", "LARD_MINER_URL", default=s.miner_url)).rstrip("/")
+    s.poll_seconds = int(pick("poll_seconds", "LARD_POLL_SECONDS", default=s.poll_seconds))
+    s.board_wait_seconds = int(
+        pick("board_wait_seconds", "LARD_BOARD_WAIT_SECONDS", default=s.board_wait_seconds)
+    )
+    s.ha_base_url = str(pick("ha_base_url", "LARD_HA_BASE_URL", default="")).rstrip("/")
+    s.enable_writes = _truthy(pick("enable_writes", "LARD_ENABLE_WRITES", default=False))
+    s.power_target_w = int(pick("power_target_w", "LARD_POWER_TARGET_W", default=s.power_target_w))
+    s.braiins_username = str(
+        pick("braiins_username", "LARD_BRAIINS_USERNAME", default=s.braiins_username)
+    )
+    s.braiins_password = str(
+        pick(
+            "braiins_password",
+            "BRAIINS_PASSWORD",
+            "LARD_BRAIINS_PASSWORD",
+            default="",
+        )
+    )
+    s.ha_token = str(
+        pick(
+            "ha_token",
+            "hass_token",
+            "HASS_TOKEN",
+            "LARD_HA_TOKEN",
+            default="",
+        )
+    )
+    s.mqtt_host = str(pick("mqtt_host", "LARD_MQTT_HOST", default=""))
+    s.mqtt_port = int(pick("mqtt_port", "LARD_MQTT_PORT", default=s.mqtt_port))
+    s.mqtt_username = str(pick("mqtt_username", "LARD_MQTT_USERNAME", default=""))
+    s.mqtt_password = str(pick("mqtt_password", "LARD_MQTT_PASSWORD", default=""))
+    s.timezone = str(pick("timezone", "TZ", "LARD_TIMEZONE", default=s.timezone))
+    s.health_port = int(os.environ.get("LARD_HEALTH_PORT", s.health_port))
+
+    data_override = os.environ.get("LARD_DATA_DIR")
+    if data_override:
+        s.data_dir = Path(data_override)
+    share_override = os.environ.get("LARD_SHARE_DIR")
+    if share_override:
+        s.share_dir = Path(share_override)
+    return s
+
+
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+class Logger:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.log_path = settings.data_dir / "controller.log"
+
+    def now_local(self) -> str:
+        return datetime.now(self.settings.tz()).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+    def __call__(self, msg: str) -> None:
+        line = f"{self.now_local()} {msg}"
+        print(line, flush=True)
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.log_path.open("a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+# ---------------------------------------------------------------------------
+# Home Assistant client
+# ---------------------------------------------------------------------------
+class HA:
+    def __init__(self, bases: list[str], token: str, log: Logger):
+        self.bases = [b.rstrip("/") for b in bases if b]
+        self.token = token
+        self.log = log
+        self.fail_count = 0
+
+    def _req(self, method: str, path: str, body=None, timeout=30):
+        if not self.token:
+            raise RuntimeError("HA token missing (SUPERVISOR_TOKEN or ha_token / secrets)")
+        if not self.bases:
+            raise RuntimeError("HA base URL missing")
+        data = None if body is None else json.dumps(body).encode()
+        headers = {
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json",
+        }
+        last = None
+        for base in self.bases:
+            url = base + path
+            try:
+                req = urllib.request.Request(url, data=data, headers=headers, method=method)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode()
+                    try:
+                        return resp.status, json.loads(raw) if raw else {}
+                    except Exception:
+                        return resp.status, {"raw": raw[:500]}
+            except Exception as e:
+                last = e
+                continue
+        self.fail_count += 1
+        raise RuntimeError(f"HA {method} {path} failed: {last}")
+
+    def state(self, entity_id: str):
+        try:
+            code, data = self._req("GET", f"/api/states/{entity_id}")
+            if code == 200 and isinstance(data, dict):
+                return data.get("state")
+        except Exception as e:
+            self.log(f"ha_state_err {entity_id}: {e}")
+            self.fail_count += 1
+        return None
+
+    def set_state(self, entity_id: str, state, attributes=None):
+        if entity_id in FORBIDDEN_HA_WRITES:
+            self.log(f"REFUSED HA write to forbidden entity {entity_id}")
+            return
+        body = {"state": state, "attributes": attributes or {}}
+        try:
+            self._req("POST", f"/api/states/{entity_id}", body)
+        except Exception as e:
+            self.log(f"ha_set_state_err {entity_id}: {e}")
+            self.fail_count += 1
+
+
+def ha_bases(settings: Settings) -> list[str]:
+    bases: list[str] = []
+    if settings.ha_base_url:
+        bases.append(settings.ha_base_url)
+    # Supervisor proxy when running as an add-on (homeassistant_api: true)
+    if os.environ.get("SUPERVISOR_TOKEN"):
+        bases.append("http://supervisor/core")
+    bases.extend(
+        [
+            "http://supervisor/core",
+            "http://homeassistant.local:8123",
+            "http://127.0.0.1:8123",
+        ]
+    )
+    # de-dupe, keep order
+    out: list[str] = []
+    seen = set()
+    for b in bases:
+        b = b.rstrip("/")
+        if b and b not in seen:
+            out.append(b)
+            seen.add(b)
+    return out
+
+
+def ha_token(settings: Settings) -> str:
+    return (
+        os.environ.get("SUPERVISOR_TOKEN")
+        or settings.ha_token
+        or os.environ.get("HASS_TOKEN")
+        or ""
+    )
+
+
+# ---------------------------------------------------------------------------
+# Braiins OS+ REST (API ~1.8.0)
+# ---------------------------------------------------------------------------
+class Braiins:
+    def __init__(self, settings: Settings, log: Logger):
+        self.settings = settings
+        self.log = log
+        self.token = None
+        self.token_ts = 0.0
+        self.fail_count = 0
+        self.last_ok_iso = ""
+
+    @property
+    def miner(self) -> str:
+        return self.settings.miner_url.rstrip("/")
+
+    def ensure_auth(self):
+        if self.token and (time.time() - self.token_ts) < 50 * 60:
+            return
+        if not self.settings.braiins_password:
+            raise RuntimeError("braiins password missing (options / /data/secrets.json / env)")
+        req = urllib.request.Request(
+            self.miner + "/api/v1/auth/login",
+            data=json.dumps(
+                {
+                    "username": self.settings.braiins_username,
+                    "password": self.settings.braiins_password,
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            j = json.loads(resp.read().decode())
+        self.token = j.get("token")
+        self.token_ts = time.time()
+        if not self.token:
+            raise RuntimeError("braiins login missing token")
+        self.last_ok_iso = utc_iso()
+
+    def _call(self, method: str, path: str, body=None, timeout=30):
+        lowered = path.lower()
+        if any(deny in lowered for deny in BRAIINS_DENY_PATHS):
+            raise RuntimeError(f"refused Braiins path {path} (reboot/reset denied)")
+        self.ensure_auth()
+        headers = {
+            "Authorization": self.token,  # raw token, not Bearer — Braiins OS+ 1.8
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        data = None if body is None else json.dumps(body).encode()
+        req = urllib.request.Request(self.miner + path, data=data, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read().decode()
+                try:
+                    j = json.loads(raw) if raw else {}
+                except Exception:
+                    j = {"raw": raw[:1000]}
+                self.last_ok_iso = utc_iso()
+                return resp.status, j
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode() if e.fp else ""
+            if e.code == 401:
+                self.token = None
+            self.fail_count += 1
+            try:
+                j = json.loads(raw) if raw else {}
+            except Exception:
+                j = {"raw": raw[:1000]}
+            return e.code, j
+        except Exception:
+            self.fail_count += 1
+            raise
+
+    def pause(self):
+        return self._call("PUT", "/api/v1/actions/pause")
+
+    def resume(self):
+        return self._call("PUT", "/api/v1/actions/resume")
+
+    def set_power(self, watt: int):
+        return self._call("PUT", "/api/v1/performance/power-target", {"watt": int(watt)})
+
+    def get_power_target(self):
+        return self._call("GET", "/api/v1/performance/power-target")
+
+    def patch_boards(self, enable: bool, ids: list[str]):
+        if not ids:
+            return 200, {}
+        return self._call(
+            "PATCH",
+            "/api/v1/miner/hw/hashboards",
+            {"enable": bool(enable), "hashboard_ids": [str(i) for i in ids]},
+        )
+
+    def enabled_ids(self):
+        code, hb = self._call("GET", "/api/v1/miner/hw/hashboards")
+        out = []
+        for b in (hb or {}).get("hashboards") or []:
+            en = b.get("enabled")
+            if en is None:
+                en = b.get("is_enabled")
+            if en:
+                out.append(str(b.get("id")))
+        return sorted(out), code, hb
+
+    def approx_power_w(self):
+        """Best-effort live watts. Missing stats are not a write failure."""
+        for path in ("/api/v1/miner/stats", "/api/v1/miner", "/api/v1/miner/details"):
+            try:
+                code, j = self._call("GET", path)
+            except Exception:
+                continue
+            if code != 200 or not isinstance(j, dict):
+                continue
+            found = _find_number(
+                j,
+                (
+                    "approx_consumption",
+                    "power_consumption",
+                    "wattage",
+                    "power",
+                    "watt",
+                ),
+            )
+            if found is not None:
+                return found
+        return None
+
+    def set_cooling_profile_auto(self):
+        """Own cooling by leaving Braiins automatic. No invented PWM policy."""
+        return self._call("PUT", "/api/v1/cooling", {"mode": "automatic"})
+
+
+def _find_number(obj, keys: tuple[str, ...]):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in keys and isinstance(v, (int, float)) and not isinstance(v, bool):
+                return float(v)
+            found = _find_number(v, keys)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _find_number(item, keys)
+            if found is not None:
+                return found
+    return None
+
+
+# ---------------------------------------------------------------------------
+# MQTT (optional) — discovery + LWT so online goes off if the add-on dies
+# ---------------------------------------------------------------------------
+class MqttPublisher:
+    def __init__(self, settings: Settings, log: Logger):
+        self.settings = settings
+        self.log = log
+        self.client = None
+        self.ok = False
+        self._lock = threading.Lock()
+
+    def discover_broker(self, token: str) -> bool:
+        if self.settings.mqtt_host:
+            return True
+        if not token:
+            return False
+        try:
+            req = urllib.request.Request(
+                "http://supervisor/services/mqtt",
+                headers={"Authorization": f"Bearer {token}"},
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                j = json.loads(resp.read().decode() or "{}")
+            data = j.get("data") or j
+            host = data.get("host") or data.get("broker")
+            if not host:
+                return False
+            self.settings.mqtt_host = str(host)
+            if data.get("port"):
+                self.settings.mqtt_port = int(data["port"])
+            if data.get("username") and not self.settings.mqtt_username:
+                self.settings.mqtt_username = str(data["username"])
+            if data.get("password") and not self.settings.mqtt_password:
+                self.settings.mqtt_password = str(data["password"])
+            self.log(f"mqtt discovered host={self.settings.mqtt_host}:{self.settings.mqtt_port}")
+            return True
+        except Exception as e:
+            self.log(f"mqtt_discover_skip: {e}")
+            return False
+
+    def start(self) -> bool:
+        if not self.settings.mqtt_host:
+            return False
+        try:
+            import paho.mqtt.client as mqtt  # type: ignore
+        except Exception as e:
+            self.log(f"mqtt paho missing, REST publish only: {e}")
+            return False
+        try:
+            client = mqtt.Client(
+                mqtt.CallbackAPIVersion.VERSION2,
+                client_id="lard_controller",
+                clean_session=True,
+            )
+        except Exception:
+            client = mqtt.Client(client_id="lard_controller", clean_session=True)
+        if self.settings.mqtt_username:
+            client.username_pw_set(self.settings.mqtt_username, self.settings.mqtt_password)
+        client.will_set("lard/controller/availability", "offline", qos=1, retain=True)
+
+        def _on_connect(c, _u, _f, rc, *args):
+            if rc == 0 or str(rc) in {"Success", "0"}:
+                c.publish("lard/controller/availability", "online", qos=1, retain=True)
+                self.ok = True
+            else:
+                self.log(f"mqtt connect rc={rc}")
+                self.ok = False
+
+        client.on_connect = _on_connect
+        try:
+            client.connect(self.settings.mqtt_host, int(self.settings.mqtt_port), 30)
+            client.loop_start()
+            self.client = client
+            self._publish_discovery()
+            self.log("mqtt connected — heartbeat via discovery + LWT")
+            return True
+        except Exception as e:
+            self.log(f"mqtt_connect_failed REST fallback: {e}")
+            self.ok = False
+            return False
+
+    def _publish_discovery(self):
+        if not self.client:
+            return
+        device = {
+            "identifiers": ["lard_controller"],
+            "name": "LARD Controller",
+            "manufacturer": "LARD",
+            "model": "Board-priority Braiins actuator",
+            "sw_version": "0.1.0",
+        }
+        sensors = [
+            (
+                "binary_sensor",
+                "online",
+                {
+                    "name": "LARD Controller Online",
+                    "state_topic": "lard/controller/online",
+                    "payload_on": "on",
+                    "payload_off": "off",
+                    "device_class": "connectivity",
+                },
+            ),
+            ("sensor", "last_seen", {"name": "LARD Controller Last Seen", "state_topic": "lard/controller/last_seen"}),
+            (
+                "sensor",
+                "requested_mode",
+                {"name": "LARD Controller Requested Mode", "state_topic": "lard/controller/requested_mode"},
+            ),
+            (
+                "sensor",
+                "actual_mode",
+                {"name": "LARD Controller Actual Mode", "state_topic": "lard/controller/actual_mode"},
+            ),
+            ("sensor", "error", {"name": "LARD Controller Error", "state_topic": "lard/controller/error"}),
+            (
+                "sensor",
+                "api_fail_count",
+                {
+                    "name": "LARD Controller API Fail Count",
+                    "state_topic": "lard/controller/api_fail_count",
+                    "state_class": "measurement",
+                },
+            ),
+            (
+                "sensor",
+                "last_braiins_ok",
+                {"name": "LARD Controller Last Braiins OK", "state_topic": "lard/controller/last_braiins_ok"},
+            ),
+            (
+                "sensor",
+                "power_w",
+                {
+                    "name": "LARD Controller Power",
+                    "state_topic": "lard/controller/power_w",
+                    "unit_of_measurement": "W",
+                    "device_class": "power",
+                    "state_class": "measurement",
+                },
+            ),
+            ("sensor", "boards", {"name": "LARD Controller Boards", "state_topic": "lard/controller/boards"}),
+        ]
+        for platform, object_id, extra in sensors:
+            payload = {
+                "unique_id": f"lard_controller_{object_id}",
+                "object_id": f"lard_controller_{object_id}",
+                "availability_topic": "lard/controller/availability",
+                "payload_available": "online",
+                "payload_not_available": "offline",
+                "device": device,
+            }
+            payload.update(extra)
+            topic = f"homeassistant/{platform}/lard_controller_{object_id}/config"
+            self.client.publish(topic, json.dumps(payload), qos=1, retain=True)
+
+    def publish_heartbeat(self, fields: dict[str, Any]) -> bool:
+        if not self.client or not self.ok:
+            return False
+        with self._lock:
+            try:
+                mapping = {
+                    "online": "lard/controller/online",
+                    "last_seen": "lard/controller/last_seen",
+                    "requested_mode": "lard/controller/requested_mode",
+                    "actual_mode": "lard/controller/actual_mode",
+                    "error": "lard/controller/error",
+                    "api_fail_count": "lard/controller/api_fail_count",
+                    "last_braiins_ok": "lard/controller/last_braiins_ok",
+                    "power_w": "lard/controller/power_w",
+                    "boards": "lard/controller/boards",
+                }
+                for key, topic in mapping.items():
+                    if key in fields:
+                        self.client.publish(topic, str(fields[key]), qos=1, retain=True)
+                self.client.publish("lard/controller/availability", "online", qos=1, retain=True)
+                return True
+            except Exception as e:
+                self.log(f"mqtt_pub_err: {e}")
+                self.ok = False
+                return False
+
+
+# ---------------------------------------------------------------------------
+# Health HTTP (0.0.0.0:8099) — in-process thread, not a detached shell
+# ---------------------------------------------------------------------------
+class HealthState:
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.last_loop_ts = 0.0
+        self.last_status: dict[str, Any] = {}
+        self.started_ts = time.time()
+        self.lock = threading.Lock()
+
+    def touch(self) -> None:
+        with self.lock:
+            self.last_loop_ts = time.time()
+
+    def set_status(self, status: dict[str, Any]) -> None:
+        with self.lock:
+            self.last_status = dict(status)
+            self.last_loop_ts = time.time()
+
+    def snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            last = self.last_loop_ts
+            status = dict(self.last_status)
+        age = None if last == 0 else time.time() - last
+        stale_after = 2 * max(1, int(self.settings.poll_seconds))
+        healthy = last > 0 and age is not None and age < stale_after
+        return {
+            "healthy": healthy,
+            "last_loop_age_s": None if age is None else round(age, 3),
+            "stale_after_s": stale_after,
+            "uptime_s": round(time.time() - self.started_ts, 1),
+            "status": status,
+        }
+
+
+def start_health_server(health: HealthState, port: int, log: Logger) -> ThreadingHTTPServer:
+    state = health
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            return
+
+        def _send(self, code: int, payload, content_type="application/json"):
+            body = payload if isinstance(payload, (bytes, bytearray)) else payload.encode()
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            snap = state.snapshot()
+            if self.path.split("?", 1)[0] in {"/health", "/health/"}:
+                code = 200 if snap["healthy"] else 503
+                self._send(code, json.dumps(snap, indent=2) + "\n")
+                return
+            if self.path.split("?", 1)[0] in {"/status", "/status/"}:
+                self._send(200, json.dumps(snap.get("status") or {}, indent=2) + "\n")
+                return
+            if self.path.split("?", 1)[0] in {"/", "/index.html"}:
+                self._send(200, _status_html(snap), "text/html; charset=utf-8")
+                return
+            self._send(404, json.dumps({"error": "not found"}) + "\n")
+
+    httpd = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    t = threading.Thread(target=httpd.serve_forever, name="lard-health", daemon=True)
+    t.start()
+    log(f"health listening 0.0.0.0:{port}/health")
+    return httpd
+
+
+def _status_html(snap: dict) -> str:
+    st = snap.get("status") or {}
+    healthy = snap.get("healthy")
+    rows = "".join(
+        f"<tr><th>{_esc(k)}</th><td>{_esc(v)}</td></tr>"
+        for k, v in st.items()
+        if k not in {"secrets", "password", "token"}
+    )
+    badge = "ok" if healthy else "down"
+    return f"""<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"/>
+<meta http-equiv="refresh" content="10"/>
+<title>LARD Controller</title>
+<style>
+ body {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        background:#111; color:#e8e4d9; margin:24px; }}
+ h1 {{ font-size:18px; font-weight:600; }}
+ .badge {{ display:inline-block; padding:2px 8px; border-radius:4px; }}
+ .ok {{ background:#1f6f43; }}
+ .down {{ background:#8b2e2e; }}
+ table {{ border-collapse:collapse; width:min(880px,100%); }}
+ th,td {{ text-align:left; padding:6px 10px; border-bottom:1px solid #333; vertical-align:top; }}
+ th {{ color:#9aa; width:240px; font-weight:500; }}
+ a {{ color:#8fc1ff; }}
+</style></head>
+<body>
+<h1>LARD Controller <span class="badge {badge}">{badge}</span></h1>
+<p>Health: <a href="/health">/health</a> · JSON: <a href="/status">/status</a>
+ · writes stay off until <code>enable_writes</code> and the HA master gate are both on.</p>
+<table>{rows or "<tr><td>waiting for first loop…</td></tr>"}</table>
+</body></html>
+"""
+
+
+def _esc(v) -> str:
+    s = str(v)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ---------------------------------------------------------------------------
+# Controller — energy policy copied from the uploaded actuator
+# ---------------------------------------------------------------------------
+class Controller:
+    def __init__(self, ha: HA, braiins: Braiins, settings: Settings, log: Logger, health: HealthState):
+        self.ha = ha
+        self.b = braiins
+        self.settings = settings
+        self.log = log
+        self.health = health
+        self.mqtt = MqttPublisher(settings, log)
+        self.solar_samples: deque[tuple[float, float]] = deque()
+        self.actual_mode = "PAUSED"
+        self.desired_mode = "PAUSED"
+        self.reason = "boot"
+        self.last_error = ""
+        self.last_transition_ts = 0.0
+        self.last_board_change_ts = 0.0
+        self.mode_entered_ts = time.time()
+        self.two_ok_since = None
+        self.three_ok_since = None
+        self.down_ok_since = None
+        self.acting = False
+        self.dry_reads = 0
+        self.power_w = None
+        self.boards_str = ""
+        self.mode_request = "AUTO"
+
+    def writes_allowed(self, enable_on: bool) -> bool:
+        """Braiins writes require BOTH the add-on option and the HA gate."""
+        return bool(self.settings.enable_writes) and bool(enable_on)
+
+    def fnum(self, entity_id: str, default=None):
+        st = self.ha.state(entity_id)
+        try:
+            if st in (None, "unknown", "unavailable", ""):
+                return default
+            return float(st)
+        except Exception:
+            return default
+
+    def update_solar_avg(self) -> float:
+        w = self.fnum(ENT_SOLAR_AVAIL)
+        if w is None:
+            w = self.fnum(ENT_PV, 0.0) or 0.0
+        now = time.time()
+        self.solar_samples.append((now, float(w)))
+        while self.solar_samples and (now - self.solar_samples[0][0]) > SOLAR_AVG_WINDOW_S:
+            self.solar_samples.popleft()
+        if not self.solar_samples:
+            return float(w)
+        return sum(v for _, v in self.solar_samples) / len(self.solar_samples)
+
+    def faults_block(self):
+        if self.ha.state(ENT_HB) != "on":
+            return "heartbeat_lost"
+        if self.ha.state(ENT_STALE) == "on":
+            return "critical_stale"
+        fault = self.ha.state(ENT_FAULT)
+        if fault and fault not in ("ok", "unknown", "unavailable", None, "soc_hard_pause"):
+            return f"fault:{fault}"
+        return None
+
+    def compute_desired(self, solar_avg: float):
+        """Resolve requested mode, then apply the uploaded board-priority policy.
+
+        AUTO reads sensor.lard_miner_mode_desired_ha when it holds a valid mode.
+        If that template is unknown/unavailable, fall back to the uploaded
+        local energy policy (same thresholds — not a new policy).
+        Manual input_select values are honored as-is.
+        """
+        req = self.ha.state(ENT_MODE_REQ) or "AUTO"
+        self.mode_request = req
+
+        if req in MODES:
+            return req, f"manual_override:{req}"
+
+        ha_desired = self.ha.state(ENT_DESIRED_HA)
+        if ha_desired in MODES:
+            candidate, reason = ha_desired, f"ha_desired:{ha_desired}"
+            soc = self.fnum(ENT_SOC)
+            if soc is not None and soc <= 30:
+                return "PAUSED", "soc_hard_pause_le_30"
+            fb = self.faults_block()
+            if fb:
+                return "PAUSED", fb
+            return self._anti_flap(candidate, reason, solar_avg)
+
+        return self._compute_desired_local(solar_avg)
+
+    def _compute_desired_local(self, solar_avg: float):
+        """Exact uploaded AUTO policy (SOC / solar / hold / night-cap)."""
+        soc = self.fnum(ENT_SOC)
+        solar_now = self.fnum(ENT_SOLAR_AVAIL)
+        if solar_now is None:
+            solar_now = self.fnum(ENT_PV, 0.0) or 0.0
+
+        if soc is None:
+            return "PAUSED", "soc_unavailable"
+        if soc <= 30:
+            return "PAUSED", "soc_hard_pause_le_30"
+
+        fb = self.faults_block()
+        if fb:
+            return "PAUSED", fb
+
+        sunny = soc > 30 and solar_avg >= 1500
+        weak_ok = soc >= 50
+        if not (sunny or weak_ok):
+            return "PAUSED", f"await_one_board soc={soc:.0f} solar_avg={solar_avg:.0f}"
+
+        mode = "ONE_BOARD"
+        reason = "sunny_path" if sunny and soc < 50 else ("soc_ge_50" if weak_ok else "one_board")
+
+        now = time.time()
+        two_cond = soc >= 70 and solar_now >= 800
+        three_cond = soc >= 85 and solar_now >= 1100
+
+        if two_cond:
+            if self.two_ok_since is None:
+                self.two_ok_since = now
+            elif (now - self.two_ok_since) >= TWO_HOLD_S:
+                mode = "TWO_BOARD"
+                reason = f"two_board_hold soc={soc:.0f} solar={solar_now:.0f}"
+        else:
+            self.two_ok_since = None
+
+        if mode == "TWO_BOARD" and three_cond:
+            if self.three_ok_since is None:
+                self.three_ok_since = now
+            elif (now - self.three_ok_since) >= THREE_HOLD_S:
+                mode = "THREE_BOARD"
+                reason = f"three_board_hold soc={soc:.0f} solar={solar_now:.0f}"
+        elif not three_cond:
+            self.three_ok_since = None
+
+        candidate = mode
+
+        if candidate == "THREE_BOARD" and (soc <= 75 or solar_now < 900):
+            if self.down_ok_since is None:
+                self.down_ok_since = now
+            elif (now - self.down_ok_since) >= DOWN_HOLD_S:
+                candidate = "TWO_BOARD"
+                reason = f"down_three_to_two soc={soc:.0f} solar={solar_now:.0f}"
+        elif candidate in ("TWO_BOARD", "THREE_BOARD") and (soc <= 65 or solar_now < 500):
+            if self.down_ok_since is None:
+                self.down_ok_since = now
+            elif (now - self.down_ok_since) >= DOWN_HOLD_S:
+                candidate = "ONE_BOARD"
+                reason = f"down_to_one soc={soc:.0f} solar={solar_now:.0f}"
+        else:
+            self.down_ok_since = None
+
+        if candidate in ("TWO_BOARD", "THREE_BOARD") and solar_avg < 800:
+            candidate = "ONE_BOARD"
+            reason = f"night_cap_one solar_avg={solar_avg:.0f}"
+
+        return self._anti_flap(candidate, reason, solar_avg)
+
+    def _anti_flap(self, candidate: str, reason: str, _solar_avg: float):
+        now = time.time()
+        if candidate != self.actual_mode:
+            elapsed = now - self.mode_entered_ts
+            going_up = RANK[candidate] > RANK.get(self.actual_mode, 0)
+            going_down = RANK[candidate] < RANK.get(self.actual_mode, 0)
+            if going_up and self.actual_mode != "PAUSED" and elapsed < ANTI_FLAP_UP_S:
+                return self.actual_mode, f"anti_flap_up wait={int(ANTI_FLAP_UP_S - elapsed)}s ({reason})"
+            if going_down and candidate != "PAUSED" and elapsed < ANTI_FLAP_DOWN_S:
+                return self.actual_mode, f"anti_flap_down wait={int(ANTI_FLAP_DOWN_S - elapsed)}s ({reason})"
+            if (
+                going_up
+                and self.actual_mode != "PAUSED"
+                and (now - self.last_board_change_ts) < SETTLE_AFTER_BOARD_S
+            ):
+                wait = int(SETTLE_AFTER_BOARD_S - (now - self.last_board_change_ts))
+                return self.actual_mode, f"settle_after_board wait={wait}s"
+        return candidate, reason
+
+    def _set_boards(self, enabled_ids: list[str]) -> bool:
+        enabled_ids = [str(x) for x in enabled_ids]
+        if any(i in enabled_ids for i in ("2", "3")) and "1" not in enabled_ids:
+            enabled_ids = ["1"] + [i for i in enabled_ids if i != "1"]
+        all_ids = ["1", "2", "3"]
+        to_enable = [i for i in all_ids if i in enabled_ids]
+        to_disable = [i for i in all_ids if i not in enabled_ids]
+
+        if to_disable:
+            code, _ = self.b.patch_boards(False, to_disable)
+            self.log(f"PATCH disable {to_disable} http={code}")
+            if code != 200:
+                self.last_error = f"board_disable_http_{code}"
+                return False
+        if to_enable:
+            code, _ = self.b.patch_boards(True, to_enable)
+            self.log(f"PATCH enable {to_enable} http={code}")
+            if code != 200:
+                self.last_error = f"board_enable_http_{code}"
+                return False
+
+        # HTTP 200 on hashboard PATCH = accepted, not applied.
+        # Poll GET every ~5s; wait ≥ board_wait_seconds before failure.
+        expect = sorted(to_enable)
+        deadline = time.time() + max(60, int(self.settings.board_wait_seconds))
+        while time.time() < deadline:
+            self.health.touch()
+            actual, code, _ = self.b.enabled_ids()
+            self.log(f"board_poll expect={expect} actual={actual} http={code}")
+            if actual == expect:
+                self.last_board_change_ts = time.time()
+                self.boards_str = ",".join(actual) if actual else "none"
+                return True
+            time.sleep(BOARD_POLL_S)
+        self.last_error = f"board_wait_timeout expect={expect}"
+        return False
+
+    def apply_mode(self, mode: str) -> bool:
+        self.log(f"APPLY begin mode={mode}")
+        try:
+            if mode == "PAUSED":
+                code, _ = self.b.pause()
+                self.log(f"pause http={code}")
+                if code != 200:
+                    self.last_error = f"pause_http_{code}"
+                    return False
+                if not self._set_boards(BOARD_MAP["PAUSED"]):
+                    return False
+                self.actual_mode = "PAUSED"
+                self.mode_entered_ts = time.time()
+                self.last_transition_ts = time.time()
+                self.last_error = ""
+                return True
+
+            code, _ = self.b.set_power(self.settings.power_target_w)
+            self.log(f"power_target http={code}")
+            if code != 200:
+                self.last_error = f"power_target_http_{code}"
+                return False
+
+            if not self._set_boards(BOARD_MAP[mode]):
+                return False
+
+            # Own cooling profile: leave Braiins automatic. Failure is non-fatal.
+            try:
+                c_code, _ = self.b.set_cooling_profile_auto()
+                self.log(f"cooling automatic http={c_code}")
+            except Exception as e:
+                self.log(f"cooling skip: {e}")
+
+            code, _ = self.b.resume()
+            self.log(f"resume http={code}")
+            if code != 200:
+                self.last_error = f"resume_http_{code}"
+                return False
+
+            # Tuner warmup before performance judgment (uploaded semantics).
+            time.sleep(min(WARMUP_S, 20))
+            self.health.touch()
+            self.actual_mode = mode
+            self.mode_entered_ts = time.time()
+            self.last_transition_ts = time.time()
+            self.last_error = ""
+            return True
+        except Exception as e:
+            self.last_error = f"apply_exc:{e}"
+            self.log(f"APPLY exc {traceback.format_exc()}")
+            return False
+
+    def _status_dict(self, solar_avg: float, enable_on: bool) -> dict:
+        return {
+            "ts": self.log.now_local(),
+            "last_seen": utc_iso(),
+            "master_enable": enable_on,
+            "enable_writes": self.settings.enable_writes,
+            "writes_allowed": self.writes_allowed(enable_on),
+            "mode_request": self.mode_request,
+            "desired_mode": self.desired_mode,
+            "actual_mode": self.actual_mode,
+            "reason": self.reason,
+            "last_error": self.last_error,
+            "solar_avg_w": round(solar_avg, 1),
+            "soc": self.fnum(ENT_SOC),
+            "solar_available": self.fnum(ENT_SOLAR_AVAIL),
+            "old_auto_enable": self.ha.state(ENT_OLD_AUTO),
+            "power_target_w": self.settings.power_target_w,
+            "power_w": self.power_w,
+            "boards": self.boards_str,
+            "acting": self.acting,
+            "dry_reads": self.dry_reads,
+            "api_fail_count": self.ha.fail_count + self.b.fail_count,
+            "last_braiins_ok": self.b.last_ok_iso,
+            "miner_url": self.settings.miner_url,
+            "supervision": "s6-overlay + Supervisor watchdog",
+        }
+
+    def _write_status_files(self, status: dict) -> None:
+        payload = json.dumps(status, indent=2)
+        paths = [
+            self.settings.data_dir / "status.json",
+            self.settings.share_dir / "lard_controller_status.json",
+        ]
+        for p in paths:
+            try:
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(payload)
+            except Exception:
+                continue
+
+    def publish(self, solar_avg: float, enable_on: bool):
+        status = self._status_dict(solar_avg, enable_on)
+        self._write_status_files(status)
+        self.health.set_status(status)
+
+        last_seen = status["last_seen"]
+        error = self.last_error or ""
+        fails = status["api_fail_count"]
+        boards = self.boards_str or "unknown"
+        power = "" if self.power_w is None else self.power_w
+        hb = {
+            "online": "on",
+            "last_seen": last_seen,
+            "requested_mode": self.desired_mode,
+            "actual_mode": self.actual_mode,
+            "error": error if error else "ok",
+            "api_fail_count": fails,
+            "last_braiins_ok": self.b.last_ok_iso or "",
+            "power_w": power if power != "" else "",
+            "boards": boards,
+        }
+        mqtt_ok = self.mqtt.publish_heartbeat(hb)
+
+        # REST entities are the guaranteed HA health path when MQTT is down.
+        # Do not skip REST even if MQTT works — last_seen freshness is the
+        # REST-safe watchdog signal if LWT never fires.
+        attrs_base = {
+            "friendly_name": "",
+            "reason": self.reason,
+            "master_enable": enable_on,
+            "enable_writes": self.settings.enable_writes,
+            "writes_allowed": self.writes_allowed(enable_on),
+        }
+        self.ha.set_state(
+            ENT_CTRL_ONLINE,
+            "on",
+            {
+                "friendly_name": "LARD Controller Online",
+                "device_class": "connectivity",
+                "reason": self.reason,
+                "mqtt": mqtt_ok,
+            },
+        )
+        self.ha.set_state(
+            ENT_CTRL_LAST_SEEN,
+            last_seen,
+            {"friendly_name": "LARD Controller Last Seen", "device_class": "timestamp"},
+        )
+        self.ha.set_state(
+            ENT_CTRL_REQUESTED,
+            self.desired_mode,
+            {**attrs_base, "friendly_name": "LARD Controller Requested Mode"},
+        )
+        self.ha.set_state(
+            ENT_CTRL_ACTUAL,
+            self.actual_mode,
+            {**attrs_base, "friendly_name": "LARD Controller Actual Mode"},
+        )
+        self.ha.set_state(
+            ENT_CTRL_ERROR,
+            error if error else "ok",
+            {"friendly_name": "LARD Controller Error"},
+        )
+        self.ha.set_state(
+            ENT_CTRL_FAILS,
+            fails,
+            {
+                "friendly_name": "LARD Controller API Fail Count",
+                "state_class": "measurement",
+            },
+        )
+        self.ha.set_state(
+            ENT_CTRL_BRAIINS_OK,
+            self.b.last_ok_iso or "",
+            {"friendly_name": "LARD Controller Last Braiins OK"},
+        )
+        self.ha.set_state(
+            ENT_CTRL_POWER,
+            power if power != "" else "unknown",
+            {
+                "friendly_name": "LARD Controller Power",
+                "unit_of_measurement": "W",
+                "device_class": "power",
+                "state_class": "measurement",
+            },
+        )
+        self.ha.set_state(
+            ENT_CTRL_BOARDS,
+            boards,
+            {"friendly_name": "LARD Controller Boards"},
+        )
+
+        # Compatibility sensors from the uploaded controller
+        self.ha.set_state(
+            "sensor.lard_miner_mode_actual",
+            self.actual_mode,
+            {"friendly_name": "LARD Miner Mode Actual", "reason": self.reason, "last_error": self.last_error},
+        )
+        self.ha.set_state(
+            "sensor.lard_miner_mode_desired",
+            self.desired_mode,
+            {"friendly_name": "LARD Miner Mode Desired", "reason": self.reason},
+        )
+        self.ha.set_state(
+            "sensor.lard_miner_mode_reason",
+            self.reason,
+            {"friendly_name": "LARD Miner Mode Reason"},
+        )
+        self.ha.set_state(
+            "sensor.lard_solar_avg_w",
+            round(solar_avg, 1),
+            {
+                "friendly_name": "LARD Solar Avg W",
+                "unit_of_measurement": "W",
+                "device_class": "power",
+                "state_class": "measurement",
+            },
+        )
+        self.ha.set_state(
+            "sensor.lard_board_priority_status",
+            "on" if enable_on else "idle",
+            {
+                "friendly_name": "LARD Board Priority Status",
+                "desired_mode": self.desired_mode,
+                "actual_mode": self.actual_mode,
+                "reason": self.reason,
+                "last_error": self.last_error,
+                "solar_avg_w": round(solar_avg, 1),
+                "master_enable": enable_on,
+                "enable_writes": self.settings.enable_writes,
+                "power_target_w": self.settings.power_target_w,
+            },
+        )
+
+    def read_actual_from_miner(self):
+        actual, code, _ = self.b.enabled_ids()
+        if code != 200:
+            self.last_error = f"read_boards_http_{code}"
+            return
+        s = set(actual)
+        self.boards_str = ",".join(actual) if actual else "none"
+        if s == {"1", "2", "3"}:
+            self.actual_mode = "THREE_BOARD"
+        elif s == {"1", "2"}:
+            self.actual_mode = "TWO_BOARD"
+        elif s == {"1"}:
+            self.actual_mode = "ONE_BOARD"
+        else:
+            self.actual_mode = "PAUSED"
+        try:
+            self.power_w = self.b.approx_power_w()
+        except Exception as e:
+            self.log(f"power_read_skip: {e}")
+
+    def tick(self):
+        self.health.touch()
+        enable_on = self.ha.state(ENT_ENABLE) == "on"
+        solar_avg = self.update_solar_avg()
+        desired, reason = self.compute_desired(solar_avg)
+        self.desired_mode = desired
+        self.reason = reason
+        self.dry_reads += 1
+
+        old_auto = self.ha.state(ENT_OLD_AUTO)
+        if old_auto == "on":
+            self.log("WARNING competing writer: switch.solar_miner_auto_enable is ON — will not turn it on; writes refused")
+
+        if not self.writes_allowed(enable_on):
+            self.acting = False
+            if self.settings.enable_writes and not enable_on:
+                self.reason = f"{reason}|master_gate_off"
+            elif not self.settings.enable_writes:
+                self.reason = f"{reason}|enable_writes_false"
+            try:
+                self.read_actual_from_miner()
+            except Exception as e:
+                self.log(f"observe miner failed: {e}")
+            self.publish(solar_avg, enable_on)
+            return
+
+        if old_auto == "on":
+            self.acting = False
+            self.last_error = "refusing_writes_old_auto_enable_is_on"
+            self.publish(solar_avg, enable_on)
+            return
+
+        self.acting = True
+        if desired != self.actual_mode:
+            ok = self.apply_mode(desired)
+            if not ok:
+                self.log(f"APPLY failed err={self.last_error}")
+        try:
+            self.power_w = self.b.approx_power_w()
+            ids, code, _ = self.b.enabled_ids()
+            if code == 200:
+                self.boards_str = ",".join(ids) if ids else "none"
+        except Exception as e:
+            self.log(f"post_apply_read: {e}")
+        self.publish(solar_avg, True)
+
+
+def main() -> int:
+    settings = load_settings()
+    settings.data_dir.mkdir(parents=True, exist_ok=True)
+    log = Logger(settings)
+    log("controller starting (Supervisor add-on foreground)")
+    log(
+        f"miner={settings.miner_url} poll={settings.poll_seconds}s "
+        f"board_wait>={settings.board_wait_seconds}s enable_writes={settings.enable_writes} "
+        f"power_target={settings.power_target_w}W"
+    )
+    if settings.enable_writes:
+        log("WRITES ARMED — still requires input_boolean.lard_board_priority_enable=on")
+    else:
+        log("WRITES DISARMED — observe-only until add-on option enable_writes is true")
+
+    health = HealthState(settings)
+    try:
+        start_health_server(health, settings.health_port, log)
+    except OSError as e:
+        log(f"FATAL health bind 0.0.0.0:{settings.health_port}: {e}")
+        return 1
+
+    token = ha_token(settings)
+    ha = HA(ha_bases(settings), token, log)
+    braiins = Braiins(settings, log)
+    ctrl = Controller(ha, braiins, settings, log, health)
+    if token:
+        ctrl.mqtt.discover_broker(token)
+    ctrl.mqtt.start()
+
+    try:
+        ctrl.read_actual_from_miner()
+    except Exception as e:
+        log(f"initial miner read failed (ok if offline / no password): {e}")
+
+    log("controller loop enter — both gates off means observe-only")
+    while True:
+        try:
+            ctrl.tick()
+        except Exception as e:
+            log(f"tick_err {e}\n{traceback.format_exc()}")
+            ctrl.last_error = str(e)[:200]
+            health.touch()
+            try:
+                ctrl.publish(0.0, False)
+            except Exception:
+                pass
+        time.sleep(max(1, int(settings.poll_seconds)))
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(0)

@@ -1,0 +1,8 @@
+build_from:
+  amd64: ghcr.io/home-assistant/amd64-base-python:3.13-alpine3.22
+  aarch64: ghcr.io/home-assistant/aarch64-base-python:3.13-alpine3.22
+  armv7: ghcr.io/home-assistant/armv7-base-python:3.12-alpine3.21
+labels:
+  io.hass.type: addon
+  io.hass.name: LARD Controller
+args: {}

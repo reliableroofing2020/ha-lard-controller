@@ -1,0 +1,13 @@
+#!/command/with-contenv bash
+# s6 longrun: exec the controller in the foreground. This process is a
+# child of s6 (PID 1). If it exits, finish/halt stops the container so
+# Supervisor — not s6, not a pgrep loop — owns the restart.
+set -euo pipefail
+
+if [ -x /opt/lard/bin/python ]; then
+  PYTHON=/opt/lard/bin/python
+else
+  PYTHON=python3
+fi
+
+exec "${PYTHON}" -u /app/controller.py

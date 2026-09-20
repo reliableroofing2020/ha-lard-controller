@@ -1,0 +1,10 @@
+#!/command/with-contenv bash
+# Any controller exit (crash or clean) brings the container down.
+# Supervisor watchdog / restart policy then recreates the add-on.
+set -eu
+echo "lard-controller service exit code=${1:-unknown} — stopping container for Supervisor restart" >&2
+if [ -x /run/s6/basedir/bin/halt ]; then
+  exec /run/s6/basedir/bin/halt
+fi
+kill -s TERM 1 || true
+exit "${1:-1}"
