@@ -475,11 +475,17 @@ class Braiins:
         code, hb = self._call("GET", "/api/v1/miner/hw/hashboards")
         out = []
         for b in (hb or {}).get("hashboards") or []:
+            if not isinstance(b, dict):
+                continue
             en = b.get("enabled")
             if en is None:
                 en = b.get("is_enabled")
             if en:
-                out.append(str(b.get("id")))
+                bid = norm_board_id(b.get("id"))
+                if not bid:
+                    bid = norm_board_id(b.get("hashboard_id"))
+                if bid:
+                    out.append(bid)
         return sorted(out), code, hb
 
     def approx_power_w(self):
@@ -576,6 +582,26 @@ def _walk_keys(obj):
     elif isinstance(obj, list):
         for item in obj:
             yield from _walk_keys(item)
+
+
+def norm_board_id(val) -> str:
+    """Normalize hashboard id so 1, '1', and 1.0 all compare as '1'."""
+    if val is None or isinstance(val, bool):
+        return ""
+    if isinstance(val, (int, float)):
+        if float(val) == int(val):
+            return str(int(val))
+        return str(val)
+    s = str(val).strip()
+    if not s or s.lower() in {"none", "null"}:
+        return ""
+    try:
+        f = float(s)
+        if f == int(f):
+            return str(int(f))
+    except ValueError:
+        pass
+    return s
 
 
 def is_http_5xx(code) -> bool:
@@ -809,7 +835,7 @@ class MqttPublisher:
             "name": "LARD Controller",
             "manufacturer": "LARD",
             "model": "Board-priority Braiins actuator",
-            "sw_version": "0.1.2",
+            "sw_version": "0.1.3",
         }
         sensors = [
             (
@@ -1253,50 +1279,125 @@ class Controller:
                 return last
         return last
 
-    def _normalize_board_ids(self, enabled_ids: list[str]) -> list[str]:
-        enabled_ids = [str(x) for x in enabled_ids]
+    def _normalize_board_ids(self, enabled_ids) -> list[str]:
+        enabled_ids = [norm_board_id(x) for x in (enabled_ids or []) if norm_board_id(x)]
         if any(i in enabled_ids for i in ("2", "3")) and "1" not in enabled_ids:
             enabled_ids = ["1"] + [i for i in enabled_ids if i != "1"]
         return enabled_ids
 
     def _boards_match(self, actual_ids, expect_ids) -> bool:
-        return sorted(str(x) for x in actual_ids) == sorted(str(x) for x in expect_ids)
+        return sorted(self._normalize_board_ids(actual_ids)) == sorted(self._normalize_board_ids(expect_ids))
 
-    def _read_boards_retrying(self):
-        last_ids, last_code = [], None
-        attempts = (0,) + API_5XX_BACKOFF_S
-        for i, delay in enumerate(attempts):
-            if delay:
-                self.log(f"read_boards transient http={last_code} retry_in={delay}s")
-                self._sleep(delay)
-            try:
-                actual, code, _ = self.b.enabled_ids()
-            except Exception as e:
-                self.last_error = f"read_boards_exc:{e}"
-                return None, None
-            last_ids, last_code = actual, code
-            if code == 200:
-                return actual, code
-            if not is_http_5xx(code):
-                self.last_error = f"read_boards_http_{code}"
-                return None, code
-        self.last_error = f"read_boards_http_{last_code}"
-        return None, last_code
+    def _incomplete_boards(self, actual_ids, expect_ids) -> bool:
+        """Empty/unknown read — transient during pause/ramp. A full ONE/TWO/THREE
+        topology that is simply smaller than expect is a real mismatch (PATCH)."""
+        actual = set(self._normalize_board_ids(actual_ids))
+        expect = set(self._normalize_board_ids(expect_ids))
+        if not expect:
+            return False
+        if not actual:
+            return True
+        if actual < expect:
+            actual_l = sorted(actual)
+            if any(self._boards_match(actual_l, BOARD_MAP[m]) for m in BOARD_MAP):
+                return False
+            return True
+        return False
+
+    def _known_board_ids(self) -> list[str]:
+        raw = (self.boards_str or "").strip()
+        if not raw or raw in {"none", "unknown"}:
+            return []
+        return self._normalize_board_ids(raw.split(","))
+
+    def _boards_already_satisfied(self, mode: str, obs: MinerObservation | None = None) -> bool:
+        """Stage B is done: topology already matches, or PAUSED↔ONE_BOARD same map."""
+        if mode not in BOARD_MAP:
+            return False
+        expect = BOARD_MAP[mode]
+        if obs is not None and obs.boards_ok and self._boards_match(obs.enabled_ids, expect):
+            return True
+        # A populated non-matching read wins over last-known / identical-map skip.
+        if (
+            obs is not None
+            and obs.boards_ok
+            and obs.enabled_ids
+            and not self._incomplete_boards(obs.enabled_ids, expect)
+            and not self._boards_match(obs.enabled_ids, expect)
+        ):
+            return False
+        known = self._known_board_ids()
+        if known and self._boards_match(known, expect):
+            return True
+        settled = self._settled_mode()
+        same_map = settled in BOARD_MAP and self._boards_match(BOARD_MAP[settled], expect)
+        if not same_map:
+            return False
+        # Identical map (PAUSED and ONE_BOARD are both [1]). Skip PATCH/wait
+        # unless we positively see a different populated topology.
+        if obs is None or not obs.boards_ok or self._incomplete_boards(obs.enabled_ids, expect):
+            return True
+        return self._boards_match(obs.enabled_ids, expect)
+
+    def _read_boards_once(self):
+        try:
+            actual, code, _ = self.b.enabled_ids()
+            return actual, code
+        except Exception as e:
+            self.last_error = f"read_boards_exc:{e}"
+            return None, None
 
     def _ensure_boards(self, enabled_ids: list[str]) -> bool:
         expect = self._normalize_board_ids(enabled_ids)
-        actual, code = self._read_boards_retrying()
-        if code != 200 or actual is None:
-            if not self.last_error:
+        if self._boards_match(self._known_board_ids(), expect):
+            self.log(f"boards already match {expect}, skip PATCH/wait")
+            return True
+
+        last_actual, last_code = [], None
+        for delay in (0,) + API_5XX_BACKOFF_S:
+            if delay:
+                self.log(
+                    f"read_boards retry_in={delay}s last_http={last_code} last_actual={last_actual}"
+                )
+                self._sleep(delay)
+            actual, code = self._read_boards_once()
+            last_actual, last_code = actual, code
+            if actual is None and code is None:
+                return False
+            if is_http_5xx(code):
+                continue
+            if code != 200:
                 self.last_error = f"read_boards_http_{code}"
-            return False
-        if self._boards_match(actual, expect):
+                return False
+            if self._boards_match(actual, expect):
+                self.boards_str = ",".join(sorted(expect)) if expect else "none"
+                self.log(f"boards already match {expect}, skip PATCH/wait")
+                return True
+            if self._incomplete_boards(actual, expect):
+                self.log(f"boards incomplete actual={actual} expect={expect}")
+                continue
+            return self._set_boards(expect)
+
+        if last_code == 200 and self._boards_match(last_actual or [], expect):
             self.boards_str = ",".join(sorted(expect)) if expect else "none"
+            return True
+        if last_code is not None and last_code != 200:
+            self.last_error = f"read_boards_http_{last_code}"
+            return False
+        if self._boards_match(self._known_board_ids(), expect):
+            self.log(f"boards last-known match {expect}, skip PATCH/wait after empty polls")
             return True
         return self._set_boards(expect)
 
     def _set_boards(self, enabled_ids: list[str]) -> bool:
         enabled_ids = self._normalize_board_ids(enabled_ids)
+        # Never PATCH/wait if the live set already matches (int vs str included).
+        actual, code = self._read_boards_once()
+        if code == 200 and actual is not None and self._boards_match(actual, enabled_ids):
+            self.boards_str = ",".join(sorted(enabled_ids)) if enabled_ids else "none"
+            self.log(f"boards already match {enabled_ids} before PATCH, skip wait")
+            return True
+
         all_ids = ["1", "2", "3"]
         to_enable = [i for i in all_ids if i in enabled_ids]
         to_disable = [i for i in all_ids if i not in enabled_ids]
@@ -1315,10 +1416,10 @@ class Controller:
                 return False
 
         # HTTP 200 on hashboard PATCH = accepted, not applied.
-        # Poll GET every ~5s; wait ≥ board_wait_seconds before failure.
-        # A transient 5xx during poll is "not yet", not an immediate ERROR.
+        # Poll GET; empty/partial/5xx are transient. Compare with normalized ids.
         expect = sorted(to_enable)
         deadline = self._now() + self._board_wait_s()
+        empty_attempt = 0
         while self._now() < deadline:
             self.health.touch()
             try:
@@ -1327,10 +1428,19 @@ class Controller:
                 self.log(f"board_poll exc: {e}")
                 actual, code = [], 0
             self.log(f"board_poll expect={expect} actual={actual} http={code}")
-            if code == 200 and actual == expect:
+            if code == 200 and self._boards_match(actual, expect):
                 self.last_board_change_ts = self._now()
-                self.boards_str = ",".join(actual) if actual else "none"
+                self.boards_str = ",".join(sorted(expect)) if expect else "none"
                 return True
+            transient = is_http_5xx(code) or (
+                code == 200 and self._incomplete_boards(actual, expect)
+            )
+            if transient and empty_attempt < len(API_5XX_BACKOFF_S):
+                delay = API_5XX_BACKOFF_S[empty_attempt]
+                empty_attempt += 1
+                self.log(f"board_poll transient retry_in={delay}s")
+                self._sleep(delay)
+                continue
             self._sleep(BOARD_POLL_S)
         self.last_error = f"board_wait_timeout expect={expect}"
         return False
@@ -1371,7 +1481,7 @@ class Controller:
         if code != 200:
             self.last_error = f"read_boards_http_{code}"
             return obs
-        obs.enabled_ids = [str(i) for i in ids]
+        obs.enabled_ids = [norm_board_id(i) for i in ids if norm_board_id(i)]
         obs.boards_ok = True
         self.boards_str = ",".join(obs.enabled_ids) if obs.enabled_ids else "none"
 
@@ -1568,7 +1678,9 @@ class Controller:
                     if not self._wait_until(self._paused_confirmed, "pause_wait_timeout"):
                         self._mark_error(self.last_error or "pause_wait_timeout")
                         return False
-                if not self._ensure_boards(BOARD_MAP["PAUSED"]):
+                if self._boards_already_satisfied("PAUSED", obs):
+                    self.log("pause boards already match, skip PATCH/wait")
+                elif not self._ensure_boards(BOARD_MAP["PAUSED"]):
                     self._mark_error(self.last_error or "board_pause_failed")
                     return False
                 obs = self._observe_retrying()
@@ -1587,7 +1699,11 @@ class Controller:
             if not self._ensure_power_target():
                 self._mark_error(self.last_error or "power_target_failed")
                 return False
-            if not self._ensure_boards(BOARD_MAP[mode]):
+            # PAUSED→ONE_BOARD shares ["1"]. If topology already matches (or
+            # identical map + empty/partial read), skip PATCH and board_wait.
+            if self._boards_already_satisfied(mode, obs):
+                self.log(f"Stage B satisfied expect={BOARD_MAP[mode]}, skip PATCH/wait")
+            elif not self._ensure_boards(BOARD_MAP[mode]):
                 self._mark_error(self.last_error or "boards_failed")
                 return False
 
@@ -1610,8 +1726,11 @@ class Controller:
                     self._mark_error(self.last_error or "resume_wait_timeout")
                     return False
 
-            # Stage B: requested boards match (PATCH 200 = accepted; poll topology).
-            if not self._ensure_boards(BOARD_MAP[mode]):
+            # Stage B: skip if already matched. PATCH 200 = accepted; poll topology.
+            obs = self.observe_miner() if needs_resume else obs
+            if self._boards_already_satisfied(mode, obs):
+                self.log(f"Stage B still satisfied expect={BOARD_MAP[mode]}")
+            elif not self._ensure_boards(BOARD_MAP[mode]):
                 self._mark_error(self.last_error or "boards_failed")
                 return False
 
