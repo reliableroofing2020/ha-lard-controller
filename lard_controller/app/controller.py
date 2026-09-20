@@ -65,6 +65,7 @@ FORBIDDEN_HA_WRITES = frozenset(
 )
 
 MODES = ("PAUSED", "ONE_BOARD", "TWO_BOARD", "THREE_BOARD")
+ACTUAL_MODES = ("PAUSED", "APPLYING", "ONE_BOARD", "TWO_BOARD", "THREE_BOARD", "ERROR")
 BOARD_MAP = {
     "PAUSED": ["1"],
     "ONE_BOARD": ["1"],
@@ -72,6 +73,32 @@ BOARD_MAP = {
     "THREE_BOARD": ["1", "2", "3"],
 }
 RANK = {"PAUSED": 0, "ONE_BOARD": 1, "TWO_BOARD": 2, "THREE_BOARD": 3}
+
+# GET /api/v1/miner/details `status` — proto MinerStatus + REST names/ints.
+# Do not map board topology onto these; pause/running is independent of hashboards.
+_PAUSED_STATUS = frozenset(
+    {
+        3,
+        "3",
+        "paused",
+        "miner_status_paused",
+        "user_pause",
+        "userpause",
+    }
+)
+_OPERATIONAL_STATUS = frozenset(
+    {
+        2,
+        "2",
+        "normal",
+        "miner_status_normal",
+        "running",
+    }
+)
+
+# Optional post-warmup sanity only. Power=0 during resume warmup is not a failure.
+SANITY_POWER_W = 10.0
+SANITY_HASHRATE = 0.01
 
 # Policy timings from the uploaded actuator — do not invent a new energy policy
 BOARD_POLL_S = 5
@@ -460,6 +487,38 @@ class Braiins:
         """Own cooling by leaving Braiins automatic. No invented PWM policy."""
         return self._call("PUT", "/api/v1/cooling", {"mode": "automatic"})
 
+    def miner_details(self):
+        """GET /api/v1/miner/details — already used for live watts; also carries status."""
+        return self._call("GET", "/api/v1/miner/details")
+
+    def mining_state(self, details=None):
+        """Pause / mining phase from miner details (no new Braiins endpoints)."""
+        if details is None:
+            code, details = self.miner_details()
+        else:
+            code = 200
+        parsed = parse_mining_state(details if isinstance(details, dict) else {})
+        return parsed, code, details
+
+    def approx_hashrate(self):
+        """Best-effort live hashrate from GET /api/v1/miner/stats. Optional sanity only."""
+        try:
+            code, j = self._call("GET", "/api/v1/miner/stats")
+        except Exception:
+            return None
+        if code != 200 or not isinstance(j, dict):
+            return None
+        stats = j.get("miner_stats") if isinstance(j.get("miner_stats"), dict) else j
+        return _find_number(
+            stats,
+            (
+                "real_hashrate",
+                "hashrate",
+                "gigahashrate",
+                "ghs",
+            ),
+        )
+
 
 def _find_number(obj, keys: tuple[str, ...]):
     if isinstance(obj, dict):
@@ -475,6 +534,122 @@ def _find_number(obj, keys: tuple[str, ...]):
             if found is not None:
                 return found
     return None
+
+
+def _norm_status_token(val) -> str:
+    if val is None or isinstance(val, bool):
+        return ""
+    if isinstance(val, (int, float)):
+        if float(val) == int(val):
+            return str(int(val))
+        return str(val)
+    return str(val).strip().lower().replace("-", "_")
+
+
+def _walk_keys(obj):
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield str(k)
+            yield from _walk_keys(v)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield from _walk_keys(item)
+
+
+def _first_phase(obj):
+    """Return stopped/starting/running/stopping from a proto-JSON oneof tree."""
+    phases = ("stopped", "starting", "running", "stopping")
+    if isinstance(obj, dict):
+        nested = obj.get("status")
+        if isinstance(nested, dict):
+            found = _first_phase(nested)
+            if found:
+                return found
+        for phase in phases:
+            if phase in obj:
+                return phase
+        for v in obj.values():
+            found = _first_phase(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _first_phase(item)
+            if found:
+                return found
+    return None
+
+
+def _has_named_key(obj, names: tuple[str, ...]) -> bool:
+    want = {n.lower().replace("-", "_") for n in names}
+    for key in _walk_keys(obj):
+        if key.lower().replace("-", "_") in want:
+            return True
+    return False
+
+
+def parse_mining_state(details) -> dict[str, Any]:
+    """Parse pause / mining phase from GET /api/v1/miner/details JSON.
+
+    Handles legacy `status` (MINER_STATUS_PAUSED / NORMAL or REST ints/names)
+    and `detailed_status` oneof (stopped.user_pause / running / starting).
+    """
+    if not isinstance(details, dict):
+        details = {}
+    status_raw = details.get("status")
+    detailed = details.get("detailed_status")
+    if detailed is None:
+        detailed = details.get("detailedStatus")
+    if not isinstance(detailed, dict):
+        detailed = {}
+
+    phase = _first_phase(detailed) or ""
+    token = _norm_status_token(status_raw)
+    status_paused = status_raw in _PAUSED_STATUS or token in {
+        "3",
+        "paused",
+        "miner_status_paused",
+        "user_pause",
+        "userpause",
+    }
+    status_normal = status_raw in _OPERATIONAL_STATUS or token in {
+        "2",
+        "normal",
+        "miner_status_normal",
+        "running",
+    }
+    user_paused = _has_named_key(details, ("user_pause", "userPause")) or status_paused
+
+    running = phase == "running" or (status_normal and phase not in {"stopped", "stopping", "starting"})
+    starting = phase == "starting"
+    paused = (user_paused or status_paused or phase in {"stopped", "stopping"}) and not running
+    if running:
+        user_paused = False
+
+    return {
+        "status_raw": status_raw,
+        "phase": phase,
+        "user_paused": bool(user_paused and not running),
+        "paused": bool(paused),
+        "running": bool(running),
+        "starting": bool(starting),
+    }
+
+
+@dataclass
+class MinerObservation:
+    enabled_ids: list[str] = field(default_factory=list)
+    boards_ok: bool = False
+    status_raw: Any = None
+    phase: str = ""
+    user_paused: bool = False
+    paused: bool = False
+    running: bool = False
+    starting: bool = False
+    power_w: float | None = None
+    hashrate: float | None = None
+    details_ok: bool = False
+    ok: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -567,7 +742,7 @@ class MqttPublisher:
             "name": "LARD Controller",
             "manufacturer": "LARD",
             "model": "Board-priority Braiins actuator",
-            "sw_version": "0.1.0",
+            "sw_version": "0.1.1",
         }
         sensors = [
             (
@@ -786,6 +961,7 @@ class Controller:
         self.mqtt = MqttPublisher(settings, log)
         self.solar_samples: deque[tuple[float, float]] = deque()
         self.actual_mode = "PAUSED"
+        self.confirmed_operational = "PAUSED"
         self.desired_mode = "PAUSED"
         self.reason = "boot"
         self.last_error = ""
@@ -800,6 +976,9 @@ class Controller:
         self.power_w = None
         self.boards_str = ""
         self.mode_request = "AUTO"
+        self.miner_paused = False
+        self.mining_phase = ""
+        self._resume_ts = 0.0
 
     def writes_allowed(self, enable_on: bool) -> bool:
         """Braiins writes require BOTH the add-on option and the HA gate."""
@@ -932,29 +1111,66 @@ class Controller:
 
         return self._anti_flap(candidate, reason, solar_avg)
 
+    def _settled_mode(self) -> str:
+        """Last confirmed operational mode — never APPLYING/ERROR for policy holds."""
+        if self.actual_mode in RANK:
+            return self.actual_mode
+        if self.confirmed_operational in RANK:
+            return self.confirmed_operational
+        return "PAUSED"
+
     def _anti_flap(self, candidate: str, reason: str, _solar_avg: float):
         now = time.time()
-        if candidate != self.actual_mode:
+        settled = self._settled_mode()
+        if candidate != settled:
             elapsed = now - self.mode_entered_ts
-            going_up = RANK[candidate] > RANK.get(self.actual_mode, 0)
-            going_down = RANK[candidate] < RANK.get(self.actual_mode, 0)
-            if going_up and self.actual_mode != "PAUSED" and elapsed < ANTI_FLAP_UP_S:
-                return self.actual_mode, f"anti_flap_up wait={int(ANTI_FLAP_UP_S - elapsed)}s ({reason})"
+            going_up = RANK[candidate] > RANK.get(settled, 0)
+            going_down = RANK[candidate] < RANK.get(settled, 0)
+            if going_up and settled != "PAUSED" and elapsed < ANTI_FLAP_UP_S:
+                return settled, f"anti_flap_up wait={int(ANTI_FLAP_UP_S - elapsed)}s ({reason})"
             if going_down and candidate != "PAUSED" and elapsed < ANTI_FLAP_DOWN_S:
-                return self.actual_mode, f"anti_flap_down wait={int(ANTI_FLAP_DOWN_S - elapsed)}s ({reason})"
+                return settled, f"anti_flap_down wait={int(ANTI_FLAP_DOWN_S - elapsed)}s ({reason})"
             if (
                 going_up
-                and self.actual_mode != "PAUSED"
+                and settled != "PAUSED"
                 and (now - self.last_board_change_ts) < SETTLE_AFTER_BOARD_S
             ):
                 wait = int(SETTLE_AFTER_BOARD_S - (now - self.last_board_change_ts))
-                return self.actual_mode, f"settle_after_board wait={wait}s"
+                return settled, f"settle_after_board wait={wait}s"
         return candidate, reason
 
-    def _set_boards(self, enabled_ids: list[str]) -> bool:
+    def _now(self) -> float:
+        return time.time()
+
+    def _sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+    def _normalize_board_ids(self, enabled_ids: list[str]) -> list[str]:
         enabled_ids = [str(x) for x in enabled_ids]
         if any(i in enabled_ids for i in ("2", "3")) and "1" not in enabled_ids:
             enabled_ids = ["1"] + [i for i in enabled_ids if i != "1"]
+        return enabled_ids
+
+    def _boards_match(self, actual_ids, expect_ids) -> bool:
+        return sorted(str(x) for x in actual_ids) == sorted(str(x) for x in expect_ids)
+
+    def _ensure_boards(self, enabled_ids: list[str]) -> bool:
+        expect = self._normalize_board_ids(enabled_ids)
+        try:
+            actual, code, _ = self.b.enabled_ids()
+        except Exception as e:
+            self.last_error = f"read_boards_exc:{e}"
+            return False
+        if code != 200:
+            self.last_error = f"read_boards_http_{code}"
+            return False
+        if self._boards_match(actual, expect):
+            self.boards_str = ",".join(sorted(expect)) if expect else "none"
+            return True
+        return self._set_boards(expect)
+
+    def _set_boards(self, enabled_ids: list[str]) -> bool:
+        enabled_ids = self._normalize_board_ids(enabled_ids)
         all_ids = ["1", "2", "3"]
         to_enable = [i for i in all_ids if i in enabled_ids]
         to_disable = [i for i in all_ids if i not in enabled_ids]
@@ -975,68 +1191,233 @@ class Controller:
         # HTTP 200 on hashboard PATCH = accepted, not applied.
         # Poll GET every ~5s; wait ≥ board_wait_seconds before failure.
         expect = sorted(to_enable)
-        deadline = time.time() + max(60, int(self.settings.board_wait_seconds))
-        while time.time() < deadline:
+        deadline = self._now() + max(60, int(self.settings.board_wait_seconds))
+        while self._now() < deadline:
             self.health.touch()
             actual, code, _ = self.b.enabled_ids()
             self.log(f"board_poll expect={expect} actual={actual} http={code}")
             if actual == expect:
-                self.last_board_change_ts = time.time()
+                self.last_board_change_ts = self._now()
                 self.boards_str = ",".join(actual) if actual else "none"
                 return True
-            time.sleep(BOARD_POLL_S)
+            self._sleep(BOARD_POLL_S)
         self.last_error = f"board_wait_timeout expect={expect}"
         return False
 
-    def apply_mode(self, mode: str) -> bool:
-        self.log(f"APPLY begin mode={mode}")
+    def _ensure_power_target(self) -> bool:
         try:
+            code, payload = self.b.get_power_target()
+            current = _find_number(payload, ("watt", "wattage", "power")) if isinstance(payload, dict) else None
+            if code == 200 and current is not None and int(round(current)) == int(self.settings.power_target_w):
+                return True
+        except Exception as e:
+            self.log(f"power_target_read_skip: {e}")
+        code, _ = self.b.set_power(self.settings.power_target_w)
+        self.log(f"power_target http={code}")
+        if code != 200:
+            self.last_error = f"power_target_http_{code}"
+            return False
+        return True
+
+    def _cooling_auto(self) -> None:
+        try:
+            c_code, _ = self.b.set_cooling_profile_auto()
+            self.log(f"cooling automatic http={c_code}")
+        except Exception as e:
+            self.log(f"cooling skip: {e}")
+
+    def observe_miner(self) -> MinerObservation:
+        """Read boards + pause/mining state. Topology alone never confirms a live mode."""
+        obs = MinerObservation()
+        try:
+            ids, code, _ = self.b.enabled_ids()
+        except Exception as e:
+            self.last_error = f"read_boards_exc:{e}"
+            return obs
+        if code != 200:
+            self.last_error = f"read_boards_http_{code}"
+            return obs
+        obs.enabled_ids = [str(i) for i in ids]
+        obs.boards_ok = True
+        self.boards_str = ",".join(obs.enabled_ids) if obs.enabled_ids else "none"
+
+        try:
+            parsed, dcode, _ = self.b.mining_state()
+        except Exception as e:
+            self.last_error = f"read_details_exc:{e}"
+            return obs
+        if dcode != 200:
+            self.last_error = f"read_details_http_{dcode}"
+            return obs
+        if not isinstance(parsed, dict):
+            parsed = parse_mining_state({})
+        obs.details_ok = True
+        obs.status_raw = parsed.get("status_raw")
+        obs.phase = parsed.get("phase") or ""
+        obs.user_paused = bool(parsed.get("user_paused"))
+        obs.paused = bool(parsed.get("paused"))
+        obs.running = bool(parsed.get("running"))
+        obs.starting = bool(parsed.get("starting"))
+        obs.ok = True
+        self.miner_paused = self._is_paused(obs)
+        self.mining_phase = obs.phase or ("paused" if obs.paused else "")
+
+        try:
+            obs.power_w = self.b.approx_power_w()
+            self.power_w = obs.power_w
+        except Exception as e:
+            self.log(f"power_read_skip: {e}")
+        try:
+            obs.hashrate = self.b.approx_hashrate()
+        except Exception as e:
+            self.log(f"hashrate_read_skip: {e}")
+        return obs
+
+    def _is_paused(self, obs: MinerObservation) -> bool:
+        return bool(obs.user_paused or obs.paused)
+
+    def _paused_confirmed(self, obs: MinerObservation) -> bool:
+        if not obs.ok or obs.running:
+            return False
+        return self._is_paused(obs) or obs.phase == "stopped"
+
+    def _in_resume_warmup(self) -> bool:
+        if not self._resume_ts:
+            return False
+        return (self._now() - self._resume_ts) < WARMUP_S
+
+    def _active_confirmed(self, mode: str, obs: MinerObservation) -> bool:
+        """ONE/TWO/THREE_BOARD is confirmed only after boards + not paused + running."""
+        if not obs.ok or mode not in BOARD_MAP or mode == "PAUSED":
+            return False
+        if not self._boards_match(obs.enabled_ids, BOARD_MAP[mode]):
+            return False
+        if self._is_paused(obs) or obs.user_paused:
+            return False
+        if not obs.running:
+            return False
+        # Optional check 5: after WARMUP_S, live watts/hashrate may add
+        # confidence. Power=0 alone is never a failure — especially during
+        # the immediate resume warmup window — and does not block confirm.
+        return True
+
+    def _needs_reconcile(self, desired: str, obs: MinerObservation) -> bool:
+        if desired == "PAUSED":
+            return not self._paused_confirmed(obs)
+        return not self._active_confirmed(desired, obs)
+
+    def infer_actual_mode(self, obs: MinerObservation) -> str:
+        """Map observation → published actual. Never ONE/TWO/THREE while paused."""
+        if not obs.ok:
+            return self.actual_mode
+        if self._paused_confirmed(obs):
+            return "PAUSED"
+        if obs.starting or obs.phase in {"starting", "stopping"}:
+            return "APPLYING"
+        if obs.running:
+            s = set(obs.enabled_ids)
+            if s == {"1", "2", "3"}:
+                return "THREE_BOARD"
+            if s == {"1", "2"}:
+                return "TWO_BOARD"
+            if s == {"1"}:
+                return "ONE_BOARD"
+            return "ERROR"
+        if self._is_paused(obs) or obs.phase == "stopped":
+            return "PAUSED"
+        return "APPLYING"
+
+    def _mark_confirmed(self, mode: str) -> None:
+        self.actual_mode = mode
+        self.confirmed_operational = mode
+        self.mode_entered_ts = self._now()
+        self.last_transition_ts = self._now()
+        self.last_error = ""
+
+    def _mark_error(self, err: str) -> None:
+        self.last_error = err
+        self.actual_mode = "ERROR"
+
+    def _wait_until(self, predicate, fail_msg: str) -> bool:
+        deadline = self._now() + max(60, int(self.settings.board_wait_seconds))
+        while self._now() < deadline:
+            self.health.touch()
+            obs = self.observe_miner()
+            if obs.ok and predicate(obs):
+                return True
+            self._sleep(BOARD_POLL_S)
+        self.last_error = fail_msg
+        return False
+
+    def apply_mode(self, mode: str) -> bool:
+        """Converge miner to desired mode. actual is APPLYING until confirmed."""
+        self.log(f"APPLY begin mode={mode}")
+        self.actual_mode = "APPLYING"
+        try:
+            obs = self.observe_miner()
+            if not obs.ok:
+                self._mark_error(self.last_error or "observe_failed")
+                return False
+
             if mode == "PAUSED":
-                code, _ = self.b.pause()
-                self.log(f"pause http={code}")
-                if code != 200:
-                    self.last_error = f"pause_http_{code}"
+                if not self._paused_confirmed(obs):
+                    code, _ = self.b.pause()
+                    self.log(f"pause http={code}")
+                    if code != 200:
+                        self._mark_error(f"pause_http_{code}")
+                        return False
+                    if not self._wait_until(self._paused_confirmed, "pause_wait_timeout"):
+                        self._mark_error(self.last_error or "pause_wait_timeout")
+                        return False
+                if not self._ensure_boards(BOARD_MAP["PAUSED"]):
+                    self._mark_error(self.last_error or "board_pause_failed")
                     return False
-                if not self._set_boards(BOARD_MAP["PAUSED"]):
-                    return False
-                self.actual_mode = "PAUSED"
-                self.mode_entered_ts = time.time()
-                self.last_transition_ts = time.time()
-                self.last_error = ""
+                obs = self.observe_miner()
+                if not self._paused_confirmed(obs):
+                    code, _ = self.b.pause()
+                    self.log(f"pause http={code}")
+                    if code != 200:
+                        self._mark_error(f"pause_http_{code}")
+                        return False
+                    if not self._wait_until(self._paused_confirmed, "pause_wait_timeout"):
+                        self._mark_error(self.last_error or "pause_wait_timeout")
+                        return False
+                self._mark_confirmed("PAUSED")
                 return True
 
-            code, _ = self.b.set_power(self.settings.power_target_w)
-            self.log(f"power_target http={code}")
-            if code != 200:
-                self.last_error = f"power_target_http_{code}"
+            if not self._ensure_power_target():
+                self._mark_error(self.last_error or "power_target_failed")
+                return False
+            if not self._ensure_boards(BOARD_MAP[mode]):
+                self._mark_error(self.last_error or "boards_failed")
                 return False
 
-            if not self._set_boards(BOARD_MAP[mode]):
+            obs = self.observe_miner()
+            needs_resume = self._is_paused(obs) or obs.user_paused or obs.phase == "stopped"
+            if needs_resume:
+                self._cooling_auto()
+                code, _ = self.b.resume()
+                self.log(f"resume http={code}")
+                if code != 200:
+                    self._mark_error(f"resume_http_{code}")
+                    return False
+                self._resume_ts = self._now()
+            if needs_resume or not obs.running:
+                if not self._wait_until(
+                    lambda o: bool(o.running) and not self._is_paused(o),
+                    "resume_wait_timeout",
+                ):
+                    self._mark_error(self.last_error or "resume_wait_timeout")
+                    return False
+
+            obs = self.observe_miner()
+            if not self._active_confirmed(mode, obs):
+                self._mark_error("active_not_confirmed")
                 return False
-
-            # Own cooling profile: leave Braiins automatic. Failure is non-fatal.
-            try:
-                c_code, _ = self.b.set_cooling_profile_auto()
-                self.log(f"cooling automatic http={c_code}")
-            except Exception as e:
-                self.log(f"cooling skip: {e}")
-
-            code, _ = self.b.resume()
-            self.log(f"resume http={code}")
-            if code != 200:
-                self.last_error = f"resume_http_{code}"
-                return False
-
-            # Tuner warmup before performance judgment (uploaded semantics).
-            time.sleep(min(WARMUP_S, 20))
-            self.health.touch()
-            self.actual_mode = mode
-            self.mode_entered_ts = time.time()
-            self.last_transition_ts = time.time()
-            self.last_error = ""
+            self._mark_confirmed(mode)
             return True
         except Exception as e:
-            self.last_error = f"apply_exc:{e}"
+            self._mark_error(f"apply_exc:{e}")
             self.log(f"APPLY exc {traceback.format_exc()}")
             return False
 
@@ -1050,6 +1431,10 @@ class Controller:
             "mode_request": self.mode_request,
             "desired_mode": self.desired_mode,
             "actual_mode": self.actual_mode,
+            "confirmed_operational": self.confirmed_operational,
+            "miner_paused": self.miner_paused,
+            "mining_phase": self.mining_phase,
+            "resume_warmup": self._in_resume_warmup(),
             "reason": self.reason,
             "last_error": self.last_error,
             "solar_avg_w": round(solar_avg, 1),
@@ -1215,24 +1600,13 @@ class Controller:
         )
 
     def read_actual_from_miner(self):
-        actual, code, _ = self.b.enabled_ids()
-        if code != 200:
-            self.last_error = f"read_boards_http_{code}"
-            return
-        s = set(actual)
-        self.boards_str = ",".join(actual) if actual else "none"
-        if s == {"1", "2", "3"}:
-            self.actual_mode = "THREE_BOARD"
-        elif s == {"1", "2"}:
-            self.actual_mode = "TWO_BOARD"
-        elif s == {"1"}:
-            self.actual_mode = "ONE_BOARD"
-        else:
-            self.actual_mode = "PAUSED"
-        try:
-            self.power_w = self.b.approx_power_w()
-        except Exception as e:
-            self.log(f"power_read_skip: {e}")
+        """Observe miner. Hashboard set {1} while user-paused is PAUSED, not ONE_BOARD."""
+        obs = self.observe_miner()
+        mode = self.infer_actual_mode(obs)
+        self.actual_mode = mode
+        if mode in RANK:
+            self.confirmed_operational = mode
+        return obs
 
     def tick(self):
         self.health.touch()
@@ -1267,15 +1641,35 @@ class Controller:
             return
 
         self.acting = True
-        if desired != self.actual_mode:
-            ok = self.apply_mode(desired)
-            if not ok:
-                self.log(f"APPLY failed err={self.last_error}")
         try:
-            self.power_w = self.b.approx_power_w()
-            ids, code, _ = self.b.enabled_ids()
-            if code == 200:
-                self.boards_str = ",".join(ids) if ids else "none"
+            obs = self.observe_miner()
+        except Exception as e:
+            self.log(f"observe miner failed: {e}")
+            obs = MinerObservation()
+
+        if not obs.ok:
+            # Do not infer a live board mode from topology when pause state is unknown.
+            self.publish(solar_avg, True)
+            return
+
+        if not self._needs_reconcile(desired, obs):
+            if desired == "PAUSED" and self._paused_confirmed(obs):
+                self.actual_mode = "PAUSED"
+                self.confirmed_operational = "PAUSED"
+            elif self._active_confirmed(desired, obs):
+                self.actual_mode = desired
+                self.confirmed_operational = desired
+            self.publish(solar_avg, True)
+            return
+
+        self.actual_mode = "APPLYING"
+        self.reason = f"{reason}|applying"
+        self.publish(solar_avg, True)
+        ok = self.apply_mode(desired)
+        if not ok:
+            self.log(f"APPLY failed err={self.last_error}")
+        try:
+            self.observe_miner()
         except Exception as e:
             self.log(f"post_apply_read: {e}")
         self.publish(solar_avg, True)
