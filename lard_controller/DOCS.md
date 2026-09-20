@@ -69,6 +69,8 @@ Board-priority / anti-flap / async PATCH semantics are unchanged:
 - HTTP 200 on hashboard PATCH = **accepted, not applied**.
 - Poll `GET /api/v1/miner/hw/hashboards` every **5 s**.
 - Wait **≥ 60 s** (`board_wait_seconds`, minimum 60) before declaring a board-topology failure.
+- If the requested topology **already matches**, skip PATCH and board-wait entirely. `PAUSED` and `ONE_BOARD` both use `["1"]` — that transition goes straight to staged resume.
+- Board ids are normalized (`1` vs `"1"`). An empty/partial poll is retried (2s / 5s / 10s / 20s), not treated as a hard miss.
 - Resume confirmation waits **120 s** (`RESUME_WAIT_S`) and does not require mature hashrate.
 - Transient Braiins HTTP 5xx retry with 2s / 5s / 10s / 20s backoff. A single 500 is not `ERROR`.
 - Anti-flap: 10 min up, 5 min down; 15 min settle after a board change. Holds use the last **confirmed** operational mode, never `APPLYING` / `ERROR`.

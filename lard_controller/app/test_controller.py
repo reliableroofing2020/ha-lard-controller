@@ -25,6 +25,7 @@ from controller import (
     Logger,
     Settings,
     metric_trend_rising,
+    norm_board_id,
     parse_mining_state,
 )
 
@@ -84,6 +85,7 @@ class FakeBraiins:
         self._board_delay_left = 0
         self.power_step = 0.0
         self.resume_sets_starting = False
+        self.board_reads = None
 
     def _next_http(self, name: str, default: int = 200) -> int:
         val = getattr(self, name, default)
@@ -202,6 +204,12 @@ class FakeBraiins:
                 self._pending_enabled = None
             else:
                 self._board_delay_left -= 1
+        if self.board_reads is not None:
+            if len(self.board_reads) > 1:
+                cur = self.board_reads.popleft()
+            else:
+                cur = self.board_reads[0] if self.board_reads else list(self.enabled)
+            return list(cur), 200, {"hashboards": []}
         return list(self.enabled), 200, {"hashboards": []}
 
     def set_cooling_profile_auto(self):
@@ -708,6 +716,58 @@ class ResumeConvergenceTests(unittest.TestCase):
         self.assertFalse(metric_trend_rising([40]))
         self.assertTrue(metric_trend_rising([40, 55, 80]))
         self.assertFalse(metric_trend_rising([80, 80]))
+
+
+class BoardMatchSkipTests(unittest.TestCase):
+    def test_paused_to_one_board_same_topology_resume_only(self):
+        """PAUSED→ONE_BOARD with boards already [1]: resume only, no PATCH/wait."""
+        b = paused_one_board()
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.actual_mode = "PAUSED"
+        ctrl.confirmed_operational = "PAUSED"
+        ctrl.tick()
+        self.assertIn("resume", b.write_names())
+        self.assertNotIn("patch_boards", b.write_names())
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertNotIn("board_wait_timeout", ctrl.last_error or "")
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertTrue(b.running)
+
+    def test_enabled_ids_int_vs_str_still_matches(self):
+        self.assertEqual(norm_board_id(1), "1")
+        self.assertEqual(norm_board_id("1"), "1")
+        self.assertEqual(norm_board_id(1.0), "1")
+        b = paused_one_board()
+        b.enabled = [1]
+        ctrl = make_controller(b, "ONE_BOARD")
+        self.assertTrue(ctrl._boards_match([1], ["1"]))
+        self.assertTrue(ctrl._boards_match([1, 2], ["2", "1"]))
+        obs = ctrl.observe_miner()
+        self.assertTrue(ctrl._boards_already_satisfied("ONE_BOARD", obs))
+        ctrl.tick()
+        self.assertIn("resume", b.write_names())
+        self.assertNotIn("patch_boards", b.write_names())
+        self.assertNotIn("board_wait_timeout", ctrl.last_error or "")
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+
+    def test_one_empty_board_poll_then_correct_set_succeeds(self):
+        b = paused_one_board()
+        b.board_reads = deque([[], ["1"]])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ok = ctrl._ensure_boards(["1"])
+        self.assertTrue(ok)
+        self.assertNotIn("board_wait_timeout", ctrl.last_error or "")
+        self.assertNotIn("patch_boards", b.write_names())
+        self.assertTrue(ctrl._boards_match(["1"], ["1"]))
+
+    def test_set_boards_poll_int_ids_do_not_timeout(self):
+        b = running_boards(["1"])
+        b.enabled = [1]
+        ctrl = make_controller(b, "ONE_BOARD")
+        ok = ctrl._set_boards(["1"])
+        self.assertTrue(ok)
+        self.assertNotIn("board_wait_timeout", ctrl.last_error or "")
+        self.assertNotIn("patch_boards", b.write_names())
 
 
 if __name__ == "__main__":

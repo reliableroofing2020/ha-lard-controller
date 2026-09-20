@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.3
+
+- If requested hashboard topology already matches, skip PATCH and `board_wait` (Stage B satisfied). PAUSED→ONE_BOARD shares `["1"]` and goes straight to staged resume.
+- Board id compares are normalized (`1` / `"1"` / `1.0`). `board_wait_timeout` cannot fire when the poll already returns the expected set.
+- One empty or partial board read during pause/ramp retries with 2s / 5s / 10s / 20s backoff; it is not a hard fail.
+- `enable_writes` still defaults false. Resume A→C criteria from 0.1.2 are unchanged.
+
 ## 0.1.2
 
 - Resume confirmation is staged (A: accepted + no longer paused, B: boards match via async poll, C: running/preheat/ramping and watts or hashrate begin rising). Mature/full hashrate is not required in the resume window.
