@@ -69,10 +69,46 @@ Board-priority / anti-flap / async PATCH semantics are unchanged:
 - HTTP 200 on hashboard PATCH = **accepted, not applied**.
 - Poll `GET /api/v1/miner/hw/hashboards` every **5 s**.
 - Wait **≥ 60 s** (`board_wait_seconds`, minimum 60) before declaring failure.
-- Sleep tuner warmup (`min(30, 20)` seconds, uploaded behavior) before judging the transition.
-- Anti-flap: 10 min up, 5 min down; 15 min settle after a board change.
+- Anti-flap: 10 min up, 5 min down; 15 min settle after a board change. Holds use the last **confirmed** operational mode, never `APPLYING` / `ERROR`.
 
 Power target stays **944 W** until someone measures a higher floor.
+
+## Mode reconciliation contract
+
+Desired mode and confirmed operational/actual mode are separate. Published `actual_mode` is one of `PAUSED`, `APPLYING`, `ONE_BOARD`, `TWO_BOARD`, `THREE_BOARD`, `ERROR`.
+
+Hashboard topology alone never confirms a non-`PAUSED` mode. Board set `{1}` while Braiins is still `user_pause` / `MINER_STATUS_PAUSED` is **`PAUSED`**, not `ONE_BOARD`. That is what used to skip resume after an add-on restart (`desired == actual`).
+
+Each tick:
+
+1. Read desired mode (manual / HA / local policy).
+2. Read pause/mining state from `GET /api/v1/miner/details` (`status` + `detailed_status`) — already used for live watts; no new Braiins endpoints.
+3. Read actual board topology from `GET /api/v1/miner/hw/hashboards`.
+4. If desired is `PAUSED`: pause if needed, then mark actual `PAUSED`.
+5. If desired is a board mode:
+   - ensure required boards (poll PATCH until confirmed; skip writes when already correct)
+   - resume only if the miner is paused / not running
+   - wait until Braiins reports active/resumed
+   - only then mark actual equal to desired
+   - while converging, publish `APPLYING`
+
+`ONE_BOARD` / `TWO_BOARD` / `THREE_BOARD` confirm only when all of these are true:
+
+1. Expected hashboards enabled/disabled
+2. Miner is not user-paused
+3. Mining state is active/running
+4. Braiins reports resumed/operational state (`status` normal/running or `detailed_status.running`)
+5. After the startup grace window, power or hashrate may be used as extra sanity. **Power=0 alone is not a failure** during immediate resume warmup.
+
+Idempotent restart examples (same patterns for one/two/three boards):
+
+| Desired | Miner | Boards | Writes |
+| --- | --- | --- | --- |
+| `TWO_BOARD` | paused | 1+2 | resume only; converge to `TWO_BOARD` |
+| `TWO_BOARD` | running | 1 only | enable board 2; no pause/resume |
+| `TWO_BOARD` | running | 1+2 | none |
+
+Dual write gates (`enable_writes` + HA master boolean) and the old-auto refuse path are unchanged.
 
 ## Heartbeat entities (every loop)
 
