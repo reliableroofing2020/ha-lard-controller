@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
+import unittest.mock
+from collections import deque
 from pathlib import Path
 
 from controller import (
+    API_5XX_BACKOFF_S,
     ENT_ENABLE,
     ENT_FAULT,
     ENT_HB,
@@ -14,10 +18,13 @@ from controller import (
     ENT_OLD_AUTO,
     ENT_SOC,
     ENT_STALE,
+    RESUME_WAIT_S,
+    Braiins,
     Controller,
     HealthState,
     Logger,
     Settings,
+    metric_trend_rising,
     parse_mining_state,
 )
 
@@ -67,6 +74,32 @@ class FakeBraiins:
         self.pause_sets_paused = True
         self.details_http = 200
         self.boards_http = 200
+        self.resume_http = 200
+        self.pause_http = 200
+        self.clock = None
+        self.unpause_after_elapsed = None
+        self._resume_clock_at = None
+        self.delay_board_apply_polls = 0
+        self._pending_enabled = None
+        self._board_delay_left = 0
+        self.power_step = 0.0
+        self.resume_sets_starting = False
+
+    def _next_http(self, name: str, default: int = 200) -> int:
+        val = getattr(self, name, default)
+        if isinstance(val, deque):
+            if not val:
+                return default
+            if len(val) == 1:
+                return int(val[0])
+            return int(val.popleft())
+        return int(val)
+
+    def _note_http(self, code: int) -> None:
+        if code == 200:
+            self.fail_count = 0
+        else:
+            self.fail_count += 1
 
     def write_names(self) -> list[str]:
         names = []
@@ -91,16 +124,47 @@ class FakeBraiins:
         self.phase = "running"
         self.status = "normal"
 
+    def _set_starting(self) -> None:
+        self.paused = False
+        self.running = False
+        self.user_paused = False
+        self.phase = "starting"
+        self.status = "starting"
+
+    def _maybe_delayed_unpause(self) -> None:
+        if self.unpause_after_elapsed is None or self.clock is None:
+            return
+        if self._resume_clock_at is None:
+            return
+        if self.clock.t >= self._resume_clock_at + self.unpause_after_elapsed:
+            self._set_starting()
+            if self.power_w is None or self.power_w <= 0:
+                self.power_w = 25.0
+            if not self.power_step:
+                self.power_step = 20.0
+
     def pause(self):
         self.calls.append(("pause",))
+        code = self._next_http("pause_http")
+        self._note_http(code)
+        if code != 200:
+            return code, {}
         if self.pause_sets_paused:
             self._set_paused()
         return 200, {"already_paused": False}
 
     def resume(self):
         self.calls.append(("resume",))
+        if self.clock is not None:
+            self._resume_clock_at = self.clock.t
+        code = self._next_http("resume_http")
+        self._note_http(code)
+        if code != 200:
+            return code, {}
         if self.resume_sets_running:
             self._set_running()
+        elif self.resume_sets_starting:
+            self._set_starting()
         return 200, {"already_mining": False}
 
     def set_power(self, watt: int):
@@ -116,14 +180,29 @@ class FakeBraiins:
         ids = [str(i) for i in ids]
         self.calls.append(("patch_boards", bool(enable), ids))
         if enable:
-            self.enabled = sorted(set(self.enabled) | set(ids))
+            new = sorted(set(self.enabled) | set(ids))
         else:
-            self.enabled = sorted(set(self.enabled) - set(ids))
+            new = sorted(set(self.enabled) - set(ids))
+        if self.delay_board_apply_polls > 0:
+            self._pending_enabled = new
+            self._board_delay_left = int(self.delay_board_apply_polls)
+        else:
+            self.enabled = new
         return 200, {}
 
     def enabled_ids(self):
         self.calls.append(("enabled_ids",))
-        return list(self.enabled), self.boards_http, {"hashboards": []}
+        code = self._next_http("boards_http")
+        self._note_http(code)
+        if code != 200:
+            return [], code, {}
+        if self._pending_enabled is not None:
+            if self._board_delay_left <= 0:
+                self.enabled = self._pending_enabled
+                self._pending_enabled = None
+            else:
+                self._board_delay_left -= 1
+        return list(self.enabled), 200, {"hashboards": []}
 
     def set_cooling_profile_auto(self):
         self.calls.append(("set_cooling",))
@@ -131,6 +210,8 @@ class FakeBraiins:
 
     def approx_power_w(self):
         self.calls.append(("approx_power_w",))
+        if self.power_step and not self.paused and not self.user_paused:
+            self.power_w = (self.power_w or 0.0) + float(self.power_step)
         return self.power_w
 
     def approx_hashrate(self):
@@ -139,6 +220,11 @@ class FakeBraiins:
 
     def mining_state(self, details=None):
         self.calls.append(("mining_state",))
+        code = self._next_http("details_http")
+        self._note_http(code)
+        if code != 200:
+            return {}, code, {}
+        self._maybe_delayed_unpause()
         parsed = {
             "status_raw": self.status,
             "phase": self.phase,
@@ -146,8 +232,10 @@ class FakeBraiins:
             "paused": self.paused,
             "running": self.running,
             "starting": self.phase == "starting",
+            "preheating": self.phase in {"preheating", "preheat"},
+            "ramping": self.phase in {"ramping", "ramp", "quick_ramping"},
         }
-        return parsed, self.details_http, {}
+        return parsed, 200, {}
 
 
 class FakeClock:
@@ -191,6 +279,7 @@ def make_controller(braiins: FakeBraiins, mode_req: str, enable_writes: bool = T
     ctrl._now = clock.now  # type: ignore[method-assign]
     ctrl._sleep = clock.sleep  # type: ignore[method-assign]
     ctrl._clock = clock
+    braiins.clock = clock
     return ctrl
 
 
@@ -264,6 +353,16 @@ class ParseMiningStateTests(unittest.TestCase):
         self.assertTrue(parsed["starting"])
         self.assertFalse(parsed["running"])
         self.assertFalse(parsed["user_paused"])
+
+    def test_preheating_and_ramping_are_transitional(self):
+        pre = parse_mining_state({"detailed_status": {"preheating": {}}})
+        self.assertTrue(pre["preheating"])
+        self.assertFalse(pre["running"])
+        self.assertFalse(pre["paused"])
+        ramp = parse_mining_state({"status": "ramping"})
+        self.assertTrue(ramp["ramping"])
+        self.assertEqual(ramp["phase"], "ramping")
+        self.assertFalse(ramp["running"])
 
 
 class ReconciliationTests(unittest.TestCase):
@@ -480,6 +579,135 @@ class ReconciliationTests(unittest.TestCase):
         self.assertNotIn("resume", b.write_names())
         self.assertEqual(sorted(b.enabled), ["1", "2", "3"])
         self.assertEqual(ctrl.actual_mode, "THREE_BOARD")
+
+
+class ResumeConvergenceTests(unittest.TestCase):
+    def test_resume_wait_constant_is_90_to_120(self):
+        self.assertGreaterEqual(RESUME_WAIT_S, 90)
+        self.assertLessEqual(RESUME_WAIT_S, 120)
+        self.assertEqual(API_5XX_BACKOFF_S, (2, 5, 10, 20))
+        self.assertFalse(Settings().enable_writes)
+
+    def test_stage_abc_low_rising_watts_no_mature_th(self):
+        b = paused_one_board()
+        b.resume_sets_running = False
+        b.resume_sets_starting = True
+        b.power_w = 40.0
+        b.hashrate = 0.002
+        b.power_step = 15.0
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.tick()
+        self.assertIn("resume", b.write_names())
+        self.assertEqual(ctrl.actual_mode, "APPLYING")
+        self.assertEqual(ctrl.last_error, "")
+        self.assertFalse(b.running)
+        self.assertLess(b.power_w, 300)
+        self.assertLess(b.hashrate, 1.0)
+
+    def test_resume_does_not_timeout_at_30s_if_stage_a_clears_later(self):
+        b = paused_one_board()
+        b.resume_sets_running = False
+        b.unpause_after_elapsed = 90
+        ctrl = make_controller(b, "ONE_BOARD")
+        started = ctrl._clock.t
+        ctrl.tick()
+        self.assertGreaterEqual(ctrl._clock.t - started, 90)
+        self.assertLess(ctrl._clock.t - started, 30 + RESUME_WAIT_S)
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertNotIn("resume_wait_timeout", ctrl.last_error or "")
+        self.assertIn(ctrl.actual_mode, ("APPLYING", "ONE_BOARD"))
+        self.assertIn("resume", b.write_names())
+
+    def test_single_http_500_then_success_does_not_error(self):
+        b = paused_one_board()
+        b.boards_http = deque([500, 200])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ok = ctrl.apply_mode("ONE_BOARD")
+        self.assertTrue(ok)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertEqual(ctrl.last_error, "")
+        self.assertEqual(b.fail_count, 0)
+
+    def test_single_resume_500_then_success_does_not_error(self):
+        b = paused_one_board()
+        b.resume_http = deque([500, 200])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(ctrl.last_error, "")
+
+    def test_sustained_500s_after_backoff_window_errors(self):
+        b = paused_one_board()
+        b.boards_http = 500
+        ctrl = make_controller(b, "ONE_BOARD")
+        started = ctrl._clock.t
+        ok = ctrl.apply_mode("ONE_BOARD")
+        self.assertFalse(ok)
+        self.assertEqual(ctrl.actual_mode, "ERROR")
+        self.assertIn("500", ctrl.last_error)
+        self.assertGreaterEqual(ctrl._clock.t - started, sum(API_5XX_BACKOFF_S))
+
+    def test_api_fail_count_resets_after_successful_read(self):
+        b = running_boards(["1"])
+        b.fail_count = 6
+        ctrl = make_controller(b, "ONE_BOARD")
+        obs = ctrl.observe_miner()
+        self.assertTrue(obs.ok)
+        self.assertEqual(b.fail_count, 0)
+
+    def test_braiins_fail_count_resets_on_authenticated_http_200(self):
+        tmp = Path(tempfile.mkdtemp(prefix="lard-braiins-"))
+        settings = Settings(braiins_password="x", data_dir=tmp, share_dir=tmp / "share")
+        client = Braiins(settings, Logger(settings))
+        client.token = "tok"
+        client.token_ts = time.time()
+        client.fail_count = 9
+
+        class Resp:
+            status = 200
+
+            def read(self):
+                return b'{"ok":true}'
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with unittest.mock.patch("controller.urllib.request.urlopen", return_value=Resp()):
+            code, payload = client._call("GET", "/api/v1/miner/details")
+        self.assertEqual(code, 200)
+        self.assertEqual(payload.get("ok"), True)
+        self.assertEqual(client.fail_count, 0)
+
+    def test_board_http_200_delayed_topology_still_converges(self):
+        b = running_boards(["1"])
+        b.delay_board_apply_polls = 3
+        ctrl = make_controller(b, "TWO_BOARD")
+        ctrl.tick()
+        self.assertIn("patch_boards", b.write_names())
+        self.assertEqual(sorted(b.enabled), ["1", "2"])
+        self.assertEqual(ctrl.actual_mode, "TWO_BOARD")
+        self.assertEqual(ctrl.last_error, "")
+
+    def test_paused_correct_boards_still_resumes(self):
+        """0.1.1 regression: boards {1} + user_pause is PAUSED and must resume."""
+        b = paused_one_board()
+        ctrl = make_controller(b, "ONE_BOARD")
+        obs = ctrl.read_actual_from_miner()
+        self.assertEqual(ctrl.actual_mode, "PAUSED")
+        self.assertTrue(ctrl._needs_reconcile("ONE_BOARD", obs))
+        ctrl.tick()
+        self.assertIn("resume", b.write_names())
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertTrue(b.running)
+
+    def test_trend_helper_requires_rise_not_absolute(self):
+        self.assertFalse(metric_trend_rising([40]))
+        self.assertTrue(metric_trend_rising([40, 55, 80]))
+        self.assertFalse(metric_trend_rising([80, 80]))
 
 
 if __name__ == "__main__":

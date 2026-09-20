@@ -7,7 +7,7 @@ configuration:
     description: Main control loop period. Health is 200 while the last loop is newer than 2× this value.
   board_wait_seconds:
     name: Board wait (seconds)
-    description: How long to poll GET hashboards after a PATCH 200 (accepted, not applied). Minimum enforced wait is 60s.
+    description: How long to poll GET hashboards after a PATCH 200 (accepted, not applied). Minimum enforced wait is 60s. Resume confirmation is a separate 120s window and does not use this as a mature-hashrate gate.
   ha_base_url:
     name: Home Assistant URL
     description: Leave empty to use the Supervisor proxy (http://supervisor/core). Set a URL only for local/dev.
