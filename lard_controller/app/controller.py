@@ -97,12 +97,17 @@ _OPERATIONAL_STATUS = frozenset(
 )
 
 # Optional post-warmup sanity only. Power=0 during resume warmup is not a failure.
+# Do not treat these as mature/full-hashrate gates inside the resume window.
 SANITY_POWER_W = 10.0
 SANITY_HASHRATE = 0.01
 
 # Policy timings from the uploaded actuator — do not invent a new energy policy
 BOARD_POLL_S = 5
 WARMUP_S = 30
+# Resume Stage A/C confirmation window. Board topology uses board_wait_seconds.
+RESUME_WAIT_S = 120
+# Transient Braiins 5xx (board/ramp transitions). Do not ERROR on a single 500.
+API_5XX_BACKOFF_S = (2, 5, 10, 20)
 ANTI_FLAP_UP_S = 10 * 60
 ANTI_FLAP_DOWN_S = 5 * 60
 SETTLE_AFTER_BOARD_S = 15 * 60
@@ -110,6 +115,20 @@ SOLAR_AVG_WINDOW_S = 12 * 60
 TWO_HOLD_S = 10 * 60
 THREE_HOLD_S = 10 * 60
 DOWN_HOLD_S = 5 * 60
+# Braiins phases already parsed from miner/details — not new endpoints.
+TRANSITIONAL_PHASES = frozenset(
+    {
+        "starting",
+        "preheating",
+        "preheat",
+        "ramping",
+        "ramp",
+        "quick_ramping",
+        "quickramping",
+        "warming",
+        "warmup",
+    }
+)
 
 BRAIINS_DENY_PATHS = (
     "/reboot",
@@ -413,6 +432,9 @@ class Braiins:
                 except Exception:
                     j = {"raw": raw[:1000]}
                 self.last_ok_iso = utc_iso()
+                # Successful authenticated I/O clears transient fail poisoning.
+                if resp.status == 200:
+                    self.fail_count = 0
                 return resp.status, j
         except urllib.error.HTTPError as e:
             raw = e.read().decode() if e.fp else ""
@@ -556,9 +578,43 @@ def _walk_keys(obj):
             yield from _walk_keys(item)
 
 
+def is_http_5xx(code) -> bool:
+    try:
+        return 500 <= int(code) < 600
+    except (TypeError, ValueError):
+        return False
+
+
+def error_is_http_5xx(err: str) -> bool:
+    if not err:
+        return False
+    token = str(err).rsplit("_", 1)[-1]
+    return is_http_5xx(token)
+
+
+def metric_trend_rising(samples, min_delta: float = 0.0) -> bool:
+    """True when a metric has begun rising (delta/trend), not a mature target."""
+    vals = [float(v) for v in samples if v is not None]
+    if len(vals) < 2:
+        return False
+    return vals[-1] > vals[0] + min_delta
+
+
 def _first_phase(obj):
-    """Return stopped/starting/running/stopping from a proto-JSON oneof tree."""
-    phases = ("stopped", "starting", "running", "stopping")
+    """Return mining phase from a proto-JSON oneof tree (no new endpoints)."""
+    phases = (
+        "stopped",
+        "starting",
+        "running",
+        "stopping",
+        "preheating",
+        "preheat",
+        "ramping",
+        "ramp",
+        "quick_ramping",
+        "warming",
+        "warmup",
+    )
     if isinstance(obj, dict):
         nested = obj.get("status")
         if isinstance(nested, dict):
@@ -620,8 +676,15 @@ def parse_mining_state(details) -> dict[str, Any]:
     }
     user_paused = _has_named_key(details, ("user_pause", "userPause")) or status_paused
 
-    running = phase == "running" or (status_normal and phase not in {"stopped", "stopping", "starting"})
+    if not phase and token in TRANSITIONAL_PHASES | {"running", "stopped", "stopping"}:
+        phase = token
+
+    running = phase == "running" or (
+        status_normal and phase not in {"stopped", "stopping", "starting"} | TRANSITIONAL_PHASES
+    )
     starting = phase == "starting"
+    preheating = phase in {"preheating", "preheat", "warming", "warmup"}
+    ramping = phase in {"ramping", "ramp", "quick_ramping", "quickramping"}
     paused = (user_paused or status_paused or phase in {"stopped", "stopping"}) and not running
     if running:
         user_paused = False
@@ -633,6 +696,8 @@ def parse_mining_state(details) -> dict[str, Any]:
         "paused": bool(paused),
         "running": bool(running),
         "starting": bool(starting),
+        "preheating": bool(preheating),
+        "ramping": bool(ramping),
     }
 
 
@@ -646,6 +711,8 @@ class MinerObservation:
     paused: bool = False
     running: bool = False
     starting: bool = False
+    preheating: bool = False
+    ramping: bool = False
     power_w: float | None = None
     hashrate: float | None = None
     details_ok: bool = False
@@ -742,7 +809,7 @@ class MqttPublisher:
             "name": "LARD Controller",
             "manufacturer": "LARD",
             "model": "Board-priority Braiins actuator",
-            "sw_version": "0.1.1",
+            "sw_version": "0.1.2",
         }
         sensors = [
             (
@@ -1143,7 +1210,48 @@ class Controller:
         return time.time()
 
     def _sleep(self, seconds: float) -> None:
-        time.sleep(seconds)
+        """Sleep in short chunks so /health stays fresh during long backoffs."""
+        remaining = float(seconds)
+        while remaining > 1e-9:
+            self.health.touch()
+            chunk = min(5.0, remaining)
+            time.sleep(chunk)
+            remaining -= chunk
+
+    def _resume_wait_s(self) -> int:
+        return int(RESUME_WAIT_S)
+
+    def _board_wait_s(self) -> int:
+        return max(60, int(self.settings.board_wait_seconds))
+
+    def _http_retry(self, fn, what: str):
+        """Call fn() -> (code, body). Retry transient 5xx; fail only after backoff."""
+        last_code, last_body = None, None
+        attempts = (0,) + API_5XX_BACKOFF_S
+        for i, delay in enumerate(attempts):
+            if delay:
+                self.log(f"{what} transient http={last_code} retry_in={delay}s")
+                self._sleep(delay)
+            code, body = fn()
+            last_code, last_body = code, body
+            if code == 200 or not is_http_5xx(code):
+                return code, body
+        self.log(f"{what} sustained http={last_code} after backoff")
+        return last_code, last_body
+
+    def _observe_retrying(self) -> MinerObservation:
+        last = MinerObservation()
+        attempts = (0,) + API_5XX_BACKOFF_S
+        for i, delay in enumerate(attempts):
+            if delay:
+                self.log(f"observe transient {self.last_error} retry_in={delay}s")
+                self._sleep(delay)
+            last = self.observe_miner()
+            if last.ok:
+                return last
+            if not error_is_http_5xx(self.last_error or ""):
+                return last
+        return last
 
     def _normalize_board_ids(self, enabled_ids: list[str]) -> list[str]:
         enabled_ids = [str(x) for x in enabled_ids]
@@ -1154,15 +1262,33 @@ class Controller:
     def _boards_match(self, actual_ids, expect_ids) -> bool:
         return sorted(str(x) for x in actual_ids) == sorted(str(x) for x in expect_ids)
 
+    def _read_boards_retrying(self):
+        last_ids, last_code = [], None
+        attempts = (0,) + API_5XX_BACKOFF_S
+        for i, delay in enumerate(attempts):
+            if delay:
+                self.log(f"read_boards transient http={last_code} retry_in={delay}s")
+                self._sleep(delay)
+            try:
+                actual, code, _ = self.b.enabled_ids()
+            except Exception as e:
+                self.last_error = f"read_boards_exc:{e}"
+                return None, None
+            last_ids, last_code = actual, code
+            if code == 200:
+                return actual, code
+            if not is_http_5xx(code):
+                self.last_error = f"read_boards_http_{code}"
+                return None, code
+        self.last_error = f"read_boards_http_{last_code}"
+        return None, last_code
+
     def _ensure_boards(self, enabled_ids: list[str]) -> bool:
         expect = self._normalize_board_ids(enabled_ids)
-        try:
-            actual, code, _ = self.b.enabled_ids()
-        except Exception as e:
-            self.last_error = f"read_boards_exc:{e}"
-            return False
-        if code != 200:
-            self.last_error = f"read_boards_http_{code}"
+        actual, code = self._read_boards_retrying()
+        if code != 200 or actual is None:
+            if not self.last_error:
+                self.last_error = f"read_boards_http_{code}"
             return False
         if self._boards_match(actual, expect):
             self.boards_str = ",".join(sorted(expect)) if expect else "none"
@@ -1176,13 +1302,13 @@ class Controller:
         to_disable = [i for i in all_ids if i not in enabled_ids]
 
         if to_disable:
-            code, _ = self.b.patch_boards(False, to_disable)
+            code, _ = self._http_retry(lambda: self.b.patch_boards(False, to_disable), "PATCH disable")
             self.log(f"PATCH disable {to_disable} http={code}")
             if code != 200:
                 self.last_error = f"board_disable_http_{code}"
                 return False
         if to_enable:
-            code, _ = self.b.patch_boards(True, to_enable)
+            code, _ = self._http_retry(lambda: self.b.patch_boards(True, to_enable), "PATCH enable")
             self.log(f"PATCH enable {to_enable} http={code}")
             if code != 200:
                 self.last_error = f"board_enable_http_{code}"
@@ -1190,13 +1316,18 @@ class Controller:
 
         # HTTP 200 on hashboard PATCH = accepted, not applied.
         # Poll GET every ~5s; wait ≥ board_wait_seconds before failure.
+        # A transient 5xx during poll is "not yet", not an immediate ERROR.
         expect = sorted(to_enable)
-        deadline = self._now() + max(60, int(self.settings.board_wait_seconds))
+        deadline = self._now() + self._board_wait_s()
         while self._now() < deadline:
             self.health.touch()
-            actual, code, _ = self.b.enabled_ids()
+            try:
+                actual, code, _ = self.b.enabled_ids()
+            except Exception as e:
+                self.log(f"board_poll exc: {e}")
+                actual, code = [], 0
             self.log(f"board_poll expect={expect} actual={actual} http={code}")
-            if actual == expect:
+            if code == 200 and actual == expect:
                 self.last_board_change_ts = self._now()
                 self.boards_str = ",".join(actual) if actual else "none"
                 return True
@@ -1212,7 +1343,10 @@ class Controller:
                 return True
         except Exception as e:
             self.log(f"power_target_read_skip: {e}")
-        code, _ = self.b.set_power(self.settings.power_target_w)
+        code, _ = self._http_retry(
+            lambda: self.b.set_power(self.settings.power_target_w),
+            "power_target",
+        )
         self.log(f"power_target http={code}")
         if code != 200:
             self.last_error = f"power_target_http_{code}"
@@ -1258,7 +1392,10 @@ class Controller:
         obs.paused = bool(parsed.get("paused"))
         obs.running = bool(parsed.get("running"))
         obs.starting = bool(parsed.get("starting"))
+        obs.preheating = bool(parsed.get("preheating"))
+        obs.ramping = bool(parsed.get("ramping"))
         obs.ok = True
+        self.b.fail_count = 0
         self.miner_paused = self._is_paused(obs)
         self.mining_phase = obs.phase or ("paused" if obs.paused else "")
 
@@ -1312,7 +1449,12 @@ class Controller:
             return self.actual_mode
         if self._paused_confirmed(obs):
             return "PAUSED"
-        if obs.starting or obs.phase in {"starting", "stopping"}:
+        if (
+            obs.starting
+            or obs.preheating
+            or obs.ramping
+            or obs.phase in {"starting", "stopping"} | TRANSITIONAL_PHASES
+        ):
             return "APPLYING"
         if obs.running:
             s = set(obs.enabled_ids)
@@ -1338,8 +1480,9 @@ class Controller:
         self.last_error = err
         self.actual_mode = "ERROR"
 
-    def _wait_until(self, predicate, fail_msg: str) -> bool:
-        deadline = self._now() + max(60, int(self.settings.board_wait_seconds))
+    def _wait_until(self, predicate, fail_msg: str, timeout_s: float | None = None) -> bool:
+        limit = self._board_wait_s() if timeout_s is None else int(timeout_s)
+        deadline = self._now() + max(1, limit)
         while self._now() < deadline:
             self.health.touch()
             obs = self.observe_miner()
@@ -1349,19 +1492,75 @@ class Controller:
         self.last_error = fail_msg
         return False
 
+    def _stage_a_cleared(self, obs: MinerObservation) -> bool:
+        """Resume HTTP accepted and miner no longer reports user_pause / paused."""
+        if not obs.ok:
+            return False
+        return (not self._is_paused(obs)) and (not obs.user_paused)
+
+    def _transitional_operational(self, obs: MinerObservation) -> bool:
+        """running / preheat / ramping / starting — not mature hashrate."""
+        if obs.running or obs.starting or obs.preheating or obs.ramping:
+            return True
+        phase = (obs.phase or "").strip().lower().replace("-", "_")
+        return phase in TRANSITIONAL_PHASES
+
+    def _resume_in_progress(self, desired: str, obs: MinerObservation) -> bool:
+        """Stage C already met: stay APPLYING; do not re-issue resume or long-wait."""
+        if desired not in BOARD_MAP or desired == "PAUSED":
+            return False
+        if not obs.ok or self._is_paused(obs) or obs.user_paused:
+            return False
+        if not self._boards_match(obs.enabled_ids, BOARD_MAP[desired]):
+            return False
+        if self._active_confirmed(desired, obs):
+            return False
+        return self._transitional_operational(obs)
+
+    def _record_trend(self, obs: MinerObservation, hist: dict[str, list]) -> None:
+        if obs.power_w is not None:
+            hist["power"].append(float(obs.power_w))
+        if obs.hashrate is not None:
+            hist["hash"].append(float(obs.hashrate))
+
+    def _trend_rising(self, hist: dict[str, list]) -> bool:
+        return metric_trend_rising(hist.get("power") or []) or metric_trend_rising(hist.get("hash") or [])
+
+    def _wait_stage_c(self, mode: str) -> bool:
+        """Stage C: transitional operational phase AND power/hashrate begins rising."""
+        deadline = self._now() + self._resume_wait_s()
+        hist: dict[str, list] = {"power": [], "hash": []}
+        while self._now() < deadline:
+            self.health.touch()
+            obs = self.observe_miner()
+            if obs.ok:
+                if self._active_confirmed(mode, obs):
+                    return True
+                if self._transitional_operational(obs) and not self._is_paused(obs):
+                    self._record_trend(obs, hist)
+                    if self._trend_rising(hist):
+                        self.log(
+                            f"resume stage C ok phase={obs.phase} "
+                            f"power={obs.power_w} hashrate={obs.hashrate}"
+                        )
+                        return True
+            self._sleep(BOARD_POLL_S)
+        self.last_error = "resume_wait_timeout"
+        return False
+
     def apply_mode(self, mode: str) -> bool:
         """Converge miner to desired mode. actual is APPLYING until confirmed."""
         self.log(f"APPLY begin mode={mode}")
         self.actual_mode = "APPLYING"
         try:
-            obs = self.observe_miner()
+            obs = self._observe_retrying()
             if not obs.ok:
                 self._mark_error(self.last_error or "observe_failed")
                 return False
 
             if mode == "PAUSED":
                 if not self._paused_confirmed(obs):
-                    code, _ = self.b.pause()
+                    code, _ = self._http_retry(self.b.pause, "pause")
                     self.log(f"pause http={code}")
                     if code != 200:
                         self._mark_error(f"pause_http_{code}")
@@ -1372,9 +1571,9 @@ class Controller:
                 if not self._ensure_boards(BOARD_MAP["PAUSED"]):
                     self._mark_error(self.last_error or "board_pause_failed")
                     return False
-                obs = self.observe_miner()
+                obs = self._observe_retrying()
                 if not self._paused_confirmed(obs):
-                    code, _ = self.b.pause()
+                    code, _ = self._http_retry(self.b.pause, "pause")
                     self.log(f"pause http={code}")
                     if code != 200:
                         self._mark_error(f"pause_http_{code}")
@@ -1392,29 +1591,50 @@ class Controller:
                 self._mark_error(self.last_error or "boards_failed")
                 return False
 
-            obs = self.observe_miner()
+            obs = self._observe_retrying()
             needs_resume = self._is_paused(obs) or obs.user_paused or obs.phase == "stopped"
             if needs_resume:
                 self._cooling_auto()
-                code, _ = self.b.resume()
+                code, _ = self._http_retry(self.b.resume, "resume")
                 self.log(f"resume http={code}")
                 if code != 200:
                     self._mark_error(f"resume_http_{code}")
                     return False
                 self._resume_ts = self._now()
-            if needs_resume or not obs.running:
+                # Stage A: accepted resume and no longer user_pause / paused.
                 if not self._wait_until(
-                    lambda o: bool(o.running) and not self._is_paused(o),
+                    self._stage_a_cleared,
                     "resume_wait_timeout",
+                    timeout_s=self._resume_wait_s(),
                 ):
                     self._mark_error(self.last_error or "resume_wait_timeout")
                     return False
 
-            obs = self.observe_miner()
-            if not self._active_confirmed(mode, obs):
-                self._mark_error("active_not_confirmed")
+            # Stage B: requested boards match (PATCH 200 = accepted; poll topology).
+            if not self._ensure_boards(BOARD_MAP[mode]):
+                self._mark_error(self.last_error or "boards_failed")
                 return False
-            self._mark_confirmed(mode)
+
+            obs = self._observe_retrying()
+            if self._active_confirmed(mode, obs):
+                self._mark_confirmed(mode)
+                return True
+
+            # Stage C: running/preheat/ramping (or starting) AND watts/hashrate rising.
+            # Do not require mature/full hashrate in this window.
+            if needs_resume or not obs.running:
+                if not self._wait_stage_c(mode):
+                    self._mark_error(self.last_error or "resume_wait_timeout")
+                    return False
+
+            obs = self.observe_miner()
+            if self._active_confirmed(mode, obs):
+                self._mark_confirmed(mode)
+                return True
+            # Resume is operationally successful; remain APPLYING until final confirm.
+            self.actual_mode = "APPLYING"
+            self.last_error = ""
+            self.log(f"resume operational APPLYING until confirm mode={mode} phase={obs.phase}")
             return True
         except Exception as e:
             self._mark_error(f"apply_exc:{e}")
@@ -1662,6 +1882,13 @@ class Controller:
             self.publish(solar_avg, True)
             return
 
+        if self._resume_in_progress(desired, obs):
+            self.actual_mode = "APPLYING"
+            self.last_error = ""
+            self.reason = f"{reason}|applying"
+            self.publish(solar_avg, True)
+            return
+
         self.actual_mode = "APPLYING"
         self.reason = f"{reason}|applying"
         self.publish(solar_avg, True)
@@ -1682,7 +1909,8 @@ def main() -> int:
     log("controller starting (Supervisor add-on foreground)")
     log(
         f"miner={settings.miner_url} poll={settings.poll_seconds}s "
-        f"board_wait>={settings.board_wait_seconds}s enable_writes={settings.enable_writes} "
+        f"board_wait>={settings.board_wait_seconds}s resume_wait={RESUME_WAIT_S}s "
+        f"enable_writes={settings.enable_writes} "
         f"power_target={settings.power_target_w}W"
     )
     if settings.enable_writes:

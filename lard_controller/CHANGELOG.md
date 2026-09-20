@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.2
+
+- Resume confirmation is staged (A: accepted + no longer paused, B: boards match via async poll, C: running/preheat/ramping and watts or hashrate begin rising). Mature/full hashrate is not required in the resume window.
+- Resume wait is 120s (`RESUME_WAIT_S`). A miner that leaves `user_pause` after 30s no longer false-fails.
+- After Stage C, resume is operationally successful and actual stays `APPLYING` until running+boards confirm the live mode.
+- Transient Braiins HTTP 5xx during board/ramp transitions retry with 2s / 5s / 10s / 20s backoff. A single 500 does not ERROR; sustained 5xx after that window does.
+- `api_fail_count` (Braiins `fail_count`) resets after a successful authenticated read so a transient error does not poison the next state.
+- Hashboard PATCH HTTP 200 remains accepted-not-applied; topology is still polled. `enable_writes` still defaults false.
+
 ## 0.1.1
 
 - Mode reconciliation no longer treats hashboard topology as a confirmed live mode.
