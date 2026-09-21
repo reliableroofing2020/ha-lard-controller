@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.5
+
+- Cooling / fan-profile writes are **maintenance-gated**. A live `PUT /api/v1/cooling/mode` while hashing stalls this site's BOS+ (~26.09) miner (PAUSED/0W → APPLYING/0W / `read_boards_http_500`). The add-on now never writes cooling mid-hash.
+- When the desired profile differs from the applied profile: APPLYING → serialize Braiins writes → pause (`user_pause`) → verify pause + ~0 W → tagged `{"auto":{"max_fan_speed": N, ...}}` PUT → read back / confirm → short stabilize → resume → verify run / boards / watts / TH recovering → only then publish the operating mode as actual.
+- Intentional pause during this sequence is not `ERROR`. The controller stays `APPLYING` for the whole transition.
+- Cooling PUT failure or resume failure: restore the known-good profile if possible, pause the miner safely, enter `ERROR`. No hand-off to legacy fan automations or `switch.solar_miner_auto_enable`.
+- Idempotent: desired == applied skips pause and cooling PUT. Dwell (`cooling_dwell_seconds`, default 600) blocks rapid re-transitions from solar/SOC/slider flaps. Thermal abort (`CHIP_ABORT_F=180`) still restores unconstrained 100, but through the same gated sequence (dwell bypassed).
+- One configurable envelope per major board-count state (ONE_BOARD / TWO_BOARD / THREE_BOARD / PAUSED). Values are **TBD/measured placeholders**, not hard finals. `input_number.lard_fan_max_pct` is only an envelope cap on the desired profile — it never live-PUTs while hashing.
+- Auth unchanged: raw `Authorization` token (no Bearer). Cooling API remains `PUT /api/v1/cooling/mode`. The old `PUT /api/v1/cooling {"mode":"automatic"}` wipe path stays gone. Only this add-on writes cooling; keep `automation.solar_miner_fan_watchdog` off.
+
 ## 0.1.4
 
 - Own Braiins OS+ fan max ceiling over the LAN API. `PUT /api/v1/cooling/mode` with tagged-union `{"auto":{"max_fan_speed": N}}` (integer percent 0–100). The old wipe path `PUT /api/v1/cooling {"mode":"automatic"}` is gone.

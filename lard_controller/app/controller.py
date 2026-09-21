@@ -43,6 +43,11 @@ ENT_STALE = "binary_sensor.solar_miner_critical_stale"
 ENT_HB = "binary_sensor.lard_api_heartbeat"
 ENT_OLD_AUTO = "switch.solar_miner_auto_enable"
 ENT_FAN_MAX = "input_number.lard_fan_max_pct"
+# Optional per-mode envelope helpers. Missing → add-on options (TBD/measured).
+ENT_COOLING_ONE_MAX = "input_number.lard_cooling_one_board_max_pct"
+ENT_COOLING_TWO_MAX = "input_number.lard_cooling_two_board_max_pct"
+ENT_COOLING_THREE_MAX = "input_number.lard_cooling_three_board_max_pct"
+ENT_COOLING_PAUSED_MAX = "input_number.lard_cooling_paused_max_pct"
 
 # Heartbeat / health entities published every loop (not /local JSON)
 ENT_CTRL_ONLINE = "binary_sensor.lard_controller_online"
@@ -110,7 +115,16 @@ FAN_MAX_DEFAULT = 100
 FAN_MAX_MIN = 0
 FAN_MAX_MAX = 100
 MIN_REQUIRED_FANS = 2
-ADDON_VERSION = "0.1.4"
+# Pause-verify: watts at/under this count as idle (~0 W) for cooling writes.
+COOLING_IDLE_POWER_W = 10.0
+# Placeholders — TBD/measured. Do not treat as final site values.
+COOLING_ONE_BOARD_MAX_PCT = 70
+COOLING_TWO_BOARD_MAX_PCT = 85
+COOLING_THREE_BOARD_MAX_PCT = 100
+COOLING_PAUSED_MAX_PCT = 100
+COOLING_DWELL_S = 10 * 60
+COOLING_STABILIZE_S = 5
+ADDON_VERSION = "0.1.5"
 
 # Policy timings from the uploaded actuator — do not invent a new energy policy
 BOARD_POLL_S = 5
@@ -174,6 +188,17 @@ class Settings:
     health_port: int = 8099
     data_dir: Path = field(default_factory=lambda: Path("/data"))
     share_dir: Path = field(default_factory=lambda: Path("/share"))
+    # Cooling envelopes are placeholders (TBD/measured). One profile per board-count.
+    cooling_dwell_seconds: int = COOLING_DWELL_S
+    cooling_stabilize_seconds: int = COOLING_STABILIZE_S
+    cooling_one_board_max_fan_pct: int = COOLING_ONE_BOARD_MAX_PCT
+    cooling_two_board_max_fan_pct: int = COOLING_TWO_BOARD_MAX_PCT
+    cooling_three_board_max_fan_pct: int = COOLING_THREE_BOARD_MAX_PCT
+    cooling_paused_max_fan_pct: int = COOLING_PAUSED_MAX_PCT
+    cooling_one_board_min_fan_pct: int = 0
+    cooling_two_board_min_fan_pct: int = 0
+    cooling_three_board_min_fan_pct: int = 0
+    cooling_paused_min_fan_pct: int = 0
 
     def tz(self) -> ZoneInfo:
         try:
@@ -254,6 +279,49 @@ def load_settings() -> Settings:
     s.mqtt_password = str(pick("mqtt_password", "LARD_MQTT_PASSWORD", default=""))
     s.timezone = str(pick("timezone", "TZ", "LARD_TIMEZONE", default=s.timezone))
     s.health_port = int(os.environ.get("LARD_HEALTH_PORT", s.health_port))
+    s.cooling_dwell_seconds = int(
+        pick("cooling_dwell_seconds", "LARD_COOLING_DWELL_SECONDS", default=s.cooling_dwell_seconds)
+    )
+    s.cooling_stabilize_seconds = int(
+        pick(
+            "cooling_stabilize_seconds",
+            "LARD_COOLING_STABILIZE_SECONDS",
+            default=s.cooling_stabilize_seconds,
+        )
+    )
+
+    def _pct_opt(*names, default=100):
+        raw = pick(*names, default=default)
+        try:
+            n = int(round(float(raw)))
+        except (TypeError, ValueError):
+            n = int(default)
+        return max(FAN_MAX_MIN, min(FAN_MAX_MAX, n))
+
+    s.cooling_one_board_max_fan_pct = _pct_opt(
+        "cooling_one_board_max_fan_pct", default=s.cooling_one_board_max_fan_pct
+    )
+    s.cooling_two_board_max_fan_pct = _pct_opt(
+        "cooling_two_board_max_fan_pct", default=s.cooling_two_board_max_fan_pct
+    )
+    s.cooling_three_board_max_fan_pct = _pct_opt(
+        "cooling_three_board_max_fan_pct", default=s.cooling_three_board_max_fan_pct
+    )
+    s.cooling_paused_max_fan_pct = _pct_opt(
+        "cooling_paused_max_fan_pct", default=s.cooling_paused_max_fan_pct
+    )
+    s.cooling_one_board_min_fan_pct = _pct_opt(
+        "cooling_one_board_min_fan_pct", default=s.cooling_one_board_min_fan_pct
+    )
+    s.cooling_two_board_min_fan_pct = _pct_opt(
+        "cooling_two_board_min_fan_pct", default=s.cooling_two_board_min_fan_pct
+    )
+    s.cooling_three_board_min_fan_pct = _pct_opt(
+        "cooling_three_board_min_fan_pct", default=s.cooling_three_board_min_fan_pct
+    )
+    s.cooling_paused_min_fan_pct = _pct_opt(
+        "cooling_paused_min_fan_pct", default=s.cooling_paused_min_fan_pct
+    )
 
     data_override = os.environ.get("LARD_DATA_DIR")
     if data_override:
@@ -384,6 +452,36 @@ def ha_token(settings: Settings) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Cooling profile (one envelope per major board-count state)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class CoolingProfile:
+    """Measured-safe auto envelope. Values are configurable placeholders, not finals."""
+
+    name: str
+    max_fan_speed: int
+    min_fan_speed: int | None = None
+    minimum_required_fans: int | None = None
+
+    def matches(self, other: CoolingProfile | None) -> bool:
+        if other is None:
+            return False
+        return self.max_fan_speed == other.max_fan_speed and (self.min_fan_speed or 0) == (
+            other.min_fan_speed or 0
+        )
+
+    def extra_auto(self) -> dict[str, Any]:
+        extra: dict[str, Any] = {}
+        if self.min_fan_speed:
+            extra["min_fan_speed"] = int(self.min_fan_speed)
+        if self.minimum_required_fans is not None:
+            extra["minimum_required_fans"] = int(self.minimum_required_fans)
+        elif self.max_fan_speed >= FAN_MAX_DEFAULT:
+            extra["minimum_required_fans"] = MIN_REQUIRED_FANS
+        return extra
+
+
+# ---------------------------------------------------------------------------
 # Braiins OS+ REST (API ~1.8.0)
 # ---------------------------------------------------------------------------
 class Braiins:
@@ -394,6 +492,7 @@ class Braiins:
         self.token_ts = 0.0
         self.fail_count = 0
         self.last_ok_iso = ""
+        self._io_lock = threading.RLock()
 
     @property
     def miner(self) -> str:
@@ -427,6 +526,11 @@ class Braiins:
         lowered = path.lower()
         if any(deny in lowered for deny in BRAIINS_DENY_PATHS):
             raise RuntimeError(f"refused Braiins path {path} (reboot/reset denied)")
+        # Serialize all Braiins I/O so a cooling transition cannot race other writers.
+        with self._io_lock:
+            return self._call_locked(method, path, body=body, timeout=timeout)
+
+    def _call_locked(self, method: str, path: str, body=None, timeout=30):
         self.ensure_auth()
         headers = {
             "Authorization": self.token,  # raw token, not Bearer — Braiins OS+ 1.8
@@ -582,12 +686,14 @@ def celsius_to_fahrenheit(c) -> float:
 
 
 def parse_cooling_telemetry(state) -> dict[str, Any]:
-    """Best-effort chip °F / fan RPM / fan % from GET /api/v1/cooling/state."""
+    """Best-effort chip °F / fan RPM / fan % / envelope from GET /api/v1/cooling/state."""
     out: dict[str, Any] = {
         "chip_temp_f": None,
         "chip_temp_c": None,
         "fan_rpm": None,
         "fan_pct": None,
+        "max_fan_speed": None,
+        "min_fan_speed": None,
         "fans": [],
     }
     if not isinstance(state, dict):
@@ -636,6 +742,18 @@ def parse_cooling_telemetry(state) -> dict[str, Any]:
         out["fan_rpm"] = max(rpms)
     if pcts:
         out["fan_pct"] = round(max(pcts), 1)
+    max_fan = _find_number(state, ("max_fan_speed",))
+    min_fan = _find_number(state, ("min_fan_speed",))
+    try:
+        if max_fan is not None:
+            out["max_fan_speed"] = clamp_fan_max_pct(max_fan)
+    except (TypeError, ValueError):
+        pass
+    try:
+        if min_fan is not None:
+            out["min_fan_speed"] = clamp_fan_max_pct(min_fan)
+    except (TypeError, ValueError):
+        pass
     return out
 
 
@@ -1186,14 +1304,20 @@ class Controller:
         self.miner_paused = False
         self.mining_phase = ""
         self._resume_ts = 0.0
-        self._fan_ceiling_applied: int | None = None
-        self._fan_ceiling_token_ts = 0.0
+        self._braiins_mutex = threading.RLock()
+        self._cooling_transition_active = False
+        self._cooling_applied: CoolingProfile | None = None
+        self._cooling_desired: CoolingProfile | None = None
+        self._cooling_last_change_ts = 0.0
+        self._fan_max_seen: int | None = None
         self._miner_prev_ok = False
         self._fan_max_missing_logged = False
         self._chip_temp_f = None
         self._fan_rpm = None
         self._fan_pct = None
         self._thermal_abort_active = False
+        self._live_max_fan_speed = None
+        self._live_min_fan_speed = None
 
     def writes_allowed(self, enable_on: bool) -> bool:
         """Braiins writes require BOTH the add-on option and the HA gate."""
@@ -1626,29 +1750,28 @@ class Controller:
         self._install_fan_max_package()
 
     def _install_fan_max_package(self) -> None:
-        """Copy the shipped YAML package into /config/packages when that dir already exists."""
+        """Copy shipped YAML packages into /config/packages when that dir already exists."""
         dest_dir = Path("/config/packages")
         if not dest_dir.is_dir():
             return
-        dest = dest_dir / "lard_fan_max.yaml"
-        candidates = [
-            Path(__file__).resolve().parent / "ha_packages" / "lard_fan_max.yaml",
-            Path(__file__).resolve().parent.parent / "ha_packages" / "lard_fan_max.yaml",
-            Path("/app/ha_packages/lard_fan_max.yaml"),
-        ]
-        src = next((p for p in candidates if p.is_file()), None)
-        if src is None:
-            return
-        try:
-            text = src.read_text()
-            if dest.is_file() and dest.read_text() == text:
-                return
-            if dest.is_file():
-                return
-            dest.write_text(text)
-            self.log(f"installed {dest} — reload input_number or restart Core to load the helper")
-        except Exception as e:
-            self.log(f"fan_max package install skip: {e}")
+        for name in ("lard_fan_max.yaml", "lard_cooling_profiles.yaml"):
+            dest = dest_dir / name
+            candidates = [
+                Path(__file__).resolve().parent / "ha_packages" / name,
+                Path(__file__).resolve().parent.parent / "ha_packages" / name,
+                Path(f"/app/ha_packages/{name}"),
+            ]
+            src = next((p for p in candidates if p.is_file()), None)
+            if src is None:
+                continue
+            try:
+                text = src.read_text()
+                if dest.is_file():
+                    continue
+                dest.write_text(text)
+                self.log(f"installed {dest} — reload input_number or restart Core to load the helper")
+            except Exception as e:
+                self.log(f"{name} package install skip: {e}")
 
     def _refresh_cooling_telemetry(self) -> None:
         try:
@@ -1663,6 +1786,8 @@ class Controller:
         self._chip_temp_f = tel.get("chip_temp_f")
         self._fan_rpm = tel.get("fan_rpm")
         self._fan_pct = tel.get("fan_pct")
+        self._live_max_fan_speed = tel.get("max_fan_speed")
+        self._live_min_fan_speed = tel.get("min_fan_speed")
 
     def _thermal_abort_needed(self) -> bool:
         if thermal_fault_name(self.ha.state(ENT_FAULT)):
@@ -1671,49 +1796,334 @@ class Controller:
             return True
         return False
 
-    def _sync_fan_ceiling(self, reason: str = "tick", force: bool = False) -> None:
-        """Own Braiins auto max_fan_speed. Cool path only — never APPLYING / pause / 0W / boards."""
+    def _unconstrained_cooling(self, name: str = "ABORT") -> CoolingProfile:
+        return CoolingProfile(
+            name=name,
+            max_fan_speed=FAN_MAX_DEFAULT,
+            min_fan_speed=None,
+            minimum_required_fans=MIN_REQUIRED_FANS,
+        )
+
+    def _read_pct_entity(self, entity_id: str, default: int) -> int:
+        raw = self.ha.state(entity_id)
+        if raw in (None, "unknown", "unavailable", ""):
+            return clamp_fan_max_pct(default)
+        return clamp_fan_max_pct(raw)
+
+    def desired_cooling_profile(self, mode: str, *, abort: bool = False) -> CoolingProfile:
+        """Resolve one cooling envelope for the major board-count / pause state."""
+        if abort:
+            self._thermal_abort_active = True
+            return self._unconstrained_cooling("ABORT")
+        self._thermal_abort_active = False
+        key = mode if mode in RANK else "PAUSED"
+        max_defaults = {
+            "ONE_BOARD": self.settings.cooling_one_board_max_fan_pct,
+            "TWO_BOARD": self.settings.cooling_two_board_max_fan_pct,
+            "THREE_BOARD": self.settings.cooling_three_board_max_fan_pct,
+            "PAUSED": self.settings.cooling_paused_max_fan_pct,
+        }
+        min_defaults = {
+            "ONE_BOARD": self.settings.cooling_one_board_min_fan_pct,
+            "TWO_BOARD": self.settings.cooling_two_board_min_fan_pct,
+            "THREE_BOARD": self.settings.cooling_three_board_min_fan_pct,
+            "PAUSED": self.settings.cooling_paused_min_fan_pct,
+        }
+        helper_ents = {
+            "ONE_BOARD": ENT_COOLING_ONE_MAX,
+            "TWO_BOARD": ENT_COOLING_TWO_MAX,
+            "THREE_BOARD": ENT_COOLING_THREE_MAX,
+            "PAUSED": ENT_COOLING_PAUSED_MAX,
+        }
+        max_n = self._read_pct_entity(helper_ents[key], max_defaults[key])
+        min_n = clamp_fan_max_pct(min_defaults[key])
+        envelope = self.read_fan_max_pct()
+        max_n = min(max_n, envelope)
+        if min_n <= 0 or min_n > max_n:
+            min_n_opt = None
+        else:
+            min_n_opt = min_n
+        fans = MIN_REQUIRED_FANS if max_n >= FAN_MAX_DEFAULT else None
+        return CoolingProfile(key, max_n, min_n_opt, fans)
+
+    def _live_cooling_profile(self) -> CoolingProfile | None:
+        if self._live_max_fan_speed is None:
+            return None
+        min_n = self._live_min_fan_speed if self._live_min_fan_speed else None
+        return CoolingProfile("LIVE", int(self._live_max_fan_speed), min_n)
+
+    def _cooling_dwell_blocks(self) -> bool:
+        dwell = int(self.settings.cooling_dwell_seconds or 0)
+        if dwell <= 0 or not self._cooling_last_change_ts:
+            return False
+        return (self._now() - self._cooling_last_change_ts) < dwell
+
+    def _note_fan_max_helper(self) -> bool:
+        """True when the envelope helper changed this tick (not the first seed)."""
+        n = self.read_fan_max_pct()
+        if self._fan_max_seen is None:
+            self._fan_max_seen = n
+            return False
+        if n != self._fan_max_seen:
+            self._fan_max_seen = n
+            return True
+        return False
+
+    def _cooling_needed(self, profile: CoolingProfile, *, already_paused: bool) -> bool:
+        """Idempotent skip when desired==applied. Unknown live + running → do not pause."""
+        if profile.matches(self._cooling_applied):
+            return False
+        if self._cooling_applied is not None:
+            return True
+        live = self._live_cooling_profile()
+        if live is not None:
+            if profile.matches(live):
+                self._cooling_applied = profile
+                return False
+            return True
+        return bool(already_paused)
+
+    def _cooling_should_transition(
+        self,
+        profile: CoolingProfile,
+        *,
+        abort: bool = False,
+        helper_changed: bool = False,
+    ) -> bool:
+        """Cooling-only transition while the operating mode is already confirmed."""
+        if profile.matches(self._cooling_applied):
+            return False
+        if abort:
+            return True
+        if self._cooling_dwell_blocks():
+            return False
+        if self._cooling_applied is not None:
+            return True
+        live = self._live_cooling_profile()
+        if live is not None:
+            if profile.matches(live):
+                self._cooling_applied = profile
+                return False
+            return True
+        return bool(helper_changed)
+
+    def _cooling_idle_power(self, obs: MinerObservation) -> bool:
+        if obs.power_w is None:
+            return False
+        return float(obs.power_w) <= COOLING_IDLE_POWER_W
+
+    def _cooling_paused_idle(self, obs: MinerObservation) -> bool:
+        """user_pause + ~0 W. Intentional pause during a cooling transition is not ERROR."""
+        if not obs.ok:
+            return False
+        if not (obs.user_paused or self._paused_confirmed(obs)):
+            return False
+        if obs.running:
+            return False
+        return self._cooling_idle_power(obs)
+
+    def _set_applying_cooling(self) -> None:
+        self.actual_mode = "APPLYING"
+        self._cooling_transition_active = True
+        self.last_error = ""
+
+    def _restore_known_good_cooling(self, previous: CoolingProfile | None) -> None:
+        target = previous or self._unconstrained_cooling("PAUSED")
         try:
-            if not self.settings.enable_writes:
-                return
-            if self.ha.state(ENT_OLD_AUTO) == "on":
-                return
-            self._refresh_cooling_telemetry()
-            abort = self._thermal_abort_needed()
-            if abort:
-                n = FAN_MAX_DEFAULT
-                reason = f"{reason}|chip_abort_f={CHIP_ABORT_F}"
-                self._thermal_abort_active = True
-            else:
-                n = self.read_fan_max_pct()
-                self._thermal_abort_active = False
-            token_ts = float(getattr(self.b, "token_ts", 0.0) or 0.0)
-            token_changed = bool(token_ts) and token_ts != self._fan_ceiling_token_ts
-            if (
-                not force
-                and not abort
-                and not token_changed
-                and self._fan_ceiling_applied == n
-            ):
-                return
-            extra = {"minimum_required_fans": MIN_REQUIRED_FANS} if n >= FAN_MAX_DEFAULT else None
-            code, body = self.b.set_cooling_auto(n, extra)
-            power = self.power_w
+            extra = target.extra_auto()
+            code, body = self.b.set_cooling_auto(target.max_fan_speed, extra or None)
             self.log(
-                f"fan_ceiling reason={reason} requested={n} "
-                f"http={code} body={_summarize_http_body(body)} "
-                f"chip_temp_f={self._chip_temp_f} fan_rpm={self._fan_rpm} "
-                f"fan_pct={self._fan_pct} power_w={power}"
+                f"cooling restore known-good max={target.max_fan_speed} "
+                f"http={code} body={_summarize_http_body(body)}"
             )
-            if n >= FAN_MAX_DEFAULT:
-                self.log("fan_ceiling restore unconstrained auto max_fan_speed=100")
             if code == 200:
-                self._fan_ceiling_applied = n
-                self._fan_ceiling_token_ts = token_ts
-            else:
-                self.log(f"fan_ceiling non-fatal http={code}")
+                self._cooling_applied = target
         except Exception as e:
-            self.log(f"fan_ceiling skip: {e}")
+            self.log(f"cooling restore failed: {e}")
+
+    def _pause_safely(self) -> None:
+        try:
+            code, _ = self.b.pause()
+            self.log(f"cooling fail-safe pause http={code}")
+        except Exception as e:
+            self.log(f"cooling fail-safe pause: {e}")
+
+    def _cooling_fail(self, err: str, previous: CoolingProfile | None) -> None:
+        """Pause first, restore known-good if possible, stay paused, ERROR.
+
+        Never hand off to legacy writers. Restore is still a cooling PUT, so
+        it must not run live while hashing — pause/idle before rewrite.
+        """
+        self.log(f"cooling fail err={err} — pause + restore + ERROR (no legacy handoff)")
+        self._pause_safely()
+        try:
+            self._wait_until(self._cooling_paused_idle, "cooling_fail_idle_wait", timeout_s=30)
+        except Exception:
+            pass
+        self._restore_known_good_cooling(previous)
+        self._pause_safely()
+        self.last_error = err
+        self.actual_mode = "ERROR"
+        self._cooling_transition_active = False
+
+    def _confirm_cooling(self, profile: CoolingProfile) -> bool:
+        try:
+            code, state = self.b.get_cooling_state()
+        except Exception as e:
+            self.last_error = f"cooling_confirm_exc:{e}"
+            return False
+        if code != 200:
+            self.last_error = f"cooling_confirm_http_{code}"
+            return False
+        tel = parse_cooling_telemetry(state if isinstance(state, dict) else {})
+        self._chip_temp_f = tel.get("chip_temp_f")
+        self._fan_rpm = tel.get("fan_rpm")
+        self._fan_pct = tel.get("fan_pct")
+        self._live_max_fan_speed = tel.get("max_fan_speed")
+        self._live_min_fan_speed = tel.get("min_fan_speed")
+        live_max = tel.get("max_fan_speed")
+        if live_max is not None and clamp_fan_max_pct(live_max) != profile.max_fan_speed:
+            self.last_error = (
+                f"cooling_confirm_mismatch requested={profile.max_fan_speed} live={live_max}"
+            )
+            return False
+        live_min = tel.get("min_fan_speed")
+        if profile.min_fan_speed and live_min is not None:
+            if clamp_fan_max_pct(live_min) != int(profile.min_fan_speed):
+                self.last_error = (
+                    f"cooling_confirm_min_mismatch requested={profile.min_fan_speed} live={live_min}"
+                )
+                return False
+        if live_max is None:
+            self.log(
+                "cooling confirm: state has no max_fan_speed field; PUT 200 + GET 200 accepted"
+            )
+        return True
+
+    def _ensure_paused_idle_for_cooling(self) -> bool:
+        """Pause mining and verify user_pause + ~0 W before any cooling PUT."""
+        obs = self._observe_retrying()
+        if self._cooling_paused_idle(obs):
+            self.last_error = ""
+            self.actual_mode = "APPLYING"
+            return True
+        code, _ = self._http_retry(self.b.pause, "cooling_pause")
+        self.log(f"cooling pause http={code}")
+        if code != 200:
+            self.last_error = f"cooling_pause_http_{code}"
+            return False
+        if not self._wait_until(self._cooling_paused_idle, "cooling_pause_wait"):
+            return False
+        # Intentional paused period is not ERROR.
+        self.last_error = ""
+        self.actual_mode = "APPLYING"
+        return True
+
+    def _apply_cooling_while_paused(self, profile: CoolingProfile) -> bool:
+        """PUT tagged auto envelope, confirm it stuck. Caller must already be paused/idle."""
+        previous = self._cooling_applied
+        extra = profile.extra_auto()
+        try:
+            code, body = self._http_retry(
+                lambda: self.b.set_cooling_auto(profile.max_fan_speed, extra or None),
+                "cooling_put",
+            )
+        except Exception as e:
+            self._cooling_fail(f"cooling_put_exc:{e}", previous)
+            return False
+        self.log(
+            f"cooling PUT profile={profile.name} max={profile.max_fan_speed} "
+            f"min={profile.min_fan_speed} http={code} body={_summarize_http_body(body)} "
+            f"chip_temp_f={self._chip_temp_f} power_w={self.power_w}"
+        )
+        if code != 200:
+            self._cooling_fail(f"cooling_put_http_{code}", previous)
+            return False
+        if not self._confirm_cooling(profile):
+            self._cooling_fail(self.last_error or "cooling_confirm_failed", previous)
+            return False
+        stabilize = float(self.settings.cooling_stabilize_seconds or 0)
+        if stabilize > 0:
+            self._sleep(stabilize)
+        self._cooling_applied = profile
+        self._cooling_last_change_ts = self._now()
+        self.last_error = ""
+        return True
+
+    def _wait_cooling_resume_verify(self, mode: str, profile: CoolingProfile) -> bool:
+        """user_pause=false, running, boards, watts>0, TH/s recovering, cooling still requested."""
+        deadline = self._now() + self._resume_wait_s()
+        hist: dict[str, list] = {"power": [], "hash": []}
+        while self._now() < deadline:
+            self.health.touch()
+            obs = self.observe_miner()
+            if obs.ok and not self._is_paused(obs) and not obs.user_paused:
+                if mode in BOARD_MAP and mode != "PAUSED":
+                    if not self._boards_match(obs.enabled_ids, BOARD_MAP[mode]):
+                        self._sleep(BOARD_POLL_S)
+                        continue
+                if obs.running and obs.power_w is not None and float(obs.power_w) > 0:
+                    self._record_trend(obs, hist)
+                    cooling_ok = profile.matches(self._cooling_applied) or profile.matches(
+                        self._live_cooling_profile()
+                    )
+                    rising = self._trend_rising(hist) or obs.hashrate is None or float(obs.hashrate) > 0
+                    if cooling_ok and rising:
+                        return True
+                    if cooling_ok and float(obs.power_w) > COOLING_IDLE_POWER_W:
+                        return True
+            self._sleep(BOARD_POLL_S)
+        self.last_error = "cooling_resume_verify"
+        return False
+
+    def _gated_cooling_transition(self, profile: CoolingProfile, resume_mode: str) -> bool:
+        """Full maintenance cooling sequence. Stays APPLYING until the operating mode is confirmed."""
+        previous = self._cooling_applied
+        with self._braiins_mutex:
+            self._set_applying_cooling()
+            self.log(
+                f"COOLING begin profile={profile.name} max={profile.max_fan_speed} "
+                f"resume_mode={resume_mode}"
+            )
+            try:
+                if not self._ensure_paused_idle_for_cooling():
+                    self._cooling_fail(self.last_error or "cooling_pause_wait", previous)
+                    return False
+                if not self._apply_cooling_while_paused(profile):
+                    return False
+                if resume_mode == "PAUSED":
+                    self._cooling_transition_active = False
+                    self._mark_confirmed("PAUSED")
+                    return True
+                code, _ = self._http_retry(self.b.resume, "cooling_resume")
+                self.log(f"cooling resume http={code}")
+                if code != 200:
+                    self._cooling_fail(f"cooling_resume_http_{code}", previous)
+                    return False
+                self._resume_ts = self._now()
+                if not self._wait_until(
+                    self._stage_a_cleared,
+                    "cooling_resume_wait",
+                    timeout_s=self._resume_wait_s(),
+                ):
+                    self._cooling_fail(self.last_error or "cooling_resume_wait", previous)
+                    return False
+                if not self._wait_cooling_resume_verify(resume_mode, profile):
+                    self._cooling_fail(self.last_error or "cooling_resume_verify", previous)
+                    return False
+                self._cooling_transition_active = False
+                self.last_error = ""
+                if resume_mode in RANK:
+                    self._mark_confirmed(resume_mode)
+                else:
+                    self.actual_mode = resume_mode
+                return True
+            except Exception as e:
+                self._cooling_fail(f"cooling_exc:{e}", previous)
+                self.log(f"COOLING exc {traceback.format_exc()}")
+                return False
+            finally:
+                self._cooling_transition_active = False
 
     def observe_miner(self) -> MinerObservation:
         """Read boards + pause/mining state. Topology alone never confirms a live mode."""
@@ -1800,6 +2210,8 @@ class Controller:
 
     def infer_actual_mode(self, obs: MinerObservation) -> str:
         """Map observation → published actual. Never ONE/TWO/THREE while paused."""
+        if self._cooling_transition_active:
+            return "APPLYING"
         if not obs.ok:
             return self.actual_mode
         if self._paused_confirmed(obs):
@@ -1904,109 +2316,161 @@ class Controller:
         return False
 
     def apply_mode(self, mode: str) -> bool:
-        """Converge miner to desired mode. actual is APPLYING until confirmed."""
+        """Converge miner to desired mode. actual is APPLYING until confirmed.
+
+        Cooling PUTs are owned here only while paused (maintenance). Never live
+        mid-hash. Failures restore known-good cooling, pause, and ERROR — no
+        legacy fan/auto handoff.
+        """
         self.log(f"APPLY begin mode={mode}")
         self.actual_mode = "APPLYING"
+        previous_cooling = self._cooling_applied
+        cooling_changed = False
+        abort = self._thermal_abort_needed()
+        cooling_profile = self.desired_cooling_profile(mode, abort=abort)
+        self._cooling_desired = cooling_profile
         try:
-            obs = self._observe_retrying()
-            if not obs.ok:
-                self._mark_error(self.last_error or "observe_failed")
-                return False
-
-            if mode == "PAUSED":
-                if not self._paused_confirmed(obs):
-                    code, _ = self._http_retry(self.b.pause, "pause")
-                    self.log(f"pause http={code}")
-                    if code != 200:
-                        self._mark_error(f"pause_http_{code}")
-                        return False
-                    if not self._wait_until(self._paused_confirmed, "pause_wait_timeout"):
-                        self._mark_error(self.last_error or "pause_wait_timeout")
-                        return False
-                if self._boards_already_satisfied("PAUSED", obs):
-                    self.log("pause boards already match, skip PATCH/wait")
-                elif not self._ensure_boards(BOARD_MAP["PAUSED"]):
-                    self._mark_error(self.last_error or "board_pause_failed")
-                    return False
-                obs = self._observe_retrying()
-                if not self._paused_confirmed(obs):
-                    code, _ = self._http_retry(self.b.pause, "pause")
-                    self.log(f"pause http={code}")
-                    if code != 200:
-                        self._mark_error(f"pause_http_{code}")
-                        return False
-                    if not self._wait_until(self._paused_confirmed, "pause_wait_timeout"):
-                        self._mark_error(self.last_error or "pause_wait_timeout")
-                        return False
-                self._mark_confirmed("PAUSED")
-                return True
-
-            if not self._ensure_power_target():
-                self._mark_error(self.last_error or "power_target_failed")
-                return False
-            # PAUSED→ONE_BOARD shares ["1"]. If topology already matches (or
-            # identical map + empty/partial read), skip PATCH and board_wait.
-            if self._boards_already_satisfied(mode, obs):
-                self.log(f"Stage B satisfied expect={BOARD_MAP[mode]}, skip PATCH/wait")
-            elif not self._ensure_boards(BOARD_MAP[mode]):
-                self._mark_error(self.last_error or "boards_failed")
-                return False
-
-            obs = self._observe_retrying()
-            needs_resume = self._is_paused(obs) or obs.user_paused or obs.phase == "stopped"
-            if needs_resume:
-                self._sync_fan_ceiling("apply_mode_pre_resume", force=True)
-                code, _ = self._http_retry(self.b.resume, "resume")
-                self.log(f"resume http={code}")
-                if code != 200:
-                    self._mark_error(f"resume_http_{code}")
-                    return False
-                self._resume_ts = self._now()
-                # Stage A: accepted resume and no longer user_pause / paused.
-                if not self._wait_until(
-                    self._stage_a_cleared,
-                    "resume_wait_timeout",
-                    timeout_s=self._resume_wait_s(),
-                ):
-                    self._mark_error(self.last_error or "resume_wait_timeout")
-                    return False
-
-            # Stage B: skip if already matched. PATCH 200 = accepted; poll topology.
-            obs = self.observe_miner() if needs_resume else obs
-            if self._boards_already_satisfied(mode, obs):
-                self.log(f"Stage B still satisfied expect={BOARD_MAP[mode]}")
-            elif not self._ensure_boards(BOARD_MAP[mode]):
-                self._mark_error(self.last_error or "boards_failed")
-                return False
-
-            obs = self._observe_retrying()
-            if self._active_confirmed(mode, obs):
-                self._mark_confirmed(mode)
-                return True
-
-            # Stage C: running/preheat/ramping (or starting) AND watts/hashrate rising.
-            # Do not require mature/full hashrate in this window.
-            if needs_resume or not obs.running:
-                if not self._wait_stage_c(mode):
-                    self._mark_error(self.last_error or "resume_wait_timeout")
-                    return False
-
-            obs = self.observe_miner()
-            if self._active_confirmed(mode, obs):
-                self._mark_confirmed(mode)
-                return True
-            # Resume is operationally successful; remain APPLYING until final confirm.
-            self.actual_mode = "APPLYING"
-            self.last_error = ""
-            self.log(f"resume operational APPLYING until confirm mode={mode} phase={obs.phase}")
-            return True
+            with self._braiins_mutex:
+                return self._apply_mode_locked(
+                    mode, cooling_profile, previous_cooling, cooling_changed
+                )
         except Exception as e:
             self._mark_error(f"apply_exc:{e}")
             self.log(f"APPLY exc {traceback.format_exc()}")
             return False
         finally:
-            # Re-own the helper ceiling so apply_mode never leaves a wiped auto mode.
-            self._sync_fan_ceiling("apply_mode_complete", force=True)
+            self._cooling_transition_active = False
+
+    def _apply_mode_locked(
+        self,
+        mode: str,
+        cooling_profile: CoolingProfile,
+        previous_cooling: CoolingProfile | None,
+        cooling_changed: bool,
+    ) -> bool:
+        obs = self._observe_retrying()
+        if not obs.ok:
+            self._mark_error(self.last_error or "observe_failed")
+            return False
+
+        if mode == "PAUSED":
+            if not self._paused_confirmed(obs):
+                code, _ = self._http_retry(self.b.pause, "pause")
+                self.log(f"pause http={code}")
+                if code != 200:
+                    self._mark_error(f"pause_http_{code}")
+                    return False
+                if not self._wait_until(self._paused_confirmed, "pause_wait_timeout"):
+                    self._mark_error(self.last_error or "pause_wait_timeout")
+                    return False
+            if self._boards_already_satisfied("PAUSED", obs):
+                self.log("pause boards already match, skip PATCH/wait")
+            elif not self._ensure_boards(BOARD_MAP["PAUSED"]):
+                self._mark_error(self.last_error or "board_pause_failed")
+                return False
+            obs = self._observe_retrying()
+            if not self._paused_confirmed(obs):
+                code, _ = self._http_retry(self.b.pause, "pause")
+                self.log(f"pause http={code}")
+                if code != 200:
+                    self._mark_error(f"pause_http_{code}")
+                    return False
+                if not self._wait_until(self._paused_confirmed, "pause_wait_timeout"):
+                    self._mark_error(self.last_error or "pause_wait_timeout")
+                    return False
+            if self._cooling_needed(cooling_profile, already_paused=True):
+                self._set_applying_cooling()
+                if not self._ensure_paused_idle_for_cooling():
+                    self._cooling_fail(self.last_error or "cooling_pause_wait", previous_cooling)
+                    return False
+                if not self._apply_cooling_while_paused(cooling_profile):
+                    return False
+                self._cooling_transition_active = False
+            self._mark_confirmed("PAUSED")
+            return True
+
+        if not self._ensure_power_target():
+            self._mark_error(self.last_error or "power_target_failed")
+            return False
+
+        already_paused = self._paused_confirmed(obs) or self._is_paused(obs) or obs.user_paused
+        cooling_needed = self._cooling_needed(cooling_profile, already_paused=already_paused)
+        if cooling_needed:
+            self._set_applying_cooling()
+            if not self._ensure_paused_idle_for_cooling():
+                self._cooling_fail(self.last_error or "cooling_pause_wait", previous_cooling)
+                return False
+            if not self._apply_cooling_while_paused(cooling_profile):
+                return False
+            cooling_changed = True
+            self._cooling_transition_active = False
+            self.actual_mode = "APPLYING"
+            obs = self._observe_retrying()
+
+        # PAUSED→ONE_BOARD shares ["1"]. If topology already matches (or
+        # identical map + empty/partial read), skip PATCH and board_wait.
+        if self._boards_already_satisfied(mode, obs):
+            self.log(f"Stage B satisfied expect={BOARD_MAP[mode]}, skip PATCH/wait")
+        elif not self._ensure_boards(BOARD_MAP[mode]):
+            self._mark_error(self.last_error or "boards_failed")
+            return False
+
+        obs = self._observe_retrying()
+        needs_resume = self._is_paused(obs) or obs.user_paused or obs.phase == "stopped"
+        if needs_resume:
+            code, _ = self._http_retry(self.b.resume, "resume")
+            self.log(f"resume http={code}")
+            if code != 200:
+                if cooling_changed:
+                    self._cooling_fail(f"resume_http_{code}", previous_cooling)
+                else:
+                    self._mark_error(f"resume_http_{code}")
+                return False
+            self._resume_ts = self._now()
+            # Stage A: accepted resume and no longer user_pause / paused.
+            if not self._wait_until(
+                self._stage_a_cleared,
+                "resume_wait_timeout",
+                timeout_s=self._resume_wait_s(),
+            ):
+                if cooling_changed:
+                    self._cooling_fail(self.last_error or "resume_wait_timeout", previous_cooling)
+                else:
+                    self._mark_error(self.last_error or "resume_wait_timeout")
+                return False
+
+        # Stage B: skip if already matched. PATCH 200 = accepted; poll topology.
+        obs = self.observe_miner() if needs_resume else obs
+        if self._boards_already_satisfied(mode, obs):
+            self.log(f"Stage B still satisfied expect={BOARD_MAP[mode]}")
+        elif not self._ensure_boards(BOARD_MAP[mode]):
+            self._mark_error(self.last_error or "boards_failed")
+            return False
+
+        obs = self._observe_retrying()
+        if self._active_confirmed(mode, obs):
+            self._mark_confirmed(mode)
+            return True
+
+        # Stage C: running/preheat/ramping (or starting) AND watts/hashrate rising.
+        # Do not require mature/full hashrate in this window.
+        if needs_resume or not obs.running:
+            if not self._wait_stage_c(mode):
+                if cooling_changed:
+                    self._cooling_fail(self.last_error or "resume_wait_timeout", previous_cooling)
+                else:
+                    self._mark_error(self.last_error or "resume_wait_timeout")
+                return False
+
+        obs = self.observe_miner()
+        if self._active_confirmed(mode, obs):
+            self._mark_confirmed(mode)
+            return True
+        # Resume is operationally successful; remain APPLYING until final confirm.
+        self.actual_mode = "APPLYING"
+        self.last_error = ""
+        self.log(f"resume operational APPLYING until confirm mode={mode} phase={obs.phase}")
+        return True
 
     def _status_dict(self, solar_avg: float, enable_on: bool) -> dict:
         return {
@@ -2037,7 +2501,15 @@ class Controller:
             "last_braiins_ok": self.b.last_ok_iso,
             "miner_url": self.settings.miner_url,
             "supervision": "s6-overlay + Supervisor watchdog",
-            "fan_max_pct": self._fan_ceiling_applied,
+            "fan_max_pct": None if self._cooling_applied is None else self._cooling_applied.max_fan_speed,
+            "cooling_profile_desired": None
+            if self._cooling_desired is None
+            else f"{self._cooling_desired.name}:{self._cooling_desired.max_fan_speed}",
+            "cooling_profile_applied": None
+            if self._cooling_applied is None
+            else f"{self._cooling_applied.name}:{self._cooling_applied.max_fan_speed}",
+            "cooling_transition": self._cooling_transition_active,
+            "cooling_dwell_s": int(self.settings.cooling_dwell_seconds or 0),
             "chip_temp_f": self._chip_temp_f,
             "fan_rpm": self._fan_rpm,
             "fan_pct": self._fan_pct,
@@ -2194,6 +2666,9 @@ class Controller:
     def read_actual_from_miner(self):
         """Observe miner. Hashboard set {1} while user-paused is PAUSED, not ONE_BOARD."""
         obs = self.observe_miner()
+        if self._cooling_transition_active:
+            self.actual_mode = "APPLYING"
+            return obs
         mode = self.infer_actual_mode(obs)
         self.actual_mode = mode
         if mode in RANK:
@@ -2213,8 +2688,12 @@ class Controller:
         if old_auto == "on":
             self.log("WARNING competing writer: switch.solar_miner_auto_enable is ON — will not turn it on; writes refused")
 
-        # Fan ceiling is a cool path: helper change / thermal / login. Never APPLYING.
-        self._sync_fan_ceiling("tick")
+        self._refresh_cooling_telemetry()
+        helper_changed = self._note_fan_max_helper()
+        abort = self._thermal_abort_needed()
+        cooling_mode = desired if desired in RANK else self._settled_mode()
+        desired_cooling = self.desired_cooling_profile(cooling_mode, abort=abort)
+        self._cooling_desired = desired_cooling
 
         if not self.writes_allowed(enable_on):
             self.acting = False
@@ -2242,8 +2721,6 @@ class Controller:
             self.log(f"observe miner failed: {e}")
             obs = MinerObservation()
 
-        if obs.ok and not self._miner_prev_ok:
-            self._sync_fan_ceiling("reconnect", force=True)
         self._miner_prev_ok = bool(obs.ok)
 
         if not obs.ok:
@@ -2258,6 +2735,21 @@ class Controller:
             elif self._active_confirmed(desired, obs):
                 self.actual_mode = desired
                 self.confirmed_operational = desired
+            if self._cooling_should_transition(
+                desired_cooling, abort=abort, helper_changed=helper_changed
+            ):
+                self.actual_mode = "APPLYING"
+                self.reason = f"{reason}|cooling_applying"
+                self.publish(solar_avg, True)
+                ok = self._gated_cooling_transition(desired_cooling, desired)
+                if not ok:
+                    self.log(f"COOLING failed err={self.last_error}")
+                try:
+                    self.observe_miner()
+                except Exception as e:
+                    self.log(f"post_cooling_read: {e}")
+                self.publish(solar_avg, True)
+                return
             self.publish(solar_avg, True)
             return
 
@@ -2291,7 +2783,12 @@ def main() -> int:
         f"board_wait>={settings.board_wait_seconds}s resume_wait={RESUME_WAIT_S}s "
         f"enable_writes={settings.enable_writes} "
         f"power_target={settings.power_target_w}W "
-        f"version={ADDON_VERSION} chip_abort_f={CHIP_ABORT_F}"
+        f"version={ADDON_VERSION} chip_abort_f={CHIP_ABORT_F} "
+        f"cooling_dwell={settings.cooling_dwell_seconds}s "
+        f"cooling_profiles=ONE:{settings.cooling_one_board_max_fan_pct}/"
+        f"TWO:{settings.cooling_two_board_max_fan_pct}/"
+        f"THREE:{settings.cooling_three_board_max_fan_pct}/"
+        f"PAUSED:{settings.cooling_paused_max_fan_pct} (TBD/measured)"
     )
     if settings.enable_writes:
         log("WRITES ARMED — still requires input_boolean.lard_board_priority_enable=on")
@@ -2324,9 +2821,9 @@ def main() -> int:
         log(f"initial miner read failed (ok if offline / no password): {e}")
 
     try:
-        ctrl._sync_fan_ceiling("startup", force=True)
+        ctrl._refresh_cooling_telemetry()
     except Exception as e:
-        log(f"fan_ceiling startup skip: {e}")
+        log(f"cooling telemetry startup skip: {e}")
 
     log("controller loop enter — both gates off means observe-only")
     while True:

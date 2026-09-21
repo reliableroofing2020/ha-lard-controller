@@ -13,7 +13,7 @@ configuration:
     description: Leave empty to use the Supervisor proxy (http://supervisor/core). Set a URL only for local/dev.
   enable_writes:
     name: Enable Braiins writes
-    description: Leave false until recovery tests pass. Board/pause/resume/power writes also require input_boolean.lard_board_priority_enable to be on. Fan ceiling (input_number.lard_fan_max_pct) applies when this option is true.
+    description: Leave false until recovery tests pass. Board/pause/resume/power/cooling writes also require input_boolean.lard_board_priority_enable to be on. Cooling is maintenance-gated (pause-first) and never written live while hashing.
   power_target_w:
     name: Power target (W)
     description: Braiins floor used for all non-paused modes. v1 stays at 944 W.
@@ -41,5 +41,35 @@ configuration:
   timezone:
     name: Timezone
     description: Used only for human log timestamps. Heartbeat last_seen is UTC ISO-8601.
+  cooling_dwell_seconds:
+    name: Cooling dwell (seconds)
+    description: Minimum time between cooling-profile transitions so short solar/SOC or slider flaps do not thrash fans. Thermal abort bypasses dwell. Default 600.
+  cooling_stabilize_seconds:
+    name: Cooling stabilize (seconds)
+    description: Short pause after a confirmed cooling PUT before resume. Default 5.
+  cooling_one_board_max_fan_pct:
+    name: ONE_BOARD max fan % (TBD/measured)
+    description: Placeholder auto max_fan_speed for ONE_BOARD. Replace with a measured-safe value. Capped by input_number.lard_fan_max_pct.
+  cooling_two_board_max_fan_pct:
+    name: TWO_BOARD max fan % (TBD/measured)
+    description: Placeholder auto max_fan_speed for TWO_BOARD. Replace with a measured-safe value. Capped by input_number.lard_fan_max_pct.
+  cooling_three_board_max_fan_pct:
+    name: THREE_BOARD max fan % (TBD/measured)
+    description: Placeholder auto max_fan_speed for THREE_BOARD (full/normal envelope). Replace with a measured-safe value.
+  cooling_paused_max_fan_pct:
+    name: PAUSED max fan % (TBD/measured)
+    description: Optional unconstrained / known-good restore envelope while paused. Placeholder 100.
+  cooling_one_board_min_fan_pct:
+    name: ONE_BOARD min fan % (TBD/measured)
+    description: Optional min_fan_speed for ONE_BOARD. 0 omits the field. Placeholder.
+  cooling_two_board_min_fan_pct:
+    name: TWO_BOARD min fan % (TBD/measured)
+    description: Optional min_fan_speed for TWO_BOARD. 0 omits the field. Placeholder.
+  cooling_three_board_min_fan_pct:
+    name: THREE_BOARD min fan % (TBD/measured)
+    description: Optional min_fan_speed for THREE_BOARD. 0 omits the field. Placeholder.
+  cooling_paused_min_fan_pct:
+    name: PAUSED min fan % (TBD/measured)
+    description: Optional min_fan_speed while paused. 0 omits the field. Placeholder.
 network:
   8099/tcp: Health and status HTTP (no miner writes)

@@ -1,7 +1,9 @@
-# LARD Controller — Braiins OS+ fan ceiling helper
+# LARD Controller — envelope cap helper (not a live fan writer)
 #
-# Required by add-on 0.1.4+. The add-on owns PUT /api/v1/cooling/mode
-# {"auto":{"max_fan_speed": N}} from this helper (integer percent 0–100).
+# 0.1.5+: this helper only caps the *desired* cooling profile
+# (min(mode_profile_max, this value)). The add-on never PUTs
+# /api/v1/cooling/mode while hashing. Cooling changes go through
+# the gated pause → PUT → resume owner.
 #
 # Install (pick one):
 #   1. Copy this file to config/packages/lard_fan_max.yaml and enable
@@ -11,19 +13,18 @@
 #        min 0, max 100, step 1, initial 100
 #
 # The add-on cannot create a real YAML/UI helper via REST. If this entity
-# is missing it defaults max_fan_speed to 100 and may POST a state stub.
+# is missing it defaults the envelope cap to 100 and may POST a state stub.
 #
-# Writing 100 (or leaving the default) restores unconstrained auto
-# (max_fan_speed=100, minimum_required_fans=2). CHIP_ABORT_F=180 restores
-# that same unconstrained ceiling without a new mining-pause rule.
+# Do not add a separate HA automation that writes Braiins fans.
+# Keep automation.solar_miner_fan_watchdog off.
 
 input_number:
   lard_fan_max_pct:
-    name: LARD Fan Max %
+    name: LARD Fan Max % (envelope cap)
     min: 0
     max: 100
     step: 1
     initial: 100
-    mode: slider
+    mode: box
     unit_of_measurement: "%"
     icon: mdi:fan
