@@ -16,7 +16,7 @@ Per miner, under the existing Braiins mutex:
 
 Failure path: `RECOVERING → RETRY_RESUME_ONCE → RECOVERING → DEGRADED_NEEDS_ATTENTION`. `ERROR` is only for an explicit hard fault, a cooling PUT failure, or a non-5xx resume rejection.
 
-Same-value ceiling is a no-op (no pause, no PUT, no resume). A ceiling requested while a transaction is active is coalesced to the newest value. It auto-applies only after `HASHING` or an intentional confirmed `PAUSED`. `DEGRADED_NEEDS_ATTENTION` and `ERROR` keep that pending ceiling visible, log `pending_held`, and do not start another cooling cycle. A fresh explicit operator request is required. Automatic fan-ceiling ticks do not queue when `auto_fan_ceiling_enabled` is false.
+Same-value ceiling is a no-op (no pause, no PUT, no resume). A ceiling requested while a transaction is active is coalesced to the newest value. It auto-applies only after successful `HASHING`. Confirmed `PAUSED`, `DEGRADED_NEEDS_ATTENTION`, and `ERROR` keep that pending ceiling visible, log `pending_held`, and do not start another cooling cycle. A fresh explicit operator request is required. Automatic fan-ceiling ticks do not queue when `auto_fan_ceiling_enabled` is false. `_cooling_escalate_start` and `_cooling_escalate_restart` are hard-disabled: they log `escalate_blocked` and return false without Start, Restart, or Resume.
 
 `operational` (running, including 0 W) and `applying` (ramp) are non-terminal inside the recovery window. They may publish `RECOVERING` / `APPLYING` diagnostics. They do not clear the cooling transaction, count as success, skip the 600s deadline, or skip the one resume retry. Re-observing them does not move the original maximum deadline. The post-retry window is a separate 180s deadline.
 
@@ -72,25 +72,25 @@ Do not arm writes until the observe-only rows pass. Leave `auto_fan_ceiling_enab
 
 # PR #7 Blocker Fix Report
 
-## B1
+## B1 — Pending After Terminal Failure
 
-Pending coalesced ceilings no longer start a second cooling transaction after `DEGRADED_NEEDS_ATTENTION` or `ERROR`. `_take_pending_if_terminal` consumes pending only when the transaction is inactive, health is `HASHING` or an intentional confirmed `PAUSED`, and the closed outcome is not `degraded` or `error`. Otherwise it logs `pending_held` (once per reason and ceiling) and leaves `_pending_profile` visible. `_gated_cooling_transition` records a terminal generation. A nested or deferred apply re-checks that generation and the allow rule before any pause, PUT, or resume. A stale callback restores the pending ceiling and returns `refused` with no device commands. Tick does not auto-start a held ceiling from `DEGRADED` or `ERROR`. A fresh explicit `request_cooling_ceiling` is still an operator action.
+Pending coalesced ceilings no longer start a second cooling transaction after `DEGRADED_NEEDS_ATTENTION` or `ERROR`. `_take_pending_if_terminal` consumes pending only when the transaction is inactive and health is `HASHING`. Confirmed `PAUSED` is not an automatic apply. A closed outcome of `degraded` or `error` also blocks apply. Otherwise it logs `pending_held` (once per reason and ceiling) and leaves `_pending_profile` visible. `_gated_cooling_transition` records a terminal generation. A nested or deferred apply re-checks that generation and the allow rule before any pause, PUT, or resume. A stale callback restores the pending ceiling and returns `refused` with no device commands. Tick does not auto-start a held ceiling from `DEGRADED` or `ERROR`. A fresh explicit `request_cooling_ceiling` is still an operator action.
 
 Tests: `test_b1_pending_held_after_degraded_no_second_cycle` (fake time through the 600s window, one retry, and the 180s post-retry window; exactly the original pause/PUT/two resumes; pending stays; a later tick adds no writes). `test_b1_pending_held_after_cooling_put_error` (HTTP 400 on the cooling PUT; resume count 0; the coalesced ceiling is not PUT; only the original attempt plus the existing fail-safe restore). `test_b1_stale_callback_does_not_apply_after_error` (depth-1 apply after the terminal generation changes issues no commands). `test_b1_pending_still_applies_after_clean_hashing` (clean `HASHING` still applies the newest ceiling; cooling PUTs are the original target then the pending target).
 
-## B2
+## B2 — Bounded Recovery Completion
 
 `operational` (including running at 0 W) and `applying` (ramp) are interim inside the recovery window. `_finish_operational` and `_finish_applying` return `CoolingResult("interim")`, which is falsy and not closed. They do not clear `_cooling_txn_active`, release ownership, or count as success. `_recovery_window` returns only `hashing`, `exhausted`, or `error`. The primary 600s deadline is stamped once from the first recovery observation and is not moved when APPLYING or running is seen again. The post-retry window is a separate 180s deadline. Only stable full `HASHING`, bounded exhaustion (`DEGRADED_NEEDS_ATTENTION`), or a hard-fault/`ERROR` close the transaction. `CoolingResult` is truthy only for closed success outcomes `hashing`, `paused`, and `noop`.
 
 Tests: `test_b2_running_zero_watts_reaches_degraded_not_success` and `test_b2_persistent_applying_reaches_degraded` (exactly 2 resumes, span from the first resume at least 780s and under 820s, primary deadline delta exactly 600s, one primary `recovery_begin`, `primary_deadline_kept` once, transaction still active in the interim logs, final `DEGRADED_NEEDS_ATTENTION`, outcome `degraded`, no Start/Restart). `test_b2_unhealthy_board_with_watts_degrades` (nonzero watts and hashrate with an unhealthy board stay in recovery, then `DEGRADED`, not `HASHING`). `test_b2_later_three_healthy_polls_still_hash` (a legitimate later 3-poll healthy sample still reaches `HASHING` inside the 240s window, one resume).
 
-## B3
+## B3 — Hard Fault During Settle
 
 Every settle poll uses `_classify_settle_obs` and the same `_hard_fault` predicate. A hard fault calls `_fail_hard`, aborts the settle, and does not confirm, resume, retry, or apply pending. `_gate_resume` observes again immediately before the first resume and before the retry resume. Stale or missing telemetry is `not_clean`: it is not `ERROR` by itself, and it does not authorize ResumeMining. The configured settle remains 45s (`cooling_settle_seconds`); a zero option still falls back to the older settle setting rather than skipping the observation.
 
 Tests: `test_b3_hard_fault_during_settle_aborts_before_resume` and `test_b3_thermal_fault_during_settle_aborts_before_resume` (fault injected in `COOLING_SETTLING` before `_settle_complete`; resume 0, retry 0, health `ERROR`, cooling PUTs are the original ceiling only, a later tick adds no writes; the hardware case also holds the pending ceiling). `test_b3_fault_before_put_issues_no_cooling_command` (no pause, PUT, or resume). `test_b3_fault_immediately_before_first_resume` (full 45s settle, then fault on the primary gate; resume 0). `test_b3_fault_during_recovery_before_retry` (one resume already sent, no retry). `test_b3_fault_immediately_before_retry_resume` (one resume, retries used 0). `test_b3_stale_telemetry_is_not_a_hard_fault_and_not_blind_resume` (mining-state HTTP 500 through settle, recovery, and both gates; resume 0, not a hard fault, ends `DEGRADED`).
 
-## B4
+## B4 — Live Board Health
 
 Option A is implemented on the existing Braiins reads. `Braiins.board_health()` calls `GET /api/v1/miner/hw/hashboards` and `GET /api/v1/miner/errors`. Public `Hashboard` has no health enum, so a board is proven only when the current payload has `id`, enabled, `chips_count > 0` (int or `{"value": n}`), is not stale, and carries no safety-fault token. Miner errors (`message`, `error_codes[].code`/`reason`, `components[].name`) map onto the same hard-fault tokens. HTTP failure, malformed JSON, a missing list, incomplete entries, stale/partial flags, or an unknown value are not healthy. Option B: if the client has no `board_health` hook, `_apply_live_board_health` sets `boards_healthy=False` and `board_health_verified=False`. It does not trust a raw hashboard list and it does not reuse a previous healthy read. `_hashing_sample_ok` also requires every id in the configured `BOARD_MAP` for that mode to be `proven_healthy` on this read. Expected count is that configured set, not `len(hashboards)`. A partial list can report its present boards as structurally healthy and still fail the mode check.
 
@@ -104,20 +104,25 @@ Three older tests had encoded the unsafe early success (running at 0 W or a watt
 
 ## Remaining Follow-ups
 
-Not changed in this pass:
+Completed in this pass (trivial, and required so the recovery path cannot call them):
 
-- `_positive_lifecycle` is still broad (`init` substring, and any `running and not paused` counts as positive), so running at 0 W waits until 600s rather than stopping at 240s.
-- `_cooling_escalate_start` and `_cooling_escalate_restart` are still defined and unused on the live resume path.
-- Recovery deadlines still use `time.time()` (wall clock), not a monotonic clock.
-- Reload and orphan cooling-transaction policy is unchanged.
-- There is no concurrency test around overlapping operator requests and the recovery loop.
-- Exact 239/240/599/600/780 second boundaries are covered by the window span asserts above, not by one-second edge fixtures.
-- Startup and cooldown refusal reasons are not separately documented in `_cooling_refuse_reason`.
-- Comments near the Braiins command policy still describe Restart as a last resort even though this recovery path does not call it.
+- `_cooling_escalate_start` and `_cooling_escalate_restart` are hard-disabled. Both log `escalate_blocked`, emit `lard_cooling_escalate_blocked`, and return false. They do not call Start, BOSminer Restart, or Resume. Covered by `test_escalate_helpers_cannot_command`.
+- The Braiins deny-list comment no longer describes Restart as a last-resort cooling-resume escalation. Device reboot stays denied. 0.1.7 recovery does not call Start or BOSminer Restart.
 
-## Test Results
+Still open (not changed; narrowing them would change the 240/600 contract or add policy outside B1–B4):
 
-`python3 -m unittest test_controller` from `lard_controller/app`: 98 tests, OK. 23 new tests in `BlockerFixTests` (`test_b1_*` through `test_b4_*`). The suite uses `FakeClock` (`Controller._now` and `_sleep`); there are no real multi-minute sleeps. Command-count asserts check `write_names()`, `cooling_puts()`, and `resume_calls`, and assert that `start` and `restart` are absent after the terminal under test.
+- `_positive_lifecycle` is still broad (`init` substring, and any `running and not paused` counts as positive), so running at 0 W waits until 600s rather than stopping at 240s. Narrowing it would break the B2 window.
+- Recovery deadlines still use `time.time()` via `_now` (wall clock), not a monotonic clock. Tests replace `_now`. Anti-flap still calls `time.time()` directly.
+- Reload and orphan cooling-transaction policy is unchanged. The transaction is in memory. A process reload can leave the miner paused; there is no automatic resume-on-restart.
+- There is no concurrency stress test around overlapping operator requests and the recovery loop. The cooling path remains under `_braiins_mutex`.
+- Exact 239/240/599/600/780 second boundaries are covered by the window span asserts (first-resume span at least 780s and under 820s, primary deadline delta exactly 600s), not by one-second edge fixtures.
+- Startup and cooldown are positive lifecycle, not extra `_cooling_refuse_reason` tokens. Pause-first still applies. They were not added to the refuse list.
+
+## Test Results (total, new, full suite, fake-clock, command-count assertions)
+
+`python3 -m unittest test_controller` from `lard_controller/app`: see the recorded run below. New tests are `BlockerFixTests` (`test_b1_*` through `test_b4_*` plus `test_escalate_helpers_cannot_command`). The suite uses `FakeClock` (`Controller._now` and `_sleep`); there are no real multi-minute sleeps. Command-count asserts check `write_names()`, `cooling_puts()`, and `resume_calls`, and assert that `start` and `restart` are absent after the terminal under test and after the hard-disabled escalation helpers.
+
+Recorded result: 99 tests, OK. 24 of those are in `BlockerFixTests` (23 `test_b1_*`–`test_b4_*` cases plus `test_escalate_helpers_cannot_command`). Full suite `python3 -m unittest test_controller` from `lard_controller/app` finished in well under a second on the fake clock.
 
 ## Merge Readiness: READY FOR RE-REVIEW
 

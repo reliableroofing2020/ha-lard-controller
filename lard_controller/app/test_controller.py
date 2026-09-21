@@ -2374,6 +2374,20 @@ class BlockerFixTests(unittest.TestCase):
         self.assertFalse(ctrl._expected_boards_proven(obs, "THREE_BOARD"))
         self.assertFalse(ctrl._hashing_sample_ok(obs, "THREE_BOARD"))
 
+    def test_escalate_helpers_cannot_command(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+        before = list(b.write_names())
+        self.assertFalse(ctrl._cooling_escalate_start())
+        self.assertFalse(ctrl._cooling_escalate_restart())
+        self.assertEqual(b.write_names(), before)
+        self.assertEqual(b.resume_calls, 0)
+        _forbid_control(self, b)
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertEqual(log.count("escalate_blocked"), 2)
+        self.assertNotIn("actions/start", log)
+        self.assertNotIn("actions/restart", log)
+
 
 if __name__ == "__main__":
     unittest.main()

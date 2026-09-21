@@ -217,9 +217,10 @@ TRANSITIONAL_PHASES = frozenset(
     }
 )
 
-# Device reboot / factory only. PUT /api/v1/actions/restart is BOSminer Restart
-# (lower impact than reboot) and is allowed as a last-resort cooling-resume
-# escalation. Full device reboot is never issued by this controller.
+# Device reboot / factory reset are denied. 0.1.7 cooling recovery does not
+# call Start or BOSminer Restart either: _cooling_escalate_start and
+# _cooling_escalate_restart are hard-disabled and issue no device command.
+# Full device reboot is never issued by this controller.
 BRAIINS_DENY_PATHS = (
     "/actions/reboot",
     "/system/reboot",
@@ -3053,7 +3054,7 @@ class Controller:
 
         A later coalesced apply must see this generation. DEGRADED and ERROR
         block automatic pending apply until a newer success terminal replaces
-        them (a fresh txn that actually reaches HASHING or confirmed PAUSED).
+        them. Automatic apply requires a fresh transaction that reaches HASHING.
         """
         self._cooling_terminal_kind = kind
         self._cooling_terminal_gen += 1
@@ -3079,10 +3080,10 @@ class Controller:
         )
 
     def _auto_apply_pending_allowed(self) -> bool:
-        """Coalesced pending may start another txn only after a real success.
+        """Coalesced pending may start another txn only after successful HASHING.
 
-        HASHING, or an intentional confirmed PAUSE, is success. DEGRADED and
-        ERROR are not. An in-flight transaction cannot apply its own pending.
+        Confirmed PAUSED, DEGRADED, and ERROR are not automatic success.
+        An in-flight transaction cannot apply its own pending.
         """
         if self._cooling_txn_active:
             return False
@@ -3090,7 +3091,7 @@ class Controller:
             return False
         if self._cooling_terminal_kind in {"degraded", "error"}:
             return False
-        return self._health_class in {"HASHING", "PAUSED"}
+        return self._health_class == "HASHING"
 
     def _finish_hashing(self, mode: str) -> CoolingResult:
         self._last_cooling_result = self._last_cooling_result or "verified"
@@ -3378,7 +3379,7 @@ class Controller:
         return int(code)
 
     def _take_pending_if_terminal(self) -> CoolingProfile | None:
-        """Consume coalesced pending only after HASHING or confirmed PAUSED.
+        """Consume coalesced pending only after successful HASHING.
 
         DEGRADED and ERROR keep the pending ceiling visible and issue no
         further device command. A stale caller must re-check
@@ -3734,67 +3735,14 @@ class Controller:
         return self._transitional_operational(obs) and not self._is_paused(obs)
 
     def _cooling_escalate_start(self) -> bool:
-        """Start mining if ResumeMining 500s — bosminer may have stopped after the PUT."""
-        self.actual_mode = "APPLYING"
-        self.last_error = ""
-        self.log("cooling resume escalate: Start mining (PUT /api/v1/actions/start)")
-        try:
-            code, body = self.b.start()
-        except Exception as e:
-            self.log(f"cooling start escalate exc={e}")
-            return False
-        self.log(f"cooling start escalate http={code} body={_summarize_http_body(body)}")
-        if code != 200:
-            return False
-        self._resume_ts = self._now()
-        settle = float(self.settings.cooling_resume_settle_seconds or 0) or 5.0
-        self._sleep(settle)
-        obs = self.observe_miner()
-        if self._cooling_resume_accepted(obs):
-            return True
-        try:
-            rcode, rbody = self.b.resume()
-        except Exception as e:
-            self.log(f"cooling resume after start exc={e}")
-            return False
-        self.log(f"cooling resume after start http={rcode} body={_summarize_http_body(rbody)}")
-        if rcode == 200:
-            self._resume_ts = self._now()
-            return True
-        return self._cooling_resume_accepted(self.observe_miner())
+        """Hard-disabled. Cooling recovery must not call Start mining."""
+        self._emit("lard_cooling_escalate_blocked", action="start")
+        return False
 
     def _cooling_escalate_restart(self) -> bool:
-        """BOSminer Restart (not device reboot) after Start did not recover resume."""
-        self.actual_mode = "APPLYING"
-        self.last_error = ""
-        self.log(
-            "cooling resume escalate: BOSminer Restart (PUT /api/v1/actions/restart) "
-            "— device reboot is not used"
-        )
-        try:
-            code, body = self.b.restart()
-        except Exception as e:
-            self.log(f"cooling bosminer restart escalate exc={e}")
-            return False
-        self.log(f"cooling bosminer restart escalate http={code} body={_summarize_http_body(body)}")
-        if code != 200 and not is_http_5xx(code):
-            return False
-        settle = float(self.settings.cooling_resume_settle_seconds or 0) or 5.0
-        self._sleep(settle)
-        self._wait_cooling_process_ready(timeout_s=settle)
-        try:
-            rcode, rbody = self.b.resume()
-        except Exception as e:
-            self.log(f"cooling resume after bosminer restart exc={e}")
-            rcode, rbody = 0, {"exc": str(e)}
-        self.log(
-            f"cooling resume after bosminer restart http={rcode} "
-            f"body={_summarize_http_body(rbody)}"
-        )
-        if rcode == 200:
-            self._resume_ts = self._now()
-            return True
-        return self._cooling_escalate_start()
+        """Hard-disabled. Cooling recovery must not call BOSminer Restart."""
+        self._emit("lard_cooling_escalate_blocked", action="restart")
+        return False
 
     def _resume_after_cooling(
         self, previous: CoolingProfile | None, mode: str | None = None
@@ -3934,7 +3882,7 @@ class Controller:
     ) -> CoolingResult | bool:
         """Pause-first cooling transaction plus bounded recovery. Per-miner lock held.
 
-        Recursive coalesced apply runs only after HASHING or confirmed PAUSED.
+        Recursive coalesced apply runs only after successful HASHING.
         A callback whose generation or terminal no longer matches issues no
         device command.
         """
