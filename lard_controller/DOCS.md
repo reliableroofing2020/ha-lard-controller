@@ -114,16 +114,19 @@ When **desired profile ≠ applied profile** (and dwell has elapsed, unless ther
 5. `PUT /api/v1/cooling/mode` with the tagged auto body.
 6. Read cooling state back; confirm requested values stuck (or PUT 200 + GET 200 when the state payload has no `max_fan_speed`).
 7. Short stabilize (`cooling_stabilize_seconds`, default 5).
-8. Resume mining (unless the operating mode is `PAUSED`).
-9. Verify `user_pause=false`, mining running, expected hashboards, watts > 0, TH/s recovering, cooling still the requested profile.
-10. Only then publish the requested operating mode as actual.
+8. Poll miner readiness (`GET /api/v1/miner/details`: pause flag, `bosminer_uptime_s`, status / `detailed_status` reason, watts). `bosminer_uptime_s == 0` means the bosminer process is not running — that is unreadiness, not a confirmed hard fail.
+9. Wait `cooling_resume_settle_seconds` (default 20). Do **not** assume the first `ResumeMining` is accepted.
+10. Resume mining with bounded backoff (5s / 10s / 20s). Stay `APPLYING`. A 500 is retried.
+11. If ResumeMining still 500: escalate `PUT /api/v1/actions/start`, then BOSminer `PUT /api/v1/actions/restart`. Device reboot (`/actions/reboot`) is never used.
+12. Verify `user_pause=false`, mining running, expected hashboards, watts > 0, TH/s recovering, cooling still the requested profile.
+13. Only then publish the requested operating mode as actual.
 
 Rules:
 
-- The intentional paused period is **not** `ERROR`. Stay in `APPLYING` for the whole cooling transition.
+- The intentional paused period is **not** `ERROR`. Stay in `APPLYING` for the whole cooling transition **and** the post-PUT resume recovery window.
 - Desired == applied → skip pause and cooling PUT (idempotent).
 - `cooling_dwell_seconds` (default 600) blocks rapid cooling-only re-transitions so short solar/SOC/slider flaps do not thrash profiles. A committed board-count `apply_mode` still applies that mode's profile while paused.
-- Cooling PUT failure **or** resume failure: restore the last known-good profile if possible → pause the miner safely → `ERROR`. Do **not** hand off to legacy writers.
+- Cooling PUT failure: restore the last known-good profile if possible → pause the miner safely → `ERROR`. Resume HTTP 500 after a cooling PUT is **not** an immediate fail — `ERROR` only after settle + bounded resume + Start + BOSminer Restart are exhausted. Do **not** hand off to legacy writers.
 - `CHIP_ABORT_F=180`: unconstrained 100 still applies, through the same gated sequence (dwell bypassed). Existing SOC / heartbeat / stale / fault **mining-pause** policy is unchanged.
 - Startup / reconnect no longer force a cooling PUT.
 
@@ -230,6 +233,8 @@ Run these with **`enable_writes: false`** first. None of them should touch the m
 | Cooling idempotent | Desired profile already applied | No pause, no cooling PUT |
 | Cooling dwell | Change the helper twice inside 600 s | Second transition is skipped until dwell elapses |
 | Cooling PUT / resume fail | (fault injection) | Restore known-good, miner left paused, `ERROR`; old auto stays off |
+| Cooling resume 500 then 200 | After a confirmed PUT, first `ResumeMining` 500s until settle | Stays `APPLYING`; succeeds after settle/backoff; not `ERROR` early |
+| Cooling resume always 500 | Resume keeps 500 after settle + backoff | Start, then BOSminer Restart, then `ERROR`; no device reboot; no legacy handoff |
 | Cooling restore 100 | Thermal abort or helper 100 after a lower profile | Gated pause → PUT 100 → resume (not a live PUT) |
 | Old auto | Flip `switch.solar_miner_auto_enable` on (then off) | Writes refused; notification from the package; switch is not turned on by this add-on |
 

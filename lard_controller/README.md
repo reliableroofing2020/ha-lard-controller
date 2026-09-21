@@ -9,7 +9,7 @@ Supervisor owns start / stop / restart. This is not an Advanced SSH `nohup` job 
 | | |
 | --- | --- |
 | Slug | `lard_controller` |
-| Version | `0.1.5` |
+| Version | `0.1.6` |
 | Miner | Braiins OS+ REST @ `http://192.168.1.113` (API ~1.8.0) |
 | Network | `host_network: true` |
 | Health | `http://<ha-host>:8099/health` (Supervisor watchdog) |
@@ -87,7 +87,7 @@ Drop [`../package/lard_controller_watchdog.yaml`](../package/lard_controller_wat
 
 ## Cooling profiles (0.1.5+ — never live while hashing)
 
-A live `PUT /api/v1/cooling/mode` while hashing stalls this site's BOS+ miner. **Only LARD Controller writes cooling**, and only as a pause-first maintenance transition (`APPLYING` → pause → verify 0 W → tagged auto PUT → confirm → resume → verify run). Intentional pause during that sequence is not `ERROR`.
+A live `PUT /api/v1/cooling/mode` while hashing stalls this site's BOS+ miner. **Only LARD Controller writes cooling**, and only as a pause-first maintenance transition (`APPLYING` → pause → verify 0 W → tagged auto PUT → confirm → settle → resume with backoff → verify run). Intentional pause during that sequence is not `ERROR`. After the PUT, ResumeMining may 500 until BOSminer settles — 0.1.6 waits, retries, then escalates Start / BOSminer Restart; it does not hard-fail the first 500 or reboot the device.
 
 One configurable envelope per major board-count state (placeholders, **TBD/measured**):
 
@@ -104,6 +104,7 @@ One configurable envelope per major board-count state (placeholders, **TBD/measu
 | --- | --- |
 | Dwell | `cooling_dwell_seconds` (default 600) — blocks short solar/SOC/slider flaps |
 | Stabilize | `cooling_stabilize_seconds` (default 5) after a confirmed PUT |
+| Resume settle | `cooling_resume_settle_seconds` (default 20) before ResumeMining; 500s retry then Start / BOSminer Restart |
 | Thermal abort | `CHIP_ABORT_F=180` restores unconstrained 100 through the same gated sequence |
 
 The add-on does **not** create real HA helpers (REST cannot). On startup it POSTs a state stub for `lard_fan_max_pct` if missing and, if `config/packages/` already exists, copies the YAML once. Prefer installing the packages and restarting Core:

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.6
+
+- After a gated cooling PUT, do **not** treat the first `ResumeMining` HTTP 500 as a hard fail. Cooling apply is a disruptive config transition: BOSminer may not accept resume until the process settles (`bosminer_uptime_s == 0` means the process is not running).
+- Sequence after PUT + confirm: stay `APPLYING` → poll pause / process-ready / watts / status → wait `cooling_resume_settle_seconds` (default 20) → bounded ResumeMining backoff (5s / 10s / 20s) → escalate `PUT /api/v1/actions/start` if still 500 → then BOSminer `PUT /api/v1/actions/restart`. Full device reboot (`/actions/reboot`) is still denied and is never used.
+- `ERROR` only after that bounded recovery is exhausted. Intentional pause during the window is still not `ERROR`. No legacy handoff.
+- Logs whether the cooling PUT temporarily changes bosminer uptime, miner-ready, or pause reason (distinguishes “not ready yet” vs hard failure). Existing 0.1.5 pause-first cooling rules are unchanged. `enable_writes` still defaults false. No hard-coded final fan %.
+
 ## 0.1.5
 
 - Cooling / fan-profile writes are **maintenance-gated**. A live `PUT /api/v1/cooling/mode` while hashing stalls this site's BOS+ (~26.09) miner (PAUSED/0W → APPLYING/0W / `read_boards_http_500`). The add-on now never writes cooling mid-hash.
