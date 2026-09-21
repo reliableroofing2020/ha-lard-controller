@@ -1,0 +1,29 @@
+# LARD Controller — Braiins OS+ fan ceiling helper
+#
+# Required by add-on 0.1.4+. The add-on owns PUT /api/v1/cooling/mode
+# {"auto":{"max_fan_speed": N}} from this helper (integer percent 0–100).
+#
+# Install (pick one):
+#   1. Copy this file to config/packages/lard_fan_max.yaml and enable
+#      packages in configuration.yaml, then restart Core.
+#   2. Settings → Devices & services → Helpers → Create → Number:
+#        entity_id: input_number.lard_fan_max_pct
+#        min 0, max 100, step 1, initial 100
+#
+# The add-on cannot create a real YAML/UI helper via REST. If this entity
+# is missing it defaults max_fan_speed to 100 and may POST a state stub.
+#
+# Writing 100 (or leaving the default) restores unconstrained auto
+# (max_fan_speed=100, minimum_required_fans=2). CHIP_ABORT_F=180 restores
+# that same unconstrained ceiling without a new mining-pause rule.
+
+input_number:
+  lard_fan_max_pct:
+    name: LARD Fan Max %
+    min: 0
+    max: 100
+    step: 1
+    initial: 100
+    mode: slider
+    unit_of_measurement: "%"
+    icon: mdi:fan

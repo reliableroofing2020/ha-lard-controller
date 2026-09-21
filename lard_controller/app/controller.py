@@ -42,6 +42,7 @@ ENT_FAULT = "sensor.solar_miner_fault_reason"
 ENT_STALE = "binary_sensor.solar_miner_critical_stale"
 ENT_HB = "binary_sensor.lard_api_heartbeat"
 ENT_OLD_AUTO = "switch.solar_miner_auto_enable"
+ENT_FAN_MAX = "input_number.lard_fan_max_pct"
 
 # Heartbeat / health entities published every loop (not /local JSON)
 ENT_CTRL_ONLINE = "binary_sensor.lard_controller_online"
@@ -100,6 +101,16 @@ _OPERATIONAL_STATUS = frozenset(
 # Do not treat these as mature/full-hashrate gates inside the resume window.
 SANITY_POWER_W = 10.0
 SANITY_HASHRATE = 0.01
+
+# Operator thermal policy for the fan-ceiling owner only.
+# Restore unconstrained auto (max_fan_speed=100) at this chip °F.
+# Does not add a new mining-pause rule; existing fault/SOC pause paths stay as-is.
+CHIP_ABORT_F = 180
+FAN_MAX_DEFAULT = 100
+FAN_MAX_MIN = 0
+FAN_MAX_MAX = 100
+MIN_REQUIRED_FANS = 2
+ADDON_VERSION = "0.1.4"
 
 # Policy timings from the uploaded actuator — do not invent a new energy policy
 BOARD_POLL_S = 5
@@ -511,9 +522,18 @@ class Braiins:
                 return found
         return None
 
-    def set_cooling_profile_auto(self):
-        """Own cooling by leaving Braiins automatic. No invented PWM policy."""
-        return self._call("PUT", "/api/v1/cooling", {"mode": "automatic"})
+    def set_cooling_auto(self, max_fan_speed: int, extra_auto: dict | None = None):
+        """PUT /api/v1/cooling/mode tagged union. Integer percent 0–100, not a 0.6 ratio."""
+        n = clamp_fan_max_pct(max_fan_speed)
+        auto: dict[str, Any] = dict(extra_auto or {})
+        auto["max_fan_speed"] = n
+        if n >= FAN_MAX_DEFAULT:
+            auto.setdefault("minimum_required_fans", MIN_REQUIRED_FANS)
+        return self._call("PUT", "/api/v1/cooling/mode", {"auto": auto})
+
+    def get_cooling_state(self):
+        """GET /api/v1/cooling/state — fans rpm/target_speed_ratio + highest temp. Not /mode (405)."""
+        return self._call("GET", "/api/v1/cooling/state")
 
     def miner_details(self):
         """GET /api/v1/miner/details — already used for live watts; also carries status."""
@@ -546,6 +566,100 @@ class Braiins:
                 "ghs",
             ),
         )
+
+
+def clamp_fan_max_pct(val) -> int:
+    """Integer u32 percent 0–100. Floats are rounded, then clamped."""
+    try:
+        n = int(round(float(val)))
+    except (TypeError, ValueError):
+        return FAN_MAX_DEFAULT
+    return max(FAN_MAX_MIN, min(FAN_MAX_MAX, n))
+
+
+def celsius_to_fahrenheit(c) -> float:
+    return float(c) * 9.0 / 5.0 + 32.0
+
+
+def parse_cooling_telemetry(state) -> dict[str, Any]:
+    """Best-effort chip °F / fan RPM / fan % from GET /api/v1/cooling/state."""
+    out: dict[str, Any] = {
+        "chip_temp_f": None,
+        "chip_temp_c": None,
+        "fan_rpm": None,
+        "fan_pct": None,
+        "fans": [],
+    }
+    if not isinstance(state, dict):
+        return out
+    ht = state.get("highest_temperature")
+    degree_c = None
+    if isinstance(ht, dict):
+        temp = ht.get("temperature")
+        if isinstance(temp, dict) and temp.get("degree_c") is not None:
+            degree_c = temp.get("degree_c")
+        elif ht.get("degree_c") is not None:
+            degree_c = ht.get("degree_c")
+    if degree_c is None:
+        degree_c = _find_number(state, ("degree_c", "chip_temp", "temperature"))
+    try:
+        if degree_c is not None:
+            out["chip_temp_c"] = float(degree_c)
+            out["chip_temp_f"] = celsius_to_fahrenheit(degree_c)
+    except (TypeError, ValueError):
+        pass
+    fans = state.get("fans") if isinstance(state.get("fans"), list) else []
+    rpms: list[int] = []
+    pcts: list[float] = []
+    for fan in fans:
+        if not isinstance(fan, dict):
+            continue
+        rpm = fan.get("rpm")
+        ratio = fan.get("target_speed_ratio")
+        rec: dict[str, Any] = {}
+        try:
+            if rpm is not None:
+                rec["rpm"] = int(rpm)
+                rpms.append(int(rpm))
+        except (TypeError, ValueError):
+            pass
+        try:
+            if ratio is not None:
+                pct = float(ratio) * 100.0 if float(ratio) <= 1.0 else float(ratio)
+                rec["pct"] = round(pct, 1)
+                pcts.append(pct)
+        except (TypeError, ValueError):
+            pass
+        if rec:
+            out["fans"].append(rec)
+    if rpms:
+        out["fan_rpm"] = max(rpms)
+    if pcts:
+        out["fan_pct"] = round(max(pcts), 1)
+    return out
+
+
+def thermal_fault_name(fault) -> bool:
+    if fault in (None, "ok", "unknown", "unavailable", "none", ""):
+        return False
+    s = str(fault).strip().lower()
+    return any(
+        key in s
+        for key in ("thermal", "cooling", "overtemp", "overheat", "chip_temp", "chip_hot")
+    )
+
+
+def _summarize_http_body(body, limit: int = 240) -> str:
+    if body is None:
+        return ""
+    try:
+        raw = json.dumps(body, default=str) if not isinstance(body, str) else body
+    except Exception:
+        raw = str(body)
+    raw = raw.replace("\n", " ")
+    if len(raw) > limit:
+        return raw[:limit] + "…"
+    return raw
 
 
 def _find_number(obj, keys: tuple[str, ...]):
@@ -835,7 +949,7 @@ class MqttPublisher:
             "name": "LARD Controller",
             "manufacturer": "LARD",
             "model": "Board-priority Braiins actuator",
-            "sw_version": "0.1.3",
+            "sw_version": ADDON_VERSION,
         }
         sensors = [
             (
@@ -1072,6 +1186,14 @@ class Controller:
         self.miner_paused = False
         self.mining_phase = ""
         self._resume_ts = 0.0
+        self._fan_ceiling_applied: int | None = None
+        self._fan_ceiling_token_ts = 0.0
+        self._miner_prev_ok = False
+        self._fan_max_missing_logged = False
+        self._chip_temp_f = None
+        self._fan_rpm = None
+        self._fan_pct = None
+        self._thermal_abort_active = False
 
     def writes_allowed(self, enable_on: bool) -> bool:
         """Braiins writes require BOTH the add-on option and the HA gate."""
@@ -1463,12 +1585,135 @@ class Controller:
             return False
         return True
 
-    def _cooling_auto(self) -> None:
+    def read_fan_max_pct(self) -> int:
+        raw = self.ha.state(ENT_FAN_MAX)
+        if raw in (None, "unknown", "unavailable", ""):
+            if not self._fan_max_missing_logged:
+                self.log(
+                    f"fan_max helper {ENT_FAN_MAX} missing/unavailable — "
+                    f"defaulting to {FAN_MAX_DEFAULT}. Install ha_packages/lard_fan_max.yaml"
+                )
+                self._fan_max_missing_logged = True
+            return FAN_MAX_DEFAULT
+        return clamp_fan_max_pct(raw)
+
+    def ensure_fan_max_helper(self) -> None:
+        """Idempotent HA helper. REST cannot create a real input_number; POST state if missing."""
         try:
-            c_code, _ = self.b.set_cooling_profile_auto()
-            self.log(f"cooling automatic http={c_code}")
+            raw = self.ha.state(ENT_FAN_MAX)
+            if raw not in (None, "unknown", "unavailable", ""):
+                return
+            self.ha.set_state(
+                ENT_FAN_MAX,
+                FAN_MAX_DEFAULT,
+                {
+                    "friendly_name": "LARD Fan Max %",
+                    "min": FAN_MAX_MIN,
+                    "max": FAN_MAX_MAX,
+                    "step": 1,
+                    "mode": "box",
+                    "unit_of_measurement": "%",
+                    "icon": "mdi:fan",
+                    "source": "lard_controller",
+                },
+            )
+            self.log(
+                f"ensured {ENT_FAN_MAX}={FAN_MAX_DEFAULT} via HA state API "
+                "(install ha_packages/lard_fan_max.yaml for a real helper slider)"
+            )
         except Exception as e:
-            self.log(f"cooling skip: {e}")
+            self.log(f"fan_max helper ensure failed: {e}")
+        self._install_fan_max_package()
+
+    def _install_fan_max_package(self) -> None:
+        """Copy the shipped YAML package into /config/packages when that dir already exists."""
+        dest_dir = Path("/config/packages")
+        if not dest_dir.is_dir():
+            return
+        dest = dest_dir / "lard_fan_max.yaml"
+        candidates = [
+            Path(__file__).resolve().parent / "ha_packages" / "lard_fan_max.yaml",
+            Path(__file__).resolve().parent.parent / "ha_packages" / "lard_fan_max.yaml",
+            Path("/app/ha_packages/lard_fan_max.yaml"),
+        ]
+        src = next((p for p in candidates if p.is_file()), None)
+        if src is None:
+            return
+        try:
+            text = src.read_text()
+            if dest.is_file() and dest.read_text() == text:
+                return
+            if dest.is_file():
+                return
+            dest.write_text(text)
+            self.log(f"installed {dest} — reload input_number or restart Core to load the helper")
+        except Exception as e:
+            self.log(f"fan_max package install skip: {e}")
+
+    def _refresh_cooling_telemetry(self) -> None:
+        try:
+            code, state = self.b.get_cooling_state()
+        except Exception as e:
+            self.log(f"cooling_state skip: {e}")
+            return
+        if code != 200:
+            self.log(f"cooling_state http={code} body={_summarize_http_body(state)}")
+            return
+        tel = parse_cooling_telemetry(state if isinstance(state, dict) else {})
+        self._chip_temp_f = tel.get("chip_temp_f")
+        self._fan_rpm = tel.get("fan_rpm")
+        self._fan_pct = tel.get("fan_pct")
+
+    def _thermal_abort_needed(self) -> bool:
+        if thermal_fault_name(self.ha.state(ENT_FAULT)):
+            return True
+        if self._chip_temp_f is not None and float(self._chip_temp_f) >= CHIP_ABORT_F:
+            return True
+        return False
+
+    def _sync_fan_ceiling(self, reason: str = "tick", force: bool = False) -> None:
+        """Own Braiins auto max_fan_speed. Cool path only — never APPLYING / pause / 0W / boards."""
+        try:
+            if not self.settings.enable_writes:
+                return
+            if self.ha.state(ENT_OLD_AUTO) == "on":
+                return
+            self._refresh_cooling_telemetry()
+            abort = self._thermal_abort_needed()
+            if abort:
+                n = FAN_MAX_DEFAULT
+                reason = f"{reason}|chip_abort_f={CHIP_ABORT_F}"
+                self._thermal_abort_active = True
+            else:
+                n = self.read_fan_max_pct()
+                self._thermal_abort_active = False
+            token_ts = float(getattr(self.b, "token_ts", 0.0) or 0.0)
+            token_changed = bool(token_ts) and token_ts != self._fan_ceiling_token_ts
+            if (
+                not force
+                and not abort
+                and not token_changed
+                and self._fan_ceiling_applied == n
+            ):
+                return
+            extra = {"minimum_required_fans": MIN_REQUIRED_FANS} if n >= FAN_MAX_DEFAULT else None
+            code, body = self.b.set_cooling_auto(n, extra)
+            power = self.power_w
+            self.log(
+                f"fan_ceiling reason={reason} requested={n} "
+                f"http={code} body={_summarize_http_body(body)} "
+                f"chip_temp_f={self._chip_temp_f} fan_rpm={self._fan_rpm} "
+                f"fan_pct={self._fan_pct} power_w={power}"
+            )
+            if n >= FAN_MAX_DEFAULT:
+                self.log("fan_ceiling restore unconstrained auto max_fan_speed=100")
+            if code == 200:
+                self._fan_ceiling_applied = n
+                self._fan_ceiling_token_ts = token_ts
+            else:
+                self.log(f"fan_ceiling non-fatal http={code}")
+        except Exception as e:
+            self.log(f"fan_ceiling skip: {e}")
 
     def observe_miner(self) -> MinerObservation:
         """Read boards + pause/mining state. Topology alone never confirms a live mode."""
@@ -1710,7 +1955,7 @@ class Controller:
             obs = self._observe_retrying()
             needs_resume = self._is_paused(obs) or obs.user_paused or obs.phase == "stopped"
             if needs_resume:
-                self._cooling_auto()
+                self._sync_fan_ceiling("apply_mode_pre_resume", force=True)
                 code, _ = self._http_retry(self.b.resume, "resume")
                 self.log(f"resume http={code}")
                 if code != 200:
@@ -1759,6 +2004,9 @@ class Controller:
             self._mark_error(f"apply_exc:{e}")
             self.log(f"APPLY exc {traceback.format_exc()}")
             return False
+        finally:
+            # Re-own the helper ceiling so apply_mode never leaves a wiped auto mode.
+            self._sync_fan_ceiling("apply_mode_complete", force=True)
 
     def _status_dict(self, solar_avg: float, enable_on: bool) -> dict:
         return {
@@ -1789,6 +2037,11 @@ class Controller:
             "last_braiins_ok": self.b.last_ok_iso,
             "miner_url": self.settings.miner_url,
             "supervision": "s6-overlay + Supervisor watchdog",
+            "fan_max_pct": self._fan_ceiling_applied,
+            "chip_temp_f": self._chip_temp_f,
+            "fan_rpm": self._fan_rpm,
+            "fan_pct": self._fan_pct,
+            "thermal_abort": self._thermal_abort_active,
         }
 
     def _write_status_files(self, status: dict) -> None:
@@ -1960,6 +2213,9 @@ class Controller:
         if old_auto == "on":
             self.log("WARNING competing writer: switch.solar_miner_auto_enable is ON — will not turn it on; writes refused")
 
+        # Fan ceiling is a cool path: helper change / thermal / login. Never APPLYING.
+        self._sync_fan_ceiling("tick")
+
         if not self.writes_allowed(enable_on):
             self.acting = False
             if self.settings.enable_writes and not enable_on:
@@ -1985,6 +2241,10 @@ class Controller:
         except Exception as e:
             self.log(f"observe miner failed: {e}")
             obs = MinerObservation()
+
+        if obs.ok and not self._miner_prev_ok:
+            self._sync_fan_ceiling("reconnect", force=True)
+        self._miner_prev_ok = bool(obs.ok)
 
         if not obs.ok:
             # Do not infer a live board mode from topology when pause state is unknown.
@@ -2030,7 +2290,8 @@ def main() -> int:
         f"miner={settings.miner_url} poll={settings.poll_seconds}s "
         f"board_wait>={settings.board_wait_seconds}s resume_wait={RESUME_WAIT_S}s "
         f"enable_writes={settings.enable_writes} "
-        f"power_target={settings.power_target_w}W"
+        f"power_target={settings.power_target_w}W "
+        f"version={ADDON_VERSION} chip_abort_f={CHIP_ABORT_F}"
     )
     if settings.enable_writes:
         log("WRITES ARMED — still requires input_boolean.lard_board_priority_enable=on")
@@ -2053,9 +2314,19 @@ def main() -> int:
     ctrl.mqtt.start()
 
     try:
+        ctrl.ensure_fan_max_helper()
+    except Exception as e:
+        log(f"fan_max helper ensure skip: {e}")
+
+    try:
         ctrl.read_actual_from_miner()
     except Exception as e:
         log(f"initial miner read failed (ok if offline / no password): {e}")
+
+    try:
+        ctrl._sync_fan_ceiling("startup", force=True)
+    except Exception as e:
+        log(f"fan_ceiling startup skip: {e}")
 
     log("controller loop enter — both gates off means observe-only")
     while True:

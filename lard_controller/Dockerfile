@@ -14,6 +14,7 @@ RUN python3 -m venv /opt/lard \
     && /opt/lard/bin/pip install --no-cache-dir -r /app/requirements.txt
 
 COPY app/ /app/
+COPY ha_packages/ /app/ha_packages/
 COPY rootfs/ /
 
 RUN chmod a+x /etc/s6-overlay/s6-rc.d/lard-controller/run \
@@ -26,5 +27,5 @@ LABEL \
     io.hass.name="LARD Controller" \
     io.hass.description="Board-priority Braiins actuator supervised by HA Supervisor" \
     io.hass.type="addon" \
-    io.hass.version="0.1.0" \
+    io.hass.version="0.1.4" \
     io.hass.arch="amd64|aarch64|armv7"

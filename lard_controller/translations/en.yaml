@@ -13,7 +13,7 @@ configuration:
     description: Leave empty to use the Supervisor proxy (http://supervisor/core). Set a URL only for local/dev.
   enable_writes:
     name: Enable Braiins writes
-    description: Leave false until recovery tests pass. Writes also require input_boolean.lard_board_priority_enable to be on.
+    description: Leave false until recovery tests pass. Board/pause/resume/power writes also require input_boolean.lard_board_priority_enable to be on. Fan ceiling (input_number.lard_fan_max_pct) applies when this option is true.
   power_target_w:
     name: Power target (W)
     description: Braiins floor used for all non-paused modes. v1 stays at 944 W.

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.4
+
+- Own Braiins OS+ fan max ceiling over the LAN API. `PUT /api/v1/cooling/mode` with tagged-union `{"auto":{"max_fan_speed": N}}` (integer percent 0–100). The old wipe path `PUT /api/v1/cooling {"mode":"automatic"}` is gone.
+- HA helper `input_number.lard_fan_max_pct` (0–100, step 1, default 100) is required. Package: `ha_packages/lard_fan_max.yaml`. The add-on ensures a state stub on startup if the helper is missing; install the package for a real slider.
+- Ceiling is applied on helper change, add-on start, Braiins login/reconnect, and after `apply_mode` completes so a control cycle cannot wipe it. Cool path only: does not set `APPLYING`, pause, write 0 W, or restart boards.
+- Cooling API failures are logged independently and never fail the mining-control / `apply_mode` loop.
+- `CHIP_ABORT_F=180`: if chip temp or a thermal/cooling fault crosses that threshold, restore unconstrained auto (`max_fan_speed=100`, `minimum_required_fans=2`) immediately. No new mining-pause rule.
+- Fan-ceiling writes require `enable_writes` (same add-on gate as other Braiins writers). They still refuse when `switch.solar_miner_auto_enable` is on. They do not force AUTO or enable legacy writers.
+
 ## 0.1.3
 
 - If requested hashboard topology already matches, skip PATCH and `board_wait` (Stage B satisfied). PAUSED→ONE_BOARD shares `["1"]` and goes straight to staged resume.

@@ -39,10 +39,12 @@ Diagnostic JSON is **not** the health path:
 
 ## Write gates (both required)
 
-Braiins pause / resume / hashboard PATCH / power-target / cooling automatic are issued only when:
+Braiins pause / resume / hashboard PATCH / power-target are issued only when:
 
 1. Add-on option `enable_writes` is **true**, and
 2. `input_boolean.lard_board_priority_enable` is **on**
+
+Fan ceiling (`PUT /api/v1/cooling/mode` with `max_fan_speed`) is issued when `enable_writes` is **true**. It does not wait for the master boolean, does not force `AUTO`, and still refuses if `switch.solar_miner_auto_enable` is on.
 
 Default `enable_writes` is **false**. First boot cannot write the miner.
 
@@ -76,6 +78,32 @@ Board-priority / anti-flap / async PATCH semantics are unchanged:
 - Anti-flap: 10 min up, 5 min down; 15 min settle after a board change. Holds use the last **confirmed** operational mode, never `APPLYING` / `ERROR`.
 
 Power target stays **944 W** until someone measures a higher floor.
+
+## Fan ceiling owner
+
+The add-on owns Braiins OS+ automatic fan max over the LAN API. Not Adv SSH.
+
+| | |
+| --- | --- |
+| Helper | `input_number.lard_fan_max_pct` — range 0–100, step 1, default 100 |
+| Package | `ha_packages/lard_fan_max.yaml` (copy into `config/packages/`) |
+| Write | `PUT /api/v1/cooling/mode` body `{"auto":{"max_fan_speed": N}}` (`N` integer u32 percent, **not** a 0.6 float) |
+| Restore 100 | `{"auto":{"max_fan_speed": 100, "minimum_required_fans": 2}}` |
+| Read | `GET /api/v1/cooling/state` (fans rpm / `target_speed_ratio`). `GET /api/v1/cooling/mode` is **405** |
+| Auth | `Authorization: <raw token>` (no Bearer) |
+
+The helper must exist. REST cannot create a real `input_number`; on startup the add-on POSTs a state stub if the entity is missing and copies the package into `/config/packages/` only when that directory already exists. Install the YAML (or create the Number helper in the UI) and restart Core.
+
+Applied when `enable_writes` is true:
+
+- helper value changes
+- add-on start
+- successful Braiins login / reconnect (`token_ts` change or miner returns)
+- after every `apply_mode` (so the old pre-resume cooling call cannot wipe the ceiling)
+
+Cool path only: **never** sets `actual_mode=APPLYING`, **never** pauses, **never** writes power target 0, **never** PATCH/restarts boards. Cooling HTTP failures are logged and do **not** fail `apply_mode` or the mining-control loop.
+
+`CHIP_ABORT_F=180` (operator policy; this controller had no prior chip-°F abort). If `GET /api/v1/cooling/state` highest temperature converts to ≥ 180 °F, or `sensor.solar_miner_fault_reason` looks like a thermal/cooling fault, restore unconstrained auto (`max_fan_speed=100`) immediately. Existing SOC / heartbeat / stale / fault **pause** policy is unchanged.
 
 ## Mode reconciliation contract
 
@@ -173,7 +201,10 @@ Run these with **`enable_writes: false`** first. None of them should touch the m
 | Crash process | `kill -9` the python PID **inside** the add-on container (or `ha addons restart local_lard_controller`) | Container exits; Supervisor recreates it. Do **not** start a host `nohup` replacement |
 | Braiins unreachable | Unplug miner ethernet or point `miner_url` at a closed port | Loop continues, `api_fail_count` rises, `/health` stays 200, **no reboot attempts** |
 | Watchdog YAML | Turn enable on and stop the add-on for >2 min | Persistent notification; **no** Braiins API from HA |
-| Dual gate | `enable_writes: true` but master boolean off | Logs `master_gate_off`; no PATCH/pause/resume |
+| Dual gate | `enable_writes: true` but master boolean off | Logs `master_gate_off`; no PATCH/pause/resume (fan ceiling may still PUT if writes are armed) |
+| Fan ceiling 100→60 while hashing | Set `input_number.lard_fan_max_pct` to 60 | Logs `fan_ceiling requested=60`; `actual_mode` stays the live board mode (not `APPLYING`); power target unchanged; no pause |
+| Fan ceiling survives control cycle | After 60 is applied, wait one poll / any board-priority tick | Next `apply_mode` complete re-PUTs `max_fan_speed=60` (never bare `{"mode":"automatic"}`) |
+| Fan ceiling restore 100 | Set helper to 100 | Logs unconstrained auto restore `max_fan_speed=100` |
 | Old auto | Flip `switch.solar_miner_auto_enable` on (then off) | Writes refused; notification from the package; switch is not turned on by this add-on |
 
 After the table is green, arm writes in a planned window.
