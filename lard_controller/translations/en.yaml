@@ -49,7 +49,7 @@ configuration:
     description: Short pause after a confirmed cooling PUT before the resume-settle window. Default 5.
   cooling_resume_settle_seconds:
     name: Cooling resume settle (seconds)
-    description: Wait after a confirmed cooling PUT before ResumeMining. BOSminer may return HTTP 500 until the cooling/config process settles. Default 20. First 500 is retried with backoff, then Start, then BOSminer Restart — not a device reboot.
+    description: Legacy settle used only when cooling_settle_seconds is 0. 0.1.7 recovery does not escalate ResumeMining 500s to Start or BOSminer Restart.
   cooling_one_board_max_fan_pct:
     name: ONE_BOARD max fan % (TBD/measured)
     description: Placeholder auto max_fan_speed for ONE_BOARD. Replace with a measured-safe value. Capped by input_number.lard_fan_max_pct.
@@ -74,5 +74,41 @@ configuration:
   cooling_paused_min_fan_pct:
     name: PAUSED min fan % (TBD/measured)
     description: Optional min_fan_speed while paused. 0 omits the field. Placeholder.
+  cooling_writes_only_when_paused:
+    name: Cooling writes only when paused
+    description: When true (default), a cooling PUT is refused unless the miner is paused and idle. Never a live mid-hash PUT.
+  auto_fan_ceiling_enabled:
+    name: Auto fan ceiling
+    description: Leave false. Automatic fan-ceiling changes stay off until a proof run. Explicit maintenance transitions still use the gated pause path.
+  cooling_settle_seconds:
+    name: Cooling settle (seconds)
+    description: Poll after a confirmed cooling PUT before ResumeMining. Default 45. Do not resume just because the PUT returned.
+  transition_poll_interval_seconds:
+    name: Transition poll interval (seconds)
+    description: How often to poll pause, settle, and recovery. Default 10.
+  expected_recovery_seconds:
+    name: Expected recovery (seconds)
+    description: 0 W is normal through this window when Braiins is in cooldown, preheat, startup, or APPLYING. Default 240.
+  maximum_recovery_seconds:
+    name: Maximum recovery (seconds)
+    description: Keep waiting past the expected window only while lifecycle stays positive. Default 600. Then one resume retry.
+  post_retry_recovery_seconds:
+    name: Post-retry recovery (seconds)
+    description: Shorter window after the single automatic resume retry. Default 180. Then DEGRADED_NEEDS_ATTENTION, not ERROR.
+  stable_hash_poll_count:
+    name: Stable hash polls
+    description: Consecutive good watts/hashrate/board samples required before health is HASHING. Default 3.
+  telemetry_failures_before_error:
+    name: Telemetry failures before ERROR
+    description: First misses are UNKNOWN or STALE and do not pause, resume, or write cooling. Default 3.
+  resume_retry_enabled:
+    name: Resume retry
+    description: Allow one automatic ResumeMining retry after maximum recovery. Default true.
+  max_resume_retries_per_transaction:
+    name: Max resume retries per transaction
+    description: Hard cap is 1. Default 1.
+  coalesce_pending_cooling_requests:
+    name: Coalesce pending cooling
+    description: While a transaction is active, keep only the newest requested fan ceiling and apply it after HASHING or a terminal state. Default true.
 network:
   8099/tcp: Health and status HTTP (no miner writes)

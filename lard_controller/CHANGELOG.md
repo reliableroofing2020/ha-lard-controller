@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.7
+
+- Bounded cooling recovery state machine. After a gated pause → cooling PUT → settle, ResumeMining is issued **once**. 0 W / 0 TH/s during cooldown, preheat, startup, init, or APPLYING stays `RECOVERING` and is not `ERROR`.
+- Windows: post-write settle 45s (`cooling_settle_seconds`), poll 10s, expected recovery 240s, maximum 600s. Between expected and maximum the controller keeps waiting only while Braiins reports a positive lifecycle. At the maximum, exactly one guarded resume retry, then a 180s post-retry window. If that still does not hash: `DEGRADED_NEEDS_ATTENTION`, not `ERROR`.
+- Full `HASHING` health needs 3 consecutive polls with plausible watts, hashrate above the startup threshold, expected boards present and healthy, and no hard fault. A missing or unhealthy board with nonzero watts is not full `HASHING`.
+- Hard faults (overheat, hardware/board/PSU/fan failure, unrecoverable) go straight to `ERROR`. No Start, no BOSminer Restart, no device reboot, and no extra cooling PUT on that path.
+- Telemetry timeouts publish `UNKNOWN` / `STALE` and keep the last good reading. They do not ERROR or issue corrective commands on the first miss. `ERROR` only after `telemetry_failures_before_error` (default 3). Timeouts during a cooling transaction do not cancel or overwrite that transaction.
+- Per-miner lock. Same-value cooling is a no-op (no pause/resume). Requests during a transaction coalesce to the newest ceiling and apply after `HASHING` or a terminal degraded/error. No live cooling PUT while hashing.
+- `auto_fan_ceiling_enabled` stays **false**. Automatic fan-ceiling changes stay off. `cooling_writes_only_when_paused` stays true. `enable_writes` still defaults false. `switch.solar_miner_auto_enable` is still never turned on.
+- Observability: `sensor.lard_controller_health` plus cooling transaction attributes (txn id, phase, ceilings, resume result, recovery elapsed/remaining, lifecycle reason, telemetry freshness). Structured `lard_cooling_*` / `lard_telemetry_*` events.
+
 ## 0.1.6
 
 - After a gated cooling PUT, do **not** treat the first `ResumeMining` HTTP 500 as a hard fail. Cooling apply is a disruptive config transition: BOSminer may not accept resume until the process settles (`bosminer_uptime_s == 0` means the process is not running).

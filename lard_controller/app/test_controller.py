@@ -13,7 +13,6 @@ from controller import (
     API_5XX_BACKOFF_S,
     CHIP_ABORT_F,
     COOLING_IDLE_POWER_W,
-    COOLING_RESUME_BACKOFF_S,
     ENT_ENABLE,
     ENT_FAN_MAX,
     ENT_FAULT,
@@ -42,6 +41,10 @@ class FakeHA:
         self._states = dict(states)
         self.fail_count = 0
         self.writes: list[tuple[str, object]] = []
+        self.events: list[tuple[str, dict]] = []
+
+    def fire_event(self, event_type, data=None):
+        self.events.append((event_type, dict(data or {})))
 
     def state(self, entity_id: str):
         return self._states.get(entity_id)
@@ -114,6 +117,17 @@ class FakeBraiins:
         self.resume_ok_after_elapsed = None
         self.cooling_resets_bosminer = False
         self._cooling_put_clock_at = None
+        # 0.1.7 scripted lifecycle. Defaults keep the old resume_sets_running path.
+        self.lifecycle_after_resume = None
+        self.become_running_after_s = None
+        self.run_on_resume_number = None
+        self.resume_calls = 0
+        self.resume_500_enters_lifecycle = False
+        self.hard_fault_after_resume = False
+        self.boards_healthy = True
+        self.board_stale = False
+        self.lifecycle_power_w = 0.0
+        self.lifecycle_hashrate = 0.0
 
     def _next_http(self, name: str, default: int = 200) -> int:
         val = getattr(self, name, default)
@@ -186,6 +200,41 @@ class FakeBraiins:
         self.phase = "starting"
         self.status = "starting"
 
+    def _enter_lifecycle(self, phase: str) -> None:
+        self.paused = False
+        self.running = False
+        self.user_paused = False
+        self.phase = phase
+        self.status = phase
+        self.pause_reason = phase
+        self.power_w = float(self.lifecycle_power_w or 0.0)
+        self.hashrate = float(self.lifecycle_hashrate or 0.0)
+
+    def _enter_hard_fault(self) -> None:
+        self.paused = True
+        self.running = False
+        self.user_paused = False
+        self.phase = "stopped"
+        self.status = "hardware_fault"
+        self.pause_reason = "hardware_fault"
+        self.power_w = 0.0
+        self.hashrate = 0.0
+
+    def _maybe_become_running(self) -> None:
+        if self.become_running_after_s is None or self.clock is None:
+            return
+        if self._resume_clock_at is None or self.running:
+            return
+        if self.clock.t >= self._resume_clock_at + float(self.become_running_after_s):
+            self._set_running()
+
+    def _apply_scripted_state(self) -> None:
+        self._maybe_delayed_unpause()
+        self._maybe_become_running()
+
+    def board_health(self):
+        return {"healthy": bool(self.boards_healthy), "stale": bool(self.board_stale)}
+
     def _maybe_delayed_unpause(self) -> None:
         if self.unpause_after_elapsed is None or self.clock is None:
             return
@@ -210,6 +259,7 @@ class FakeBraiins:
 
     def resume(self):
         self.calls.append(("resume",))
+        self.resume_calls += 1
         if self.clock is not None:
             self._resume_clock_at = self.clock.t
         if self.resume_ok_after_elapsed is not None and self.clock is not None:
@@ -222,8 +272,20 @@ class FakeBraiins:
         code = self._next_http("resume_http")
         self._note_http(code)
         if code != 200:
+            if self.resume_500_enters_lifecycle and self.lifecycle_after_resume:
+                self._enter_lifecycle(self.lifecycle_after_resume)
             return code, {}
-        if self.resume_sets_running:
+        if self.hard_fault_after_resume:
+            self._enter_hard_fault()
+            return 200, {"already_mining": False}
+        if (
+            self.run_on_resume_number is not None
+            and self.resume_calls >= int(self.run_on_resume_number)
+        ):
+            self._set_running()
+        elif self.lifecycle_after_resume:
+            self._enter_lifecycle(self.lifecycle_after_resume)
+        elif self.resume_sets_running:
             self._set_running()
         elif self.resume_sets_starting:
             self._set_starting()
@@ -347,7 +409,7 @@ class FakeBraiins:
         self._note_http(code)
         if code != 200:
             return {}, code, {}
-        self._maybe_delayed_unpause()
+        self._apply_scripted_state()
         uptime = self.bosminer_uptime_s
         miner_ready = None if uptime is None else float(uptime) > 0
         not_started = self.status in (1, "1", "not_started", "miner_status_not_started") or (
@@ -412,6 +474,10 @@ def make_controller(braiins: FakeBraiins, mode_req: str, enable_writes: bool = T
         cooling_two_board_max_fan_pct=100,
         cooling_three_board_max_fan_pct=100,
         cooling_paused_max_fan_pct=100,
+        # Production default is false. These tests opt into the gated path.
+        auto_fan_ceiling_enabled=True,
+        cooling_settle_seconds=0,
+        cooling_writes_only_when_paused=True,
     )
     log = Logger(settings)
     health = HealthState(settings)
@@ -551,14 +617,16 @@ class ReconciliationTests(unittest.TestCase):
         self.assertFalse(b.paused)
 
     def test_1b_resume_without_running_does_not_confirm_one_board(self):
+        """Resume accepted but miner stays paused: not ONE_BOARD, and not ERROR."""
         b = paused_one_board()
         b.resume_sets_running = False
         ctrl = make_controller(b, "ONE_BOARD")
         ctrl.tick()
         self.assertIn("resume", b.write_names())
         self.assertNotEqual(ctrl.actual_mode, "ONE_BOARD")
-        self.assertEqual(ctrl.actual_mode, "ERROR")
-        self.assertIn("resume_wait_timeout", ctrl.last_error)
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(ctrl._health_class, "DEGRADED_NEEDS_ATTENTION")
+        self.assertIn("degraded", ctrl.last_error)
 
     def test_2_running_wrong_boards_fixes_boards_no_pause_resume(self):
         b = running_boards(["1"])
@@ -1290,8 +1358,12 @@ class FanCeilingTests(unittest.TestCase):
         self.assertNotIn("restart", b.write_names())
         self.assertGreaterEqual(b.write_names().count("resume"), 2)
 
-    def test_cooling_resume_always_500_escalates_then_errors(self):
-        """Resume 500s exhaust settle/backoff, then Start, then BOSminer Restart, then ERROR."""
+    def test_cooling_resume_always_500_is_degraded_not_error(self):
+        """Sustained ResumeMining 500 with no lifecycle progress is DEGRADED.
+
+        0.1.7 does not escalate to Start or BOSminer Restart, and does not ERROR
+        solely because resume stays HTTP 500 / 0 W.
+        """
         b = running_boards(["1"])
         b.resume_http = 500
         ctrl = make_controller(b, "ONE_BOARD")
@@ -1311,18 +1383,19 @@ class FanCeilingTests(unittest.TestCase):
 
         b.resume = wrap_resume  # type: ignore[method-assign]
         ctrl.tick()
-        self.assertEqual(ctrl.actual_mode, "ERROR")
-        self.assertIn("cooling_resume_http_500", ctrl.last_error)
-        self.assertIn("start", b.write_names())
-        self.assertIn("restart", b.write_names())
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(ctrl._health_class, "DEGRADED_NEEDS_ATTENTION")
+        self.assertIn("degraded_needs_attention", ctrl.last_error)
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertEqual(b.resume_calls, 2)
         self.assertTrue(saw_applying)
         self.assertTrue(all(m == "APPLYING" for m in saw_applying))
-        self.assertGreaterEqual(ctrl._clock.t - started, 8 + sum(COOLING_RESUME_BACKOFF_S))
+        self.assertGreaterEqual(ctrl._clock.t - started, 8)
         self.assertTrue(b.paused)
         self.assertNotEqual(ctrl.ha._states.get(ENT_OLD_AUTO), "on")
         puts = [c[1] for c in b.cooling_puts()]
-        self.assertIn(60, puts)
-        self.assertEqual(puts[-1], 100)
+        self.assertEqual(puts, [60])
 
     def test_cooling_resume_200_first_try_still_works(self):
         b = running_boards(["1"])
@@ -1399,6 +1472,272 @@ class FanCeilingTests(unittest.TestCase):
             code, body = client.restart()
         self.assertEqual(code, 200)
         self.assertTrue(hasattr(Braiins, "start"))
+
+
+class RecoveryStateMachineTests(unittest.TestCase):
+    """0.1.7 bounded recovery. Fake clock only — no real multi-minute sleeps."""
+
+    def test_defaults_keep_auto_fan_ceiling_off(self):
+        s = Settings()
+        self.assertFalse(s.auto_fan_ceiling_enabled)
+        self.assertTrue(s.cooling_writes_only_when_paused)
+        self.assertEqual(s.cooling_settle_seconds, 45)
+        self.assertEqual(s.transition_poll_interval_seconds, 10)
+        self.assertEqual(s.expected_recovery_seconds, 240)
+        self.assertEqual(s.maximum_recovery_seconds, 600)
+        self.assertEqual(s.post_retry_recovery_seconds, 180)
+        self.assertEqual(s.stable_hash_poll_count, 3)
+        self.assertEqual(s.telemetry_failures_before_error, 3)
+        self.assertTrue(s.resume_retry_enabled)
+        self.assertEqual(s.max_resume_retries_per_transaction, 1)
+        self.assertTrue(s.coalesce_pending_cooling_requests)
+        self.assertFalse(s.enable_writes)
+
+    def test_1_plain_pause_resume_zero_watts_then_hashing(self):
+        b = running_boards(["1"])
+        b.lifecycle_after_resume = "cooldown"
+        b.become_running_after_s = 185
+        ctrl = make_controller(b, "ONE_BOARD")
+        ok = ctrl.run_plain_pause_resume("ONE_BOARD")
+        self.assertTrue(ok)
+        self.assertGreaterEqual(ctrl._clock.t - b._resume_clock_at, 185)
+        self.assertLess(ctrl._clock.t - b._resume_clock_at, 240)
+        self.assertEqual(b.resume_calls, 1)
+        self.assertNotIn("set_cooling_auto", b.write_names())
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(ctrl.last_error, "")
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertIn("power_w=0.0", log)
+        self.assertIn("recovery_hashing", log)
+
+    def test_2_cooling_while_paused_delayed_success(self):
+        b = paused_one_board()
+        b.lifecycle_after_resume = "cooldown"
+        b.become_running_after_s = 480
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl._cooling_applied = _applied(100)
+        ok = ctrl.request_cooling_ceiling(60, resume_mode="ONE_BOARD")
+        self.assertTrue(ok)
+        self.assertEqual(b.resume_calls, 1)
+        self.assertGreaterEqual(ctrl._clock.t - b._resume_clock_at, 480)
+        self.assertLess(ctrl._clock.t - b._resume_clock_at, 600)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        puts = [c[1] for c in b.cooling_puts()]
+        self.assertEqual(puts, [60])
+        names = b.write_names()
+        self.assertLess(names.index("set_cooling_auto"), names.index("resume"))
+
+    def test_3_resume_http_500_then_legitimate_recovery_is_not_error(self):
+        b = running_boards(["1"])
+        b.resume_http = 500
+        b.resume_500_enters_lifecycle = True
+        b.lifecycle_after_resume = "cooldown"
+        b.become_running_after_s = 185
+        ctrl = make_controller(b, "ONE_BOARD")
+        ok = ctrl.run_plain_pause_resume("ONE_BOARD")
+        self.assertTrue(ok)
+        self.assertEqual(b.resume_calls, 1)
+        self.assertFalse(ctrl._resume_retry_used)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertEqual(ctrl.last_error, "")
+
+    def test_4_max_recovery_one_retry_then_hashing(self):
+        b = running_boards(["1"])
+        b.lifecycle_after_resume = "cooldown"
+        b.run_on_resume_number = 2
+        ctrl = make_controller(b, "ONE_BOARD")
+        ok = ctrl.run_plain_pause_resume("ONE_BOARD")
+        self.assertTrue(ok)
+        self.assertEqual(b.resume_calls, 2)
+        self.assertTrue(ctrl._resume_retry_used)
+        self.assertGreaterEqual(ctrl._clock.t - b._resume_clock_at, 0)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertIn("recovery_limit", log)
+        self.assertIn("one guarded resume retry", log)
+
+    def test_5_retry_fails_degraded_not_error(self):
+        b = running_boards(["1"])
+        b.lifecycle_after_resume = "cooldown"
+        ctrl = make_controller(b, "ONE_BOARD")
+        ok = ctrl.run_plain_pause_resume("ONE_BOARD")
+        self.assertFalse(ok)
+        self.assertEqual(b.resume_calls, 2)
+        self.assertTrue(ctrl._resume_retry_used)
+        self.assertEqual(ctrl._health_class, "DEGRADED_NEEDS_ATTENTION")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertIn("degraded_needs_attention", ctrl.last_error)
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertNotIn("set_cooling_auto", b.write_names())
+
+    def test_6_hard_fault_is_error_without_resume_retry(self):
+        b = running_boards(["1"])
+        b.hard_fault_after_resume = True
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl._cooling_applied = _applied(100)
+        ctrl._fan_max_seen = 100
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        ok = ctrl.tick()
+        self.assertFalse(ok if ok is not None else False)
+        self.assertEqual(b.resume_calls, 1)
+        self.assertFalse(ctrl._resume_retry_used)
+        self.assertEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(ctrl._health_class, "ERROR")
+        self.assertIn("hard_fault", ctrl.last_error)
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        puts = [c[1] for c in b.cooling_puts()]
+        self.assertEqual(puts, [60])
+
+    def test_7_one_or_two_telemetry_timeouts_are_stale_not_error(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl._cooling_txn_active = True
+        ctrl._cooling_phase = "RECOVERING"
+        ctrl._health_class = "RECOVERING"
+        ctrl.actual_mode = "APPLYING"
+        ctrl._note_telemetry_success()
+        ctrl._note_telemetry_failure("recovery_primary")
+        self.assertEqual(ctrl._telemetry_freshness, "STALE")
+        self.assertEqual(ctrl._cooling_phase, "RECOVERING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        ctrl._note_telemetry_failure("recovery_primary")
+        self.assertEqual(ctrl._telemetry_fail_streak, 2)
+        self.assertEqual(ctrl._telemetry_freshness, "STALE")
+        self.assertEqual(ctrl._cooling_phase, "RECOVERING")
+        self.assertEqual(ctrl._health_class, "RECOVERING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(b.write_names(), [])
+
+        b2 = running_boards(["1"])
+        b2.boards_http = 500
+        ctrl2 = make_controller(b2, "ONE_BOARD")
+        ctrl2.tick()
+        self.assertEqual(ctrl2._telemetry_freshness, "UNKNOWN")
+        self.assertNotEqual(ctrl2.actual_mode, "ERROR")
+        ctrl2.tick()
+        self.assertEqual(ctrl2._telemetry_fail_streak, 2)
+        self.assertNotEqual(ctrl2.actual_mode, "ERROR")
+        self.assertEqual(ctrl2._health_class, "UNKNOWN")
+        self.assertEqual(b2.write_names(), [])
+
+    def test_8_sustained_telemetry_failure_errors_without_corrective_writes(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl._cooling_txn_active = True
+        ctrl._cooling_phase = "RECOVERING"
+        ctrl._health_class = "RECOVERING"
+        ctrl.actual_mode = "APPLYING"
+        for _ in range(3):
+            ctrl._note_telemetry_failure("recovery_primary")
+        self.assertEqual(ctrl._cooling_phase, "RECOVERING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertTrue(ctrl._telemetry_fault)
+        self.assertEqual(b.write_names(), [])
+
+        b2 = running_boards(["1"])
+        b2.boards_http = 500
+        ctrl2 = make_controller(b2, "ONE_BOARD")
+        ctrl2.tick()
+        ctrl2.tick()
+        ctrl2.tick()
+        self.assertEqual(ctrl2.actual_mode, "ERROR")
+        self.assertEqual(ctrl2._health_class, "ERROR")
+        self.assertEqual(ctrl2.last_error, "telemetry_sustained_unavailable")
+        self.assertEqual(b2.write_names(), [])
+
+    def test_9_same_value_cooling_is_noop(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl._cooling_applied = CoolingProfile("EXPLICIT", 70, None, None)
+        ok = ctrl.request_cooling_ceiling(70)
+        self.assertTrue(ok)
+        self.assertNotIn("pause", b.write_names())
+        self.assertNotIn("resume", b.write_names())
+        self.assertNotIn("set_cooling_auto", b.write_names())
+        self.assertEqual(ctrl._last_cooling_result, "noop")
+        self.assertIn("lard_cooling_noop", [name for name, _payload in ctrl.ha.events])
+
+    def test_10_multiple_ceilings_during_txn_keep_newest_only(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl._cooling_applied = _applied(100)
+        ctrl._fan_max_seen = 100
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        orig_pause = b.pause
+
+        def wrap_pause():
+            if b.resume_calls == 0 and b.write_names().count("pause") == 0:
+                ctrl.request_cooling_ceiling(70)
+                ctrl.request_cooling_ceiling(80)
+            return orig_pause()
+
+        b.pause = wrap_pause  # type: ignore[method-assign]
+        ctrl.tick()
+        puts = [c[1] for c in b.cooling_puts()]
+        self.assertEqual(puts, [60, 80])
+        self.assertNotIn(70, puts)
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertIn("lard_cooling_coalesced", [name for name, _payload in ctrl.ha.events])
+
+    def test_11_live_cooling_while_hashing_is_rejected(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.settings.auto_fan_ceiling_enabled = False
+        ctrl._cooling_applied = _applied(100)
+        ctrl.tick()
+        self.assertNotIn("set_cooling_auto", b.write_names())
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        before = list(b.write_names())
+        ctrl.tick()
+        self.assertEqual(b.write_names(), before)
+        self.assertIn("lard_cooling_deferred", [name for name, _payload in ctrl.ha.events])
+
+        b2 = running_boards(["1"])
+        ctrl2 = make_controller(b2, "ONE_BOARD")
+        ctrl2.settings.auto_fan_ceiling_enabled = False
+        ctrl2._cooling_applied = _applied(100)
+        ok = ctrl2.request_cooling_ceiling(60, resume_mode="ONE_BOARD")
+        self.assertTrue(ok)
+        names = b2.write_names()
+        self.assertLess(names.index("pause"), names.index("set_cooling_auto"))
+        self.assertEqual(ctrl2._health_class, "HASHING")
+        self.assertNotEqual(ctrl2.actual_mode, "ERROR")
+
+        b3 = running_boards(["1"])
+        ctrl3 = make_controller(b3, "ONE_BOARD")
+        refused = ctrl3._apply_cooling_while_paused(CoolingProfile("EXPLICIT", 50, None, None))
+        self.assertFalse(refused)
+        self.assertNotIn("set_cooling_auto", b3.write_names())
+        self.assertNotEqual(ctrl3.actual_mode, "ERROR")
+
+    def test_12_unhealthy_board_is_not_full_hashing(self):
+        b = running_boards(["1"])
+        b.boards_healthy = False
+        ctrl = make_controller(b, "ONE_BOARD")
+        ok = ctrl.run_plain_pause_resume("ONE_BOARD")
+        self.assertTrue(ok)
+        self.assertNotEqual(ctrl._health_class, "HASHING")
+        self.assertEqual(ctrl._health_class, "RECOVERING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertGreater(b.power_w, 10)
 
 
 if __name__ == "__main__":

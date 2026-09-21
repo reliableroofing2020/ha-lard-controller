@@ -113,20 +113,23 @@ When **desired profile ≠ applied profile** (and dwell has elapsed, unless ther
 4. Verify `user_pause=true` **and** actual power ≈ 0 W.
 5. `PUT /api/v1/cooling/mode` with the tagged auto body.
 6. Read cooling state back; confirm requested values stuck (or PUT 200 + GET 200 when the state payload has no `max_fan_speed`).
-7. Short stabilize (`cooling_stabilize_seconds`, default 5).
+7. Short stabilize (`cooling_stabilize_seconds`, default 5), then the 0.1.7 post-write settle (`cooling_settle_seconds`, default 45, poll every `transition_poll_interval_seconds`, default 10). Do **not** resume merely because the PUT returned.
 8. Poll miner readiness (`GET /api/v1/miner/details`: pause flag, `bosminer_uptime_s`, status / `detailed_status` reason, watts). `bosminer_uptime_s == 0` means the bosminer process is not running — that is unreadiness, not a confirmed hard fail.
-9. Wait `cooling_resume_settle_seconds` (default 20). Do **not** assume the first `ResumeMining` is accepted.
-10. Resume mining with bounded backoff (5s / 10s / 20s). Stay `APPLYING`. A 500 is retried.
-11. If ResumeMining still 500: escalate `PUT /api/v1/actions/start`, then BOSminer `PUT /api/v1/actions/restart`. Device reboot (`/actions/reboot`) is never used.
-12. Verify `user_pause=false`, mining running, expected hashboards, watts > 0, TH/s recovering, cooling still the requested profile.
-13. Only then publish the requested operating mode as actual.
+9. Resume mining **once** (`RESUME_REQUESTED`). HTTP 500 is not an immediate `ERROR`. Device reboot is never used. 0.1.7 does **not** escalate to `PUT /api/v1/actions/start` or BOSminer Restart for this recovery.
+10. Enter `RECOVERING`. 0 W / 0 TH/s is acceptable while the miner is reachable and in a legitimate lifecycle (APPLYING, cooldown, cooling down, preheat, startup, init, autotune) and there is no hard fault.
+11. Before `expected_recovery_seconds` (default 240), stay `RECOVERING` when lifecycle is positive. Between expected and `maximum_recovery_seconds` (default 600), keep waiting only with positive lifecycle or progress.
+12. At the maximum, if still reachable, not hashing, and not a hard fault: exactly one guarded resume retry, then `post_retry_recovery_seconds` (default 180). If that fails: health `DEGRADED_NEEDS_ATTENTION` (actual stays `APPLYING`). Not `ERROR`.
+13. Full `HASHING` (`sensor.lard_controller_health`) requires `stable_hash_poll_count` (default 3) consecutive polls with plausible watts, hashrate above the startup threshold, expected boards present and healthy, and no hard fault. Only then publish the operating mode as confirmed actual. A missing or unhealthy board with nonzero watts is not full `HASHING`.
 
 Rules:
 
-- The intentional paused period is **not** `ERROR`. Stay in `APPLYING` for the whole cooling transition **and** the post-PUT resume recovery window.
-- Desired == applied → skip pause and cooling PUT (idempotent).
-- `cooling_dwell_seconds` (default 600) blocks rapid cooling-only re-transitions so short solar/SOC/slider flaps do not thrash profiles. A committed board-count `apply_mode` still applies that mode's profile while paused.
-- Cooling PUT failure: restore the last known-good profile if possible → pause the miner safely → `ERROR`. Resume HTTP 500 after a cooling PUT is **not** an immediate fail — `ERROR` only after settle + bounded resume + Start + BOSminer Restart are exhausted. Do **not** hand off to legacy writers.
+- The intentional paused period is **not** `ERROR`. Published `actual_mode` stays `APPLYING` for the whole cooling transition. Finer phase and health (`HASHING`, `PAUSED`, `APPLYING`, `RECOVERING`, `UNKNOWN`, `DEGRADED_NEEDS_ATTENTION`, `ERROR`) are on `sensor.lard_controller_health` and actual-mode attributes.
+- Desired == applied → skip pause and cooling PUT (idempotent no-op).
+- A new ceiling requested during a transaction is coalesced to the newest value and applied only after `HASHING` or a terminal degraded/error. No live cooling PUT while hashing. `auto_fan_ceiling_enabled` defaults false, so ordinary ticks do not start a cooling transaction.
+- `cooling_dwell_seconds` (default 600) blocks rapid cooling-only re-transitions so short solar/SOC/slider flaps do not thrash profiles. A committed board-count `apply_mode` still applies that mode's profile while paused when auto fan ceiling is enabled.
+- Cooling PUT failure or a non-5xx resume rejection: restore the last known-good profile if possible → pause the miner safely → `ERROR`. Resume HTTP 500, or 0 W during cooldown/preheat, is **not** that path. Do **not** hand off to legacy writers.
+- Hard fault (overheat, hardware/board/ASIC/PSU/fan failure, unrecoverable): `ERROR` immediately. No resume retry and no extra cooling PUT.
+- A missed telemetry read is `UNKNOWN` or `STALE` until `telemetry_failures_before_error` (default 3) consecutive failures. It does not drive pause/resume/cooling. During a transaction it does not cancel that transaction.
 - `CHIP_ABORT_F=180`: unconstrained 100 still applies, through the same gated sequence (dwell bypassed). Existing SOC / heartbeat / stale / fault **mining-pause** policy is unchanged.
 - Startup / reconnect no longer force a cooling PUT.
 
@@ -186,6 +189,7 @@ Dual write gates (`enable_writes` + HA master boolean) and the old-auto refuse p
 | `sensor.lard_controller_last_braiins_ok` | UTC ISO of last Braiins HTTP 200 |
 | `sensor.lard_controller_power_w` | Approx watts from miner stats |
 | `sensor.lard_controller_boards` | e.g. `1,2` or `none` |
+| `sensor.lard_controller_health` | `HASHING` / `PAUSED` / `APPLYING` / `RECOVERING` / `UNKNOWN` / `DEGRADED_NEEDS_ATTENTION` / `ERROR` |
 
 MQTT discovery (when a broker is available) uses availability + last-will so a dead container goes unavailable. REST entities do **not** expire by themselves — the package template `binary_sensor.lard_controller_fresh` treats `last_seen` older than 120 s as stale.
 
@@ -232,9 +236,11 @@ Run these with **`enable_writes: false`** first. None of them should touch the m
 | Cooling profile 100→60 while hashing | Set `input_number.lard_fan_max_pct` to 60 (writes armed) | Enters `APPLYING`, pauses, verifies ~0 W, PUTs tagged auto 60, confirms, resumes; then actual returns to the board mode. Never a live mid-hash PUT |
 | Cooling idempotent | Desired profile already applied | No pause, no cooling PUT |
 | Cooling dwell | Change the helper twice inside 600 s | Second transition is skipped until dwell elapses |
-| Cooling PUT / resume fail | (fault injection) | Restore known-good, miner left paused, `ERROR`; old auto stays off |
-| Cooling resume 500 then 200 | After a confirmed PUT, first `ResumeMining` 500s until settle | Stays `APPLYING`; succeeds after settle/backoff; not `ERROR` early |
-| Cooling resume always 500 | Resume keeps 500 after settle + backoff | Start, then BOSminer Restart, then `ERROR`; no device reboot; no legacy handoff |
+| Cooling PUT fail | (fault injection) | Restore known-good, miner left paused, `ERROR`; old auto stays off |
+| Cooling resume 500 then recovery | First `ResumeMining` is HTTP 500, miner then cooldown/preheat and hashes | Stays `RECOVERING` / `APPLYING`; reaches `HASHING`; not `ERROR` |
+| Cooling resume never recovers | Resume 500 or 0 W with no positive lifecycle through max + one retry | `DEGRADED_NEEDS_ATTENTION`; no Start, no BOSminer Restart, no device reboot |
+| Hard fault | Miner reports hardware/thermal fault after resume | `ERROR` immediately; no second resume; no extra cooling PUT |
+| Telemetry blip | One or two read timeouts | `UNKNOWN` or `STALE`; last good kept; no corrective pause/resume/cooling |
 | Cooling restore 100 | Thermal abort or helper 100 after a lower profile | Gated pause → PUT 100 → resume (not a live PUT) |
 | Old auto | Flip `switch.solar_miner_auto_enable` on (then off) | Writes refused; notification from the package; switch is not turned on by this add-on |
 
