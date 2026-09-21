@@ -9,7 +9,7 @@ Supervisor owns start / stop / restart. This is not an Advanced SSH `nohup` job 
 | | |
 | --- | --- |
 | Slug | `lard_controller` |
-| Version | `0.1.4` |
+| Version | `0.1.5` |
 | Miner | Braiins OS+ REST @ `http://192.168.1.113` (API ~1.8.0) |
 | Network | `host_network: true` |
 | Health | `http://<ha-host>:8099/health` (Supervisor watchdog) |
@@ -83,20 +83,30 @@ Before `enable_writes: true`, turn **off**:
 
 HVAC-only automations (`solar_miner_lower_ac`, `solar_miner_upstairs_ac`, presence comfort) are not Braiins writers.
 
-Drop [`../package/lard_controller_watchdog.yaml`](../package/lard_controller_watchdog.yaml) into `config/packages/` (watchdog) and [`ha_packages/lard_fan_max.yaml`](ha_packages/lard_fan_max.yaml) (fan ceiling helper).
+Drop [`../package/lard_controller_watchdog.yaml`](../package/lard_controller_watchdog.yaml) into `config/packages/` (watchdog), [`ha_packages/lard_fan_max.yaml`](ha_packages/lard_fan_max.yaml) (envelope cap), and [`ha_packages/lard_cooling_profiles.yaml`](ha_packages/lard_cooling_profiles.yaml) (per-mode TBD/measured envelopes).
 
-## Fan ceiling helper (required in 0.1.4+)
+## Cooling profiles (0.1.5+ — never live while hashing)
 
-The add-on owns Braiins auto `max_fan_speed` from **`input_number.lard_fan_max_pct`**. It must exist:
+A live `PUT /api/v1/cooling/mode` while hashing stalls this site's BOS+ miner. **Only LARD Controller writes cooling**, and only as a pause-first maintenance transition (`APPLYING` → pause → verify 0 W → tagged auto PUT → confirm → resume → verify run). Intentional pause during that sequence is not `ERROR`.
+
+One configurable envelope per major board-count state (placeholders, **TBD/measured**):
+
+| Mode | Default max % |
+| --- | --- |
+| `ONE_BOARD` | 70 |
+| `TWO_BOARD` | 85 |
+| `THREE_BOARD` | 100 |
+| `PAUSED` | 100 |
+
+`input_number.lard_fan_max_pct` is an **envelope cap** on the desired profile (`min(profile, helper)`). Changing it still goes through the gated transition — it is not a live fan slider.
 
 | | |
 | --- | --- |
-| Entity | `input_number.lard_fan_max_pct` |
-| Range | 0–100 |
-| Step | 1 |
-| Default | 100 (unconstrained auto) |
+| Dwell | `cooling_dwell_seconds` (default 600) — blocks short solar/SOC/slider flaps |
+| Stabilize | `cooling_stabilize_seconds` (default 5) after a confirmed PUT |
+| Thermal abort | `CHIP_ABORT_F=180` restores unconstrained 100 through the same gated sequence |
 
-The add-on does **not** create a real HA helper (REST cannot). On startup it POSTs a state stub if the entity is missing and, if `config/packages/` already exists, copies the YAML once. Prefer installing the package and restarting Core:
+The add-on does **not** create real HA helpers (REST cannot). On startup it POSTs a state stub for `lard_fan_max_pct` if missing and, if `config/packages/` already exists, copies the YAML once. Prefer installing the packages and restarting Core:
 
 ```yaml
 # configuration.yaml
@@ -106,11 +116,10 @@ homeassistant:
 
 ```bash
 cp lard_controller/ha_packages/lard_fan_max.yaml /config/packages/lard_fan_max.yaml
+cp lard_controller/ha_packages/lard_cooling_profiles.yaml /config/packages/lard_cooling_profiles.yaml
 ```
 
-Or create the Number helper in the UI with the same entity id. Writing **100** restores unconstrained auto (`max_fan_speed=100`, `minimum_required_fans=2`). If chip °F ≥ `CHIP_ABORT_F` (180) or a thermal/cooling fault is present, the add-on restores 100 immediately without pausing the miner itself.
-
-Fan-ceiling PUTs run only when `enable_writes` is true. They never set `APPLYING`, never pause, never write power target 0, and never PATCH boards.
+Keep `automation.solar_miner_fan_watchdog` off. Do not add a separate HA automation that writes Braiins fans.
 
 ## What this add-on will not do
 

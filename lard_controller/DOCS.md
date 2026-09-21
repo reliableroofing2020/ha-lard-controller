@@ -44,7 +44,7 @@ Braiins pause / resume / hashboard PATCH / power-target are issued only when:
 1. Add-on option `enable_writes` is **true**, and
 2. `input_boolean.lard_board_priority_enable` is **on**
 
-Fan ceiling (`PUT /api/v1/cooling/mode` with `max_fan_speed`) is issued when `enable_writes` is **true**. It does not wait for the master boolean, does not force `AUTO`, and still refuses if `switch.solar_miner_auto_enable` is on.
+Cooling / fan-profile writes (`PUT /api/v1/cooling/mode` with tagged `{"auto":{"max_fan_speed": N, ...}}`) use the **same dual write gates** as pause/resume/boards. They are never issued live while hashing. A live cooling PUT on this site's BOS+ (~26.09 / Antminer) stalls mining (PAUSED/0W then APPLYING/0W / `read_boards_http_500`).
 
 Default `enable_writes` is **false**. First boot cannot write the miner.
 
@@ -79,31 +79,55 @@ Board-priority / anti-flap / async PATCH semantics are unchanged:
 
 Power target stays **944 W** until someone measures a higher floor.
 
-## Fan ceiling owner
+## Cooling owner (maintenance-gated — never live while hashing)
 
-The add-on owns Braiins OS+ automatic fan max over the LAN API. Not Adv SSH.
+The add-on is the **only** Braiins cooling writer. Not Adv SSH. Not a separate HA fan automation. Keep `automation.solar_miner_fan_watchdog` **off**.
+
+Hypothesis verified in code: a live `PUT /api/v1/cooling/mode` while hashing is unsafe on this BOS+ build. Cooling changes are a pause-first maintenance transition.
 
 | | |
 | --- | --- |
-| Helper | `input_number.lard_fan_max_pct` — range 0–100, step 1, default 100 |
-| Package | `ha_packages/lard_fan_max.yaml` (copy into `config/packages/`) |
-| Write | `PUT /api/v1/cooling/mode` body `{"auto":{"max_fan_speed": N}}` (`N` integer u32 percent, **not** a 0.6 float) |
+| Write | `PUT /api/v1/cooling/mode` body `{"auto":{"max_fan_speed": N, ...}}` (`N` integer u32 percent, **not** a 0.6 float) |
 | Restore 100 | `{"auto":{"max_fan_speed": 100, "minimum_required_fans": 2}}` |
-| Read | `GET /api/v1/cooling/state` (fans rpm / `target_speed_ratio`). `GET /api/v1/cooling/mode` is **405** |
+| Read | `GET /api/v1/cooling/state` (fans rpm / `target_speed_ratio` / optional max). `GET /api/v1/cooling/mode` is **405** |
 | Auth | `Authorization: <raw token>` (no Bearer) |
+| Envelope cap | `input_number.lard_fan_max_pct` — caps desired max; **never** a live mid-hash PUT |
+| Profiles | One envelope per `ONE_BOARD` / `TWO_BOARD` / `THREE_BOARD` / `PAUSED` (add-on options or optional HA helpers) |
 
-The helper must exist. REST cannot create a real `input_number`; on startup the add-on POSTs a state stub if the entity is missing and copies the package into `/config/packages/` only when that directory already exists. Install the YAML (or create the Number helper in the UI) and restart Core.
+Profile placeholders (TBD/measured — do not treat as final site values):
 
-Applied when `enable_writes` is true:
+| State | Default max % | Intent |
+| --- | --- | --- |
+| `ONE_BOARD` | 70 | Lower envelope |
+| `TWO_BOARD` | 85 | Medium envelope |
+| `THREE_BOARD` | 100 | Full / normal |
+| `PAUSED` | 100 | Unconstrained / known-good restore |
 
-- helper value changes
-- add-on start
-- successful Braiins login / reconnect (`token_ts` change or miner returns)
-- after every `apply_mode` (so the old pre-resume cooling call cannot wipe the ceiling)
+Optional mins default to 0 (omitted from the PUT). Override via add-on options `cooling_*_max_fan_pct` / `cooling_*_min_fan_pct`, or helpers in `ha_packages/lard_cooling_profiles.yaml`. Effective max is `min(mode_profile, lard_fan_max_pct)`.
 
-Cool path only: **never** sets `actual_mode=APPLYING`, **never** pauses, **never** writes power target 0, **never** PATCH/restarts boards. Cooling HTTP failures are logged and do **not** fail `apply_mode` or the mining-control loop.
+When **desired profile ≠ applied profile** (and dwell has elapsed, unless thermal abort):
 
-`CHIP_ABORT_F=180` (operator policy; this controller had no prior chip-°F abort). If `GET /api/v1/cooling/state` highest temperature converts to ≥ 180 °F, or `sensor.solar_miner_fault_reason` looks like a thermal/cooling fault, restore unconstrained auto (`max_fan_speed=100`) immediately. Existing SOC / heartbeat / stale / fault **pause** policy is unchanged.
+1. Enter `APPLYING` (intentional — not `ERROR`).
+2. Hold the Braiins write mutex for the whole transition.
+3. Pause mining (`user_pause` / Braiins pause).
+4. Verify `user_pause=true` **and** actual power ≈ 0 W.
+5. `PUT /api/v1/cooling/mode` with the tagged auto body.
+6. Read cooling state back; confirm requested values stuck (or PUT 200 + GET 200 when the state payload has no `max_fan_speed`).
+7. Short stabilize (`cooling_stabilize_seconds`, default 5).
+8. Resume mining (unless the operating mode is `PAUSED`).
+9. Verify `user_pause=false`, mining running, expected hashboards, watts > 0, TH/s recovering, cooling still the requested profile.
+10. Only then publish the requested operating mode as actual.
+
+Rules:
+
+- The intentional paused period is **not** `ERROR`. Stay in `APPLYING` for the whole cooling transition.
+- Desired == applied → skip pause and cooling PUT (idempotent).
+- `cooling_dwell_seconds` (default 600) blocks rapid cooling-only re-transitions so short solar/SOC/slider flaps do not thrash profiles. A committed board-count `apply_mode` still applies that mode's profile while paused.
+- Cooling PUT failure **or** resume failure: restore the last known-good profile if possible → pause the miner safely → `ERROR`. Do **not** hand off to legacy writers.
+- `CHIP_ABORT_F=180`: unconstrained 100 still applies, through the same gated sequence (dwell bypassed). Existing SOC / heartbeat / stale / fault **mining-pause** policy is unchanged.
+- Startup / reconnect no longer force a cooling PUT.
+
+The helper `input_number.lard_fan_max_pct` must exist if you want an extra envelope cap. REST cannot create a real `input_number`; on startup the add-on POSTs a state stub if the entity is missing and copies the packages into `/config/packages/` only when that directory already exists.
 
 ## Mode reconciliation contract
 
@@ -201,10 +225,12 @@ Run these with **`enable_writes: false`** first. None of them should touch the m
 | Crash process | `kill -9` the python PID **inside** the add-on container (or `ha addons restart local_lard_controller`) | Container exits; Supervisor recreates it. Do **not** start a host `nohup` replacement |
 | Braiins unreachable | Unplug miner ethernet or point `miner_url` at a closed port | Loop continues, `api_fail_count` rises, `/health` stays 200, **no reboot attempts** |
 | Watchdog YAML | Turn enable on and stop the add-on for >2 min | Persistent notification; **no** Braiins API from HA |
-| Dual gate | `enable_writes: true` but master boolean off | Logs `master_gate_off`; no PATCH/pause/resume (fan ceiling may still PUT if writes are armed) |
-| Fan ceiling 100→60 while hashing | Set `input_number.lard_fan_max_pct` to 60 | Logs `fan_ceiling requested=60`; `actual_mode` stays the live board mode (not `APPLYING`); power target unchanged; no pause |
-| Fan ceiling survives control cycle | After 60 is applied, wait one poll / any board-priority tick | Next `apply_mode` complete re-PUTs `max_fan_speed=60` (never bare `{"mode":"automatic"}`) |
-| Fan ceiling restore 100 | Set helper to 100 | Logs unconstrained auto restore `max_fan_speed=100` |
+| Dual gate | `enable_writes: true` but master boolean off | Logs `master_gate_off`; no PATCH/pause/resume/**cooling** writes |
+| Cooling profile 100→60 while hashing | Set `input_number.lard_fan_max_pct` to 60 (writes armed) | Enters `APPLYING`, pauses, verifies ~0 W, PUTs tagged auto 60, confirms, resumes; then actual returns to the board mode. Never a live mid-hash PUT |
+| Cooling idempotent | Desired profile already applied | No pause, no cooling PUT |
+| Cooling dwell | Change the helper twice inside 600 s | Second transition is skipped until dwell elapses |
+| Cooling PUT / resume fail | (fault injection) | Restore known-good, miner left paused, `ERROR`; old auto stays off |
+| Cooling restore 100 | Thermal abort or helper 100 after a lower profile | Gated pause → PUT 100 → resume (not a live PUT) |
 | Old auto | Flip `switch.solar_miner_auto_enable` on (then off) | Writes refused; notification from the package; switch is not turned on by this add-on |
 
 After the table is green, arm writes in a planned window.

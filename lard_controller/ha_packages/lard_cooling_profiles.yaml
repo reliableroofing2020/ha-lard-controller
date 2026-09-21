@@ -1,0 +1,51 @@
+# LARD Controller — per-mode cooling envelopes (TBD/measured placeholders)
+#
+# 0.1.5+: cooling writes are maintenance-gated (pause → PUT → resume).
+# These helpers override add-on options when present. They never live-PUT
+# Braiins fans while hashing. Only LARD Controller writes cooling.
+#
+# Install: copy to config/packages/lard_cooling_profiles.yaml, enable
+# packages in configuration.yaml, restart Core.
+#
+# Values below are placeholders. Replace with measured-safe percents.
+
+input_number:
+  lard_cooling_one_board_max_pct:
+    name: LARD Cooling ONE_BOARD Max % (TBD/measured)
+    min: 0
+    max: 100
+    step: 1
+    initial: 70
+    mode: box
+    unit_of_measurement: "%"
+    icon: mdi:fan
+
+  lard_cooling_two_board_max_pct:
+    name: LARD Cooling TWO_BOARD Max % (TBD/measured)
+    min: 0
+    max: 100
+    step: 1
+    initial: 85
+    mode: box
+    unit_of_measurement: "%"
+    icon: mdi:fan
+
+  lard_cooling_three_board_max_pct:
+    name: LARD Cooling THREE_BOARD Max % (TBD/measured)
+    min: 0
+    max: 100
+    step: 1
+    initial: 100
+    mode: box
+    unit_of_measurement: "%"
+    icon: mdi:fan
+
+  lard_cooling_paused_max_pct:
+    name: LARD Cooling PAUSED Max % (TBD/measured)
+    min: 0
+    max: 100
+    step: 1
+    initial: 100
+    mode: box
+    unit_of_measurement: "%"
+    icon: mdi:fan-off
