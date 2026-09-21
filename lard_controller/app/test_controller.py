@@ -13,6 +13,7 @@ from controller import (
     API_5XX_BACKOFF_S,
     CHIP_ABORT_F,
     COOLING_IDLE_POWER_W,
+    COOLING_RESUME_BACKOFF_S,
     ENT_ENABLE,
     ENT_FAN_MAX,
     ENT_FAULT,
@@ -104,6 +105,15 @@ class FakeBraiins:
         self.cooling_confirm_max = None
         self._power_before_pause = power_w if power_w and power_w > 0 else 400.0
         self._hash_before_pause = hashrate if hashrate and hashrate > 0 else 20.0
+        self.bosminer_uptime_s = 120.0
+        self.pause_reason = "user_pause" if user_paused else ""
+        self.start_http = 200
+        self.restart_http = 200
+        self.start_sets_running = False
+        self.restart_sets_running = False
+        self.resume_ok_after_elapsed = None
+        self.cooling_resets_bosminer = False
+        self._cooling_put_clock_at = None
 
     def _next_http(self, name: str, default: int = 200) -> int:
         val = getattr(self, name, default)
@@ -128,6 +138,8 @@ class FakeBraiins:
             if name in {
                 "pause",
                 "resume",
+                "start",
+                "restart",
                 "patch_boards",
                 "set_power",
                 "set_cooling",
@@ -153,6 +165,7 @@ class FakeBraiins:
         self.phase = "stopped"
         self.status = "paused"
         self.power_w = 0.0
+        self.pause_reason = "user_pause"
 
     def _set_running(self) -> None:
         self.paused = False
@@ -160,6 +173,7 @@ class FakeBraiins:
         self.user_paused = False
         self.phase = "running"
         self.status = "normal"
+        self.pause_reason = ""
         if self.power_w is None or float(self.power_w) <= 0:
             self.power_w = float(getattr(self, "_power_before_pause", None) or 400.0)
         if self.hashrate is None or float(self.hashrate) <= 0:
@@ -198,6 +212,13 @@ class FakeBraiins:
         self.calls.append(("resume",))
         if self.clock is not None:
             self._resume_clock_at = self.clock.t
+        if self.resume_ok_after_elapsed is not None and self.clock is not None:
+            origin = self._cooling_put_clock_at
+            if origin is None:
+                origin = self.clock.t
+            if self.clock.t < origin + float(self.resume_ok_after_elapsed):
+                self._note_http(500)
+                return 500, {"error": "bosminer_not_ready"}
         code = self._next_http("resume_http")
         self._note_http(code)
         if code != 200:
@@ -207,6 +228,28 @@ class FakeBraiins:
         elif self.resume_sets_starting:
             self._set_starting()
         return 200, {"already_mining": False}
+
+    def start(self):
+        self.calls.append(("start",))
+        code = self._next_http("start_http")
+        self._note_http(code)
+        if code != 200:
+            return code, {}
+        if self.start_sets_running:
+            self._set_running()
+        return 200, {"already_running": False}
+
+    def restart(self):
+        self.calls.append(("restart",))
+        code = self._next_http("restart_http")
+        self._note_http(code)
+        if code != 200:
+            return code, {}
+        if self.restart_sets_running:
+            self._set_running()
+        elif self.bosminer_uptime_s is not None and float(self.bosminer_uptime_s) <= 0:
+            self.bosminer_uptime_s = 1.0
+        return 200, {"already_running": False}
 
     def set_power(self, watt: int):
         self.calls.append(("set_power", int(watt)))
@@ -257,6 +300,11 @@ class FakeBraiins:
         body = {"auto": {"max_fan_speed": n, **extra}}
         self.last_cooling_body = body
         self.calls.append(("set_cooling_auto", n, extra or None))
+        if self.clock is not None:
+            self._cooling_put_clock_at = self.clock.t
+        if self.cooling_resets_bosminer:
+            self.bosminer_uptime_s = 0.0
+            self.pause_reason = "application_unavailable"
         if self.cooling_exc:
             raise self.cooling_exc
         code = self._next_http("cooling_http")
@@ -300,6 +348,11 @@ class FakeBraiins:
         if code != 200:
             return {}, code, {}
         self._maybe_delayed_unpause()
+        uptime = self.bosminer_uptime_s
+        miner_ready = None if uptime is None else float(uptime) > 0
+        not_started = self.status in (1, "1", "not_started", "miner_status_not_started") or (
+            miner_ready is False
+        )
         parsed = {
             "status_raw": self.status,
             "phase": self.phase,
@@ -309,6 +362,10 @@ class FakeBraiins:
             "starting": self.phase == "starting",
             "preheating": self.phase in {"preheating", "preheat"},
             "ramping": self.phase in {"ramping", "ramp", "quick_ramping"},
+            "pause_reason": self.pause_reason,
+            "bosminer_uptime_s": uptime,
+            "miner_ready": miner_ready,
+            "not_started": bool(not_started),
         }
         return parsed, 200, {}
 
@@ -350,6 +407,7 @@ def make_controller(braiins: FakeBraiins, mode_req: str, enable_writes: bool = T
         # a cooling test sets a distinct desired profile / helper cap.
         cooling_dwell_seconds=600,
         cooling_stabilize_seconds=0,
+        cooling_resume_settle_seconds=0,
         cooling_one_board_max_fan_pct=100,
         cooling_two_board_max_fan_pct=100,
         cooling_three_board_max_fan_pct=100,
@@ -447,6 +505,34 @@ class ParseMiningStateTests(unittest.TestCase):
         self.assertTrue(ramp["ramping"])
         self.assertEqual(ramp["phase"], "ramping")
         self.assertFalse(ramp["running"])
+
+    def test_bosminer_uptime_zero_means_process_not_ready(self):
+        parsed = parse_mining_state(
+            {
+                "status": 1,
+                "bosminer_uptime_s": 0,
+                "detailed_status": {
+                    "stopped": {"reason": {"application_unavailable": {}}}
+                },
+            }
+        )
+        self.assertEqual(parsed["pause_reason"], "application_unavailable")
+        self.assertEqual(parsed["bosminer_uptime_s"], 0.0)
+        self.assertFalse(parsed["miner_ready"])
+        self.assertTrue(parsed["not_started"])
+
+    def test_user_pause_with_bosminer_up_is_ready(self):
+        parsed = parse_mining_state(
+            {
+                "status": 3,
+                "bosminer_uptime_s": 44,
+                "detailed_status": {"stopped": {"reason": {"user_pause": {}}}},
+            }
+        )
+        self.assertEqual(parsed["pause_reason"], "user_pause")
+        self.assertTrue(parsed["user_paused"])
+        self.assertTrue(parsed["miner_ready"])
+        self.assertFalse(parsed["not_started"])
 
 
 class ReconciliationTests(unittest.TestCase):
@@ -1166,6 +1252,153 @@ class FanCeilingTests(unittest.TestCase):
         pause_i = b.write_names().index("pause")
         put_i = b.write_names().index("set_cooling_auto")
         self.assertLess(pause_i, put_i)
+
+    def test_cooling_resume_500_then_200_after_settle_succeeds(self):
+        """0.1.6: first post-cooling ResumeMining 500 is unreadiness, not ERROR."""
+        b = running_boards(["1"])
+        b.resume_http = deque([500, 200])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.settings.cooling_resume_settle_seconds = 15
+        ctrl._cooling_applied = _applied(100)
+        ctrl._fan_max_seen = 100
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        started = ctrl._clock.t
+        modes_on_resume = []
+        errors_on_resume = []
+        resume_times = []
+        orig_resume = b.resume
+
+        def wrap_resume():
+            modes_on_resume.append(ctrl.actual_mode)
+            errors_on_resume.append(ctrl.last_error)
+            resume_times.append(ctrl._clock.t)
+            self.assertEqual(ctrl.actual_mode, "APPLYING")
+            self.assertNotEqual(ctrl.actual_mode, "ERROR")
+            return orig_resume()
+
+        b.resume = wrap_resume  # type: ignore[method-assign]
+        ctrl.tick()
+        self.assertTrue(resume_times)
+        self.assertGreaterEqual(resume_times[0] - started, 15)
+        self.assertGreaterEqual(len(resume_times), 2)
+        self.assertTrue(all(m == "APPLYING" for m in modes_on_resume))
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(ctrl.last_error, "")
+        self.assertTrue(b.running)
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertGreaterEqual(b.write_names().count("resume"), 2)
+
+    def test_cooling_resume_always_500_escalates_then_errors(self):
+        """Resume 500s exhaust settle/backoff, then Start, then BOSminer Restart, then ERROR."""
+        b = running_boards(["1"])
+        b.resume_http = 500
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.settings.cooling_resume_settle_seconds = 8
+        ctrl._cooling_applied = _applied(100)
+        ctrl._fan_max_seen = 100
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        started = ctrl._clock.t
+        saw_applying = []
+        orig_resume = b.resume
+
+        def wrap_resume():
+            saw_applying.append(ctrl.actual_mode)
+            self.assertEqual(ctrl.actual_mode, "APPLYING")
+            self.assertNotEqual(ctrl.actual_mode, "ERROR")
+            return orig_resume()
+
+        b.resume = wrap_resume  # type: ignore[method-assign]
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "ERROR")
+        self.assertIn("cooling_resume_http_500", ctrl.last_error)
+        self.assertIn("start", b.write_names())
+        self.assertIn("restart", b.write_names())
+        self.assertTrue(saw_applying)
+        self.assertTrue(all(m == "APPLYING" for m in saw_applying))
+        self.assertGreaterEqual(ctrl._clock.t - started, 8 + sum(COOLING_RESUME_BACKOFF_S))
+        self.assertTrue(b.paused)
+        self.assertNotEqual(ctrl.ha._states.get(ENT_OLD_AUTO), "on")
+        puts = [c[1] for c in b.cooling_puts()]
+        self.assertIn(60, puts)
+        self.assertEqual(puts[-1], 100)
+
+    def test_cooling_resume_200_first_try_still_works(self):
+        b = running_boards(["1"])
+        b.resume_http = 200
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.settings.cooling_resume_settle_seconds = 12
+        ctrl._cooling_applied = _applied(100)
+        ctrl._fan_max_seen = 100
+        ctrl.ha._states[ENT_FAN_MAX] = "55"
+        started = ctrl._clock.t
+        resume_times = []
+        orig_resume = b.resume
+
+        def wrap_resume():
+            resume_times.append(ctrl._clock.t)
+            self.assertEqual(ctrl.actual_mode, "APPLYING")
+            return orig_resume()
+
+        b.resume = wrap_resume  # type: ignore[method-assign]
+        ctrl.tick()
+        self.assertTrue(resume_times)
+        self.assertGreaterEqual(resume_times[0] - started, 12)
+        self.assertEqual(b.write_names().count("resume"), 1)
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertEqual(ctrl.last_error, "")
+        self.assertTrue(b.running)
+
+    def test_cooling_put_process_state_change_is_logged(self):
+        b = running_boards(["1"])
+        b.cooling_resets_bosminer = True
+        b.resume_ok_after_elapsed = 10
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.settings.cooling_resume_settle_seconds = 10
+        ctrl._cooling_applied = _applied(100)
+        ctrl._fan_max_seen = 100
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        ctrl.tick()
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertIn("cooling readiness post_cooling_put", log)
+        self.assertIn("bosminer_uptime_s", log)
+        self.assertIn("application_unavailable", log)
+        self.assertIn("changed=", log)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+
+    def test_device_reboot_denied_bosminer_restart_allowed(self):
+        tmp = Path(tempfile.mkdtemp(prefix="lard-braiins-deny-"))
+        settings = Settings(braiins_password="x", data_dir=tmp, share_dir=tmp / "share")
+        client = Braiins(settings, Logger(settings))
+        client.token = "tok"
+        client.token_ts = time.time()
+        with self.assertRaises(RuntimeError) as reboot_err:
+            client._call("PUT", "/api/v1/actions/reboot")
+        self.assertIn("reboot", str(reboot_err.exception).lower())
+        with self.assertRaises(RuntimeError):
+            client._call("PUT", "/api/v1/system/reboot")
+        with self.assertRaises(RuntimeError):
+            client._call("PUT", "/api/v1/actions/factory-reset")
+
+        class Resp:
+            status = 200
+
+            def read(self):
+                return b"true"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with unittest.mock.patch("urllib.request.urlopen", return_value=Resp()):
+            code, body = client.restart()
+        self.assertEqual(code, 200)
+        self.assertTrue(hasattr(Braiins, "start"))
 
 
 if __name__ == "__main__":

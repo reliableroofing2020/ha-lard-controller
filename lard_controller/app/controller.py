@@ -124,7 +124,12 @@ COOLING_THREE_BOARD_MAX_PCT = 100
 COOLING_PAUSED_MAX_PCT = 100
 COOLING_DWELL_S = 10 * 60
 COOLING_STABILIZE_S = 5
-ADDON_VERSION = "0.1.5"
+# After a cooling PUT, BOSminer may not accept ResumeMining until config/process
+# settles. Default is conservative; 0.1.5's 5s stabilize + immediate resume 500ed.
+COOLING_RESUME_SETTLE_S = 20
+# Few resume attempts after settle, increasing delay. Never an aggressive loop.
+COOLING_RESUME_BACKOFF_S = (5, 10, 20)
+ADDON_VERSION = "0.1.6"
 
 # Policy timings from the uploaded actuator — do not invent a new energy policy
 BOARD_POLL_S = 5
@@ -155,14 +160,14 @@ TRANSITIONAL_PHASES = frozenset(
     }
 )
 
+# Device reboot / factory only. PUT /api/v1/actions/restart is BOSminer Restart
+# (lower impact than reboot) and is allowed as a last-resort cooling-resume
+# escalation. Full device reboot is never issued by this controller.
 BRAIINS_DENY_PATHS = (
-    "/reboot",
-    "/restart",
-    "/factory",
-    "/reset",
-    "/system/reboot",
     "/actions/reboot",
-    "/actions/restart",
+    "/system/reboot",
+    "/actions/factory-reset",
+    "/factory-reset",
 )
 
 
@@ -191,6 +196,7 @@ class Settings:
     # Cooling envelopes are placeholders (TBD/measured). One profile per board-count.
     cooling_dwell_seconds: int = COOLING_DWELL_S
     cooling_stabilize_seconds: int = COOLING_STABILIZE_S
+    cooling_resume_settle_seconds: int = COOLING_RESUME_SETTLE_S
     cooling_one_board_max_fan_pct: int = COOLING_ONE_BOARD_MAX_PCT
     cooling_two_board_max_fan_pct: int = COOLING_TWO_BOARD_MAX_PCT
     cooling_three_board_max_fan_pct: int = COOLING_THREE_BOARD_MAX_PCT
@@ -287,6 +293,13 @@ def load_settings() -> Settings:
             "cooling_stabilize_seconds",
             "LARD_COOLING_STABILIZE_SECONDS",
             default=s.cooling_stabilize_seconds,
+        )
+    )
+    s.cooling_resume_settle_seconds = int(
+        pick(
+            "cooling_resume_settle_seconds",
+            "LARD_COOLING_RESUME_SETTLE_SECONDS",
+            default=s.cooling_resume_settle_seconds,
         )
     )
 
@@ -523,9 +536,9 @@ class Braiins:
         self.last_ok_iso = utc_iso()
 
     def _call(self, method: str, path: str, body=None, timeout=30):
-        lowered = path.lower()
-        if any(deny in lowered for deny in BRAIINS_DENY_PATHS):
-            raise RuntimeError(f"refused Braiins path {path} (reboot/reset denied)")
+        lowered = "/" + path.lower().lstrip("/")
+        if any(lowered.endswith(deny) or deny in lowered for deny in BRAIINS_DENY_PATHS):
+            raise RuntimeError(f"refused Braiins path {path} (device reboot/factory denied)")
         # Serialize all Braiins I/O so a cooling transition cannot race other writers.
         with self._io_lock:
             return self._call_locked(method, path, body=body, timeout=timeout)
@@ -570,6 +583,14 @@ class Braiins:
 
     def resume(self):
         return self._call("PUT", "/api/v1/actions/resume")
+
+    def start(self):
+        """PUT /api/v1/actions/start — start bosminer/mining. Not a device reboot."""
+        return self._call("PUT", "/api/v1/actions/start")
+
+    def restart(self):
+        """PUT /api/v1/actions/restart — restart bosminer. Not /actions/reboot."""
+        return self._call("PUT", "/api/v1/actions/restart")
 
     def set_power(self, watt: int):
         return self._call("PUT", "/api/v1/performance/power-target", {"watt": int(watt)})
@@ -902,11 +923,80 @@ def _has_named_key(obj, names: tuple[str, ...]) -> bool:
     return False
 
 
+# Braiins StopDetailedReason / StartDetailedReason / RunDetailedReason oneofs.
+# Used only for diagnosis (cooling PUT vs unreadiness vs hard fail).
+_STATUS_REASON_KEYS = (
+    "user_pause",
+    "thermal_pause",
+    "application_unavailable",
+    "unsupported_hardware",
+    "dead_pools",
+    "missing_license",
+    "dps_cooldown",
+    "delayed_start",
+    "cooling_down",
+    "waiting_while_cold",
+    "defrosting",
+    "preheating",
+    "normal",
+    "unspecified",
+    "none",
+)
+_NOT_STARTED_STATUS = frozenset(
+    {
+        1,
+        "1",
+        "not_started",
+        "miner_status_not_started",
+    }
+)
+
+
+def _first_reason(obj) -> str:
+    """First detailed_status reason oneof key (user_pause, cooling_down, …)."""
+    if isinstance(obj, dict):
+        reason = obj.get("reason")
+        if isinstance(reason, dict) and reason:
+            return str(next(iter(reason.keys())))
+        for key in _STATUS_REASON_KEYS:
+            if key in obj:
+                return key
+        for v in obj.values():
+            found = _first_reason(v)
+            if found:
+                return found
+    elif isinstance(obj, list):
+        for item in obj:
+            found = _first_reason(item)
+            if found:
+                return found
+    return ""
+
+
+def _bosminer_uptime_s(details) -> float | None:
+    """GET /api/v1/miner/details bosminer_uptime_s. 0 means bosminer is not running."""
+    if not isinstance(details, dict):
+        return None
+    raw = details.get("bosminer_uptime_s")
+    if raw is None:
+        raw = details.get("bosminer_uptime")
+    if raw is None:
+        raw = _find_number(details, ("bosminer_uptime_s", "bosminer_uptime"))
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_mining_state(details) -> dict[str, Any]:
     """Parse pause / mining phase from GET /api/v1/miner/details JSON.
 
     Handles legacy `status` (MINER_STATUS_PAUSED / NORMAL or REST ints/names)
     and `detailed_status` oneof (stopped.user_pause / running / starting).
+    Also surfaces bosminer process readiness: `bosminer_uptime_s == 0` means
+    the process is not running (OpenAPI), which is distinct from user_pause.
     """
     if not isinstance(details, dict):
         details = {}
@@ -932,7 +1022,13 @@ def parse_mining_state(details) -> dict[str, Any]:
         "miner_status_normal",
         "running",
     }
+    status_not_started = status_raw in _NOT_STARTED_STATUS or token in {
+        "1",
+        "not_started",
+        "miner_status_not_started",
+    }
     user_paused = _has_named_key(details, ("user_pause", "userPause")) or status_paused
+    pause_reason = _first_reason(detailed) or _first_reason(details)
 
     if not phase and token in TRANSITIONAL_PHASES | {"running", "stopped", "stopping"}:
         phase = token
@@ -947,6 +1043,15 @@ def parse_mining_state(details) -> dict[str, Any]:
     if running:
         user_paused = False
 
+    uptime = _bosminer_uptime_s(details)
+    if uptime is None:
+        miner_ready = None
+    else:
+        miner_ready = uptime > 0
+    not_started = bool(status_not_started or miner_ready is False)
+    if miner_ready is None and not_started:
+        miner_ready = False
+
     return {
         "status_raw": status_raw,
         "phase": phase,
@@ -956,6 +1061,10 @@ def parse_mining_state(details) -> dict[str, Any]:
         "starting": bool(starting),
         "preheating": bool(preheating),
         "ramping": bool(ramping),
+        "pause_reason": pause_reason,
+        "bosminer_uptime_s": uptime,
+        "miner_ready": miner_ready,
+        "not_started": bool(not_started),
     }
 
 
@@ -975,6 +1084,10 @@ class MinerObservation:
     hashrate: float | None = None
     details_ok: bool = False
     ok: bool = False
+    pause_reason: str = ""
+    bosminer_uptime_s: float | None = None
+    miner_ready: bool | None = None
+    not_started: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -2023,6 +2136,7 @@ class Controller:
         """PUT tagged auto envelope, confirm it stuck. Caller must already be paused/idle."""
         previous = self._cooling_applied
         extra = profile.extra_auto()
+        before = self._readiness_snapshot("pre_cooling_put")
         try:
             code, body = self._http_retry(
                 lambda: self.b.set_cooling_auto(profile.max_fan_speed, extra or None),
@@ -2045,6 +2159,8 @@ class Controller:
         stabilize = float(self.settings.cooling_stabilize_seconds or 0)
         if stabilize > 0:
             self._sleep(stabilize)
+        # Log whether the PUT temporarily changed bosminer process / ready / pause reason.
+        self._readiness_snapshot("post_cooling_put", previous=before)
         self._cooling_applied = profile
         self._cooling_last_change_ts = self._now()
         self.last_error = ""
@@ -2076,6 +2192,224 @@ class Controller:
         self.last_error = "cooling_resume_verify"
         return False
 
+    def _readiness_from_obs(self, obs: MinerObservation) -> dict[str, Any]:
+        return {
+            "ok": bool(obs.ok),
+            "paused": bool(obs.paused),
+            "user_paused": bool(obs.user_paused),
+            "running": bool(obs.running),
+            "starting": bool(obs.starting),
+            "phase": obs.phase or "",
+            "status": obs.status_raw,
+            "pause_reason": obs.pause_reason or "",
+            "power_w": obs.power_w,
+            "bosminer_uptime_s": obs.bosminer_uptime_s,
+            "miner_ready": obs.miner_ready,
+            "not_started": bool(obs.not_started),
+        }
+
+    def _log_readiness(self, label: str, snap: dict[str, Any], previous: dict | None = None) -> None:
+        changed = []
+        if previous:
+            for key in snap:
+                if previous.get(key) != snap.get(key):
+                    changed.append(f"{key}:{previous.get(key)}->{snap.get(key)}")
+        suffix = f" changed=[{', '.join(changed)}]" if changed else ""
+        self.log(
+            f"cooling readiness {label} paused={snap.get('paused')} "
+            f"user_paused={snap.get('user_paused')} running={snap.get('running')} "
+            f"starting={snap.get('starting')} phase={snap.get('phase')} "
+            f"status={snap.get('status')} pause_reason={snap.get('pause_reason')} "
+            f"power_w={snap.get('power_w')} bosminer_uptime_s={snap.get('bosminer_uptime_s')} "
+            f"miner_ready={snap.get('miner_ready')} not_started={snap.get('not_started')}"
+            f"{suffix}"
+        )
+
+    def _readiness_snapshot(self, label: str, previous: dict | None = None) -> dict[str, Any]:
+        """Poll pause / process-ready / watts / status for cooling-resume diagnosis."""
+        try:
+            obs = self.observe_miner()
+        except Exception as e:
+            self.log(f"cooling readiness {label} observe_exc={e}")
+            obs = MinerObservation()
+        snap = self._readiness_from_obs(obs)
+        self._log_readiness(label, snap, previous)
+        return snap
+
+    def _cooling_process_ready(self, snap: dict[str, Any]) -> bool:
+        """True when bosminer looks able to accept ResumeMining / Start.
+
+        OpenAPI: bosminer_uptime_s == 0 means the process is not running.
+        user_pause + ~0 W is expected after a gated cooling PUT — that is ready.
+        """
+        if snap.get("not_started") or snap.get("miner_ready") is False:
+            return False
+        uptime = snap.get("bosminer_uptime_s")
+        if uptime is not None:
+            try:
+                if float(uptime) <= 0:
+                    return False
+            except (TypeError, ValueError):
+                pass
+        if snap.get("ok"):
+            return True
+        return False
+
+    def _wait_cooling_process_ready(self, timeout_s: float) -> dict[str, Any]:
+        deadline = self._now() + max(0.0, float(timeout_s))
+        last = self._readiness_snapshot("process_ready_poll")
+        while True:
+            if self._cooling_process_ready(last):
+                return last
+            if self._now() >= deadline:
+                return last
+            self._sleep(min(float(BOARD_POLL_S), 5.0))
+            last = self._readiness_snapshot("process_ready_poll")
+
+    def _cooling_resume_accepted(self, obs: MinerObservation) -> bool:
+        if not obs.ok:
+            return False
+        if obs.running or obs.starting or self._stage_a_cleared(obs):
+            return True
+        return self._transitional_operational(obs) and not self._is_paused(obs)
+
+    def _cooling_escalate_start(self) -> bool:
+        """Start mining if ResumeMining 500s — bosminer may have stopped after the PUT."""
+        self.actual_mode = "APPLYING"
+        self.last_error = ""
+        self.log("cooling resume escalate: Start mining (PUT /api/v1/actions/start)")
+        try:
+            code, body = self.b.start()
+        except Exception as e:
+            self.log(f"cooling start escalate exc={e}")
+            return False
+        self.log(f"cooling start escalate http={code} body={_summarize_http_body(body)}")
+        if code != 200:
+            return False
+        self._resume_ts = self._now()
+        settle = float(self.settings.cooling_resume_settle_seconds or 0) or 5.0
+        self._sleep(settle)
+        obs = self.observe_miner()
+        if self._cooling_resume_accepted(obs):
+            return True
+        try:
+            rcode, rbody = self.b.resume()
+        except Exception as e:
+            self.log(f"cooling resume after start exc={e}")
+            return False
+        self.log(f"cooling resume after start http={rcode} body={_summarize_http_body(rbody)}")
+        if rcode == 200:
+            self._resume_ts = self._now()
+            return True
+        return self._cooling_resume_accepted(self.observe_miner())
+
+    def _cooling_escalate_restart(self) -> bool:
+        """BOSminer Restart (not device reboot) after Start did not recover resume."""
+        self.actual_mode = "APPLYING"
+        self.last_error = ""
+        self.log(
+            "cooling resume escalate: BOSminer Restart (PUT /api/v1/actions/restart) "
+            "— device reboot is not used"
+        )
+        try:
+            code, body = self.b.restart()
+        except Exception as e:
+            self.log(f"cooling bosminer restart escalate exc={e}")
+            return False
+        self.log(f"cooling bosminer restart escalate http={code} body={_summarize_http_body(body)}")
+        if code != 200 and not is_http_5xx(code):
+            return False
+        settle = float(self.settings.cooling_resume_settle_seconds or 0) or 5.0
+        self._sleep(settle)
+        self._wait_cooling_process_ready(timeout_s=settle)
+        try:
+            rcode, rbody = self.b.resume()
+        except Exception as e:
+            self.log(f"cooling resume after bosminer restart exc={e}")
+            rcode, rbody = 0, {"exc": str(e)}
+        self.log(
+            f"cooling resume after bosminer restart http={rcode} "
+            f"body={_summarize_http_body(rbody)}"
+        )
+        if rcode == 200:
+            self._resume_ts = self._now()
+            return True
+        return self._cooling_escalate_start()
+
+    def _resume_after_cooling(self, previous: CoolingProfile | None) -> bool:
+        """Do not treat the first post-cooling ResumeMining as a single-shot hard fail.
+
+        Cooling apply is a disruptive config transition. Sequence:
+        1. stay APPLYING
+        2. poll readiness (pause, process/ready, watts, status)
+        3. wait cooling_resume_settle_seconds
+        4. bounded ResumeMining backoff
+        5. escalate Start, then BOSminer Restart
+        6. ERROR only after that window is exhausted
+        Device reboot is never issued.
+        """
+        self.actual_mode = "APPLYING"
+        self._cooling_transition_active = True
+        self.last_error = ""
+        settle = float(self.settings.cooling_resume_settle_seconds or 0)
+        before = self._readiness_snapshot("pre_resume_settle")
+        if settle > 0:
+            self.log(
+                f"cooling resume settle {settle}s — do not assume immediate ResumeMining acceptance"
+            )
+            self._sleep(settle)
+        self._wait_cooling_process_ready(timeout_s=max(settle, 15.0) if settle else 5.0)
+        self._readiness_snapshot("post_resume_settle", previous=before)
+
+        last_code = None
+        attempts = 1 + len(COOLING_RESUME_BACKOFF_S)
+        for i in range(attempts):
+            self.actual_mode = "APPLYING"
+            self.last_error = ""
+            snap = self._readiness_snapshot(f"pre_resume_attempt_{i + 1}")
+            try_resume = self._cooling_process_ready(snap) or i == attempts - 1
+            if not try_resume:
+                self.log(
+                    f"cooling resume attempt={i + 1}/{attempts} skipped — process not ready yet"
+                )
+            else:
+                try:
+                    code, body = self.b.resume()
+                except Exception as e:
+                    self.log(f"cooling resume exc={e}")
+                    code, body = 500, {"exc": str(e)}
+                last_code = code
+                self.log(
+                    f"cooling resume attempt={i + 1}/{attempts} http={code} "
+                    f"body={_summarize_http_body(body)} pause_reason={snap.get('pause_reason')} "
+                    f"miner_ready={snap.get('miner_ready')} "
+                    f"bosminer_uptime_s={snap.get('bosminer_uptime_s')}"
+                )
+                if code == 200:
+                    self._resume_ts = self._now()
+                    return True
+                if not is_http_5xx(code):
+                    self._cooling_fail(f"cooling_resume_http_{code}", previous)
+                    return False
+            if i < attempts - 1:
+                delay = float(COOLING_RESUME_BACKOFF_S[i])
+                self.log(
+                    f"cooling resume transient http={last_code} retry_in={int(delay)}s "
+                    f"(stay APPLYING, not ERROR)"
+                )
+                self._sleep(delay)
+
+        self.actual_mode = "APPLYING"
+        if self._cooling_escalate_start():
+            return True
+        if self._cooling_escalate_restart():
+            return True
+        self._cooling_fail(
+            f"cooling_resume_http_{last_code if last_code is not None else 500}",
+            previous,
+        )
+        return False
+
     def _gated_cooling_transition(self, profile: CoolingProfile, resume_mode: str) -> bool:
         """Full maintenance cooling sequence. Stays APPLYING until the operating mode is confirmed."""
         previous = self._cooling_applied
@@ -2095,12 +2429,8 @@ class Controller:
                     self._cooling_transition_active = False
                     self._mark_confirmed("PAUSED")
                     return True
-                code, _ = self._http_retry(self.b.resume, "cooling_resume")
-                self.log(f"cooling resume http={code}")
-                if code != 200:
-                    self._cooling_fail(f"cooling_resume_http_{code}", previous)
+                if not self._resume_after_cooling(previous):
                     return False
-                self._resume_ts = self._now()
                 if not self._wait_until(
                     self._stage_a_cleared,
                     "cooling_resume_wait",
@@ -2159,6 +2489,10 @@ class Controller:
         obs.starting = bool(parsed.get("starting"))
         obs.preheating = bool(parsed.get("preheating"))
         obs.ramping = bool(parsed.get("ramping"))
+        obs.pause_reason = str(parsed.get("pause_reason") or "")
+        obs.bosminer_uptime_s = parsed.get("bosminer_uptime_s")
+        obs.miner_ready = parsed.get("miner_ready")
+        obs.not_started = bool(parsed.get("not_started"))
         obs.ok = True
         self.b.fail_count = 0
         self.miner_paused = self._is_paused(obs)
@@ -2403,7 +2737,6 @@ class Controller:
             if not self._apply_cooling_while_paused(cooling_profile):
                 return False
             cooling_changed = True
-            self._cooling_transition_active = False
             self.actual_mode = "APPLYING"
             obs = self._observe_retrying()
 
@@ -2418,15 +2751,16 @@ class Controller:
         obs = self._observe_retrying()
         needs_resume = self._is_paused(obs) or obs.user_paused or obs.phase == "stopped"
         if needs_resume:
-            code, _ = self._http_retry(self.b.resume, "resume")
-            self.log(f"resume http={code}")
-            if code != 200:
-                if cooling_changed:
-                    self._cooling_fail(f"resume_http_{code}", previous_cooling)
-                else:
+            if cooling_changed:
+                if not self._resume_after_cooling(previous_cooling):
+                    return False
+            else:
+                code, _ = self._http_retry(self.b.resume, "resume")
+                self.log(f"resume http={code}")
+                if code != 200:
                     self._mark_error(f"resume_http_{code}")
-                return False
-            self._resume_ts = self._now()
+                    return False
+                self._resume_ts = self._now()
             # Stage A: accepted resume and no longer user_pause / paused.
             if not self._wait_until(
                 self._stage_a_cleared,
@@ -2510,6 +2844,7 @@ class Controller:
             else f"{self._cooling_applied.name}:{self._cooling_applied.max_fan_speed}",
             "cooling_transition": self._cooling_transition_active,
             "cooling_dwell_s": int(self.settings.cooling_dwell_seconds or 0),
+            "cooling_resume_settle_s": int(self.settings.cooling_resume_settle_seconds or 0),
             "chip_temp_f": self._chip_temp_f,
             "fan_rpm": self._fan_rpm,
             "fan_pct": self._fan_pct,
@@ -2785,6 +3120,7 @@ def main() -> int:
         f"power_target={settings.power_target_w}W "
         f"version={ADDON_VERSION} chip_abort_f={CHIP_ABORT_F} "
         f"cooling_dwell={settings.cooling_dwell_seconds}s "
+        f"cooling_resume_settle={settings.cooling_resume_settle_seconds}s "
         f"cooling_profiles=ONE:{settings.cooling_one_board_max_fan_pct}/"
         f"TWO:{settings.cooling_two_board_max_fan_pct}/"
         f"THREE:{settings.cooling_three_board_max_fan_pct}/"

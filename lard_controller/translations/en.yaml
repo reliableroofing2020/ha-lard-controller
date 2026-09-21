@@ -46,7 +46,10 @@ configuration:
     description: Minimum time between cooling-profile transitions so short solar/SOC or slider flaps do not thrash fans. Thermal abort bypasses dwell. Default 600.
   cooling_stabilize_seconds:
     name: Cooling stabilize (seconds)
-    description: Short pause after a confirmed cooling PUT before resume. Default 5.
+    description: Short pause after a confirmed cooling PUT before the resume-settle window. Default 5.
+  cooling_resume_settle_seconds:
+    name: Cooling resume settle (seconds)
+    description: Wait after a confirmed cooling PUT before ResumeMining. BOSminer may return HTTP 500 until the cooling/config process settles. Default 20. First 500 is retried with backoff, then Start, then BOSminer Restart — not a device reboot.
   cooling_one_board_max_fan_pct:
     name: ONE_BOARD max fan % (TBD/measured)
     description: Placeholder auto max_fan_speed for ONE_BOARD. Replace with a measured-safe value. Capped by input_number.lard_fan_max_pct.

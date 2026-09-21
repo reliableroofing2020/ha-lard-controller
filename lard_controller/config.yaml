@@ -1,5 +1,5 @@
 name: LARD Controller
-version: "0.1.5"
+version: "0.1.6"
 slug: lard_controller
 description: >
   Supervises the LARD board-priority Braiins actuator. Observe-and-publish
@@ -58,6 +58,7 @@ options:
   timezone: "America/Chicago"
   cooling_dwell_seconds: 600
   cooling_stabilize_seconds: 5
+  cooling_resume_settle_seconds: 20
   cooling_one_board_max_fan_pct: 70
   cooling_two_board_max_fan_pct: 85
   cooling_three_board_max_fan_pct: 100
@@ -83,6 +84,7 @@ schema:
   timezone: str
   cooling_dwell_seconds: int(0,86400)
   cooling_stabilize_seconds: int(0,120)
+  cooling_resume_settle_seconds: int(0,600)
   cooling_one_board_max_fan_pct: int(0,100)
   cooling_two_board_max_fan_pct: int(0,100)
   cooling_three_board_max_fan_pct: int(0,100)
