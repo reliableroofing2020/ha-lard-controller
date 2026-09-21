@@ -11,7 +11,9 @@ from pathlib import Path
 
 from controller import (
     API_5XX_BACKOFF_S,
+    CHIP_ABORT_F,
     ENT_ENABLE,
+    ENT_FAN_MAX,
     ENT_FAULT,
     ENT_HB,
     ENT_MODE_REQ,
@@ -24,8 +26,10 @@ from controller import (
     HealthState,
     Logger,
     Settings,
+    clamp_fan_max_pct,
     metric_trend_rising,
     norm_board_id,
+    parse_cooling_telemetry,
     parse_mining_state,
 )
 
@@ -86,6 +90,14 @@ class FakeBraiins:
         self.power_step = 0.0
         self.resume_sets_starting = False
         self.board_reads = None
+        self.token_ts = 1.0
+        self.cooling_http = 200
+        self.cooling_state = {
+            "fans": [{"position": 0, "rpm": 2400, "target_speed_ratio": 0.55}],
+            "highest_temperature": {"location": 1, "temperature": {"degree_c": 70}},
+        }
+        self.cooling_exc = None
+        self.last_cooling_body = None
 
     def _next_http(self, name: str, default: int = 200) -> int:
         val = getattr(self, name, default)
@@ -107,9 +119,22 @@ class FakeBraiins:
         names = []
         for call in self.calls:
             name = call[0]
-            if name in {"pause", "resume", "patch_boards", "set_power", "set_cooling"}:
+            if name in {
+                "pause",
+                "resume",
+                "patch_boards",
+                "set_power",
+                "set_cooling",
+                "set_cooling_auto",
+            }:
                 names.append(name)
         return names
+
+    def mining_write_names(self) -> list[str]:
+        return [n for n in self.write_names() if n not in {"set_cooling", "set_cooling_auto"}]
+
+    def cooling_puts(self) -> list[tuple]:
+        return [c for c in self.calls if c[0] == "set_cooling_auto"]
 
     def _set_paused(self) -> None:
         self.paused = True
@@ -212,9 +237,23 @@ class FakeBraiins:
             return list(cur), 200, {"hashboards": []}
         return list(self.enabled), 200, {"hashboards": []}
 
-    def set_cooling_profile_auto(self):
-        self.calls.append(("set_cooling",))
-        return 200, {}
+    def set_cooling_auto(self, max_fan_speed, extra_auto=None):
+        n = int(max_fan_speed)
+        extra = dict(extra_auto or {})
+        body = {"auto": {"max_fan_speed": n, **extra}}
+        self.last_cooling_body = body
+        self.calls.append(("set_cooling_auto", n, extra or None))
+        if self.cooling_exc:
+            raise self.cooling_exc
+        code = self._next_http("cooling_http")
+        self._note_http(code)
+        return code, body
+
+    def get_cooling_state(self):
+        self.calls.append(("get_cooling_state",))
+        if self.cooling_exc:
+            raise self.cooling_exc
+        return 200, dict(self.cooling_state or {"fans": []})
 
     def approx_power_w(self):
         self.calls.append(("approx_power_w",))
@@ -266,6 +305,7 @@ def ha_states(mode_req: str) -> dict:
         ENT_STALE: "off",
         ENT_FAULT: "ok",
         ENT_SOC: "80",
+        ENT_FAN_MAX: "100",
     }
 
 
@@ -417,10 +457,10 @@ class ReconciliationTests(unittest.TestCase):
         ctrl = make_controller(b, "TWO_BOARD")
         ctrl.read_actual_from_miner()
         self.assertEqual(ctrl.actual_mode, "TWO_BOARD")
-        before = list(b.write_names())
+        before = list(b.mining_write_names())
 
         ctrl.tick()
-        self.assertEqual(b.write_names(), before)
+        self.assertEqual(b.mining_write_names(), before)
         self.assertEqual(ctrl.actual_mode, "TWO_BOARD")
         self.assertNotIn("pause", b.write_names())
         self.assertNotIn("resume", b.write_names())
@@ -494,9 +534,9 @@ class ReconciliationTests(unittest.TestCase):
         restarted = make_controller(b, "THREE_BOARD")
         restarted.read_actual_from_miner()
         self.assertEqual(restarted.actual_mode, "THREE_BOARD")
-        before = list(b.write_names())
+        before = list(b.mining_write_names())
         restarted.tick()
-        self.assertEqual(b.write_names(), before)
+        self.assertEqual(b.mining_write_names(), before)
         self.assertEqual(restarted.actual_mode, "THREE_BOARD")
 
     def test_5_restart_running_then_desired_pause(self):
@@ -551,7 +591,7 @@ class ReconciliationTests(unittest.TestCase):
         ctrl = make_controller(b, "ONE_BOARD")
         ctrl.ha._states[ENT_ENABLE] = "off"
         ctrl.tick()
-        self.assertEqual(b.write_names(), [])
+        self.assertEqual(b.mining_write_names(), [])
         self.assertIn("master_gate_off", ctrl.reason)
 
     def test_old_auto_still_refuses_writes(self):
@@ -768,6 +808,123 @@ class BoardMatchSkipTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertNotIn("board_wait_timeout", ctrl.last_error or "")
         self.assertNotIn("patch_boards", b.write_names())
+
+
+class FanCeilingTests(unittest.TestCase):
+    def test_old_automatic_wipe_path_is_gone(self):
+        self.assertFalse(hasattr(Braiins, "set_cooling_profile_auto"))
+        self.assertTrue(hasattr(Braiins, "set_cooling_auto"))
+        src = Path(__file__).resolve().parent.joinpath("controller.py").read_text()
+        self.assertNotIn('{"mode": "automatic"}', src)
+        self.assertNotIn('{"mode":"automatic"}', src)
+        self.assertIn('"/api/v1/cooling/mode"', src)
+        self.assertNotIn('"/api/v1/cooling",', src)
+        self.assertNotIn("set_cooling_profile_auto", src)
+
+    def test_clamp_fan_max_pct(self):
+        self.assertEqual(clamp_fan_max_pct(-5), 0)
+        self.assertEqual(clamp_fan_max_pct(160), 100)
+        self.assertEqual(clamp_fan_max_pct("60"), 60)
+        self.assertEqual(clamp_fan_max_pct("60.4"), 60)
+        self.assertEqual(clamp_fan_max_pct("bogus"), 100)
+        self.assertGreaterEqual(CHIP_ABORT_F, 180)
+
+    def test_parse_cooling_telemetry_ratio_and_temp(self):
+        tel = parse_cooling_telemetry(
+            {
+                "fans": [{"position": 0, "rpm": 3100, "target_speed_ratio": 0.6}],
+                "highest_temperature": {"location": 1, "temperature": {"degree_c": 80}},
+            }
+        )
+        self.assertEqual(tel["fan_rpm"], 3100)
+        self.assertEqual(tel["fan_pct"], 60.0)
+        self.assertAlmostEqual(tel["chip_temp_f"], 176.0)
+
+    def test_apply_mode_put_body_uses_helper_max_fan_speed(self):
+        b = paused_one_board()
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        ok = ctrl.apply_mode("ONE_BOARD")
+        self.assertTrue(ok)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        puts = b.cooling_puts()
+        self.assertTrue(puts)
+        self.assertTrue(any(c[1] == 60 for c in puts))
+        self.assertEqual((b.last_cooling_body or {}).get("auto", {}).get("max_fan_speed"), 60)
+        self.assertNotIn("mode", b.last_cooling_body or {})
+        self.assertNotIn("pause", b.mining_write_names())
+        self.assertIn("resume", b.mining_write_names())
+
+    def test_apply_mode_cooling_failure_does_not_fail_apply(self):
+        b = paused_one_board()
+        b.cooling_exc = RuntimeError("cooling down")
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        ok = ctrl.apply_mode("ONE_BOARD")
+        self.assertTrue(ok)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertEqual(ctrl.last_error, "")
+        self.assertIn("resume", b.mining_write_names())
+
+    def test_apply_mode_cooling_http_500_does_not_fail_apply(self):
+        b = paused_one_board()
+        b.cooling_http = 500
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.ha._states[ENT_FAN_MAX] = "45"
+        ok = ctrl.apply_mode("ONE_BOARD")
+        self.assertTrue(ok)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+
+    def test_helper_change_is_cool_path_only(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.read_actual_from_miner()
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        mining_before = list(b.mining_write_names())
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertNotEqual(ctrl.actual_mode, "APPLYING")
+        self.assertEqual(b.mining_write_names(), mining_before)
+        self.assertTrue(any(c[1] == 60 for c in b.cooling_puts()))
+        self.assertEqual((b.last_cooling_body or {}).get("auto", {}).get("max_fan_speed"), 60)
+
+    def test_helper_100_restores_unconstrained(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.ha._states[ENT_FAN_MAX] = "100"
+        ctrl.tick()
+        self.assertTrue(b.cooling_puts())
+        self.assertEqual(b.cooling_puts()[-1][1], 100)
+        extra = b.cooling_puts()[-1][2] or {}
+        self.assertEqual(extra.get("minimum_required_fans"), 2)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+
+    def test_chip_abort_restores_100_without_pausing(self):
+        b = running_boards(["1"])
+        b.cooling_state = {
+            "fans": [{"position": 0, "rpm": 4200, "target_speed_ratio": 0.6}],
+            "highest_temperature": {"location": 1, "temperature": {"degree_c": 85}},
+        }
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        ctrl.tick()
+        self.assertGreaterEqual(ctrl._chip_temp_f, CHIP_ABORT_F)
+        self.assertEqual(b.cooling_puts()[-1][1], 100)
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+        self.assertNotIn("pause", b.mining_write_names())
+        self.assertTrue(ctrl._thermal_abort_active)
+
+    def test_enable_writes_false_skips_fan_ceiling(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        ctrl.tick()
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertEqual(b.write_names(), [])
 
 
 if __name__ == "__main__":

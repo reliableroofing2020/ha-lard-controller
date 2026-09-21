@@ -9,7 +9,7 @@ Supervisor owns start / stop / restart. This is not an Advanced SSH `nohup` job 
 | | |
 | --- | --- |
 | Slug | `lard_controller` |
-| Version | `0.1.3` |
+| Version | `0.1.4` |
 | Miner | Braiins OS+ REST @ `http://192.168.1.113` (API ~1.8.0) |
 | Network | `host_network: true` |
 | Health | `http://<ha-host>:8099/health` (Supervisor watchdog) |
@@ -83,7 +83,34 @@ Before `enable_writes: true`, turn **off**:
 
 HVAC-only automations (`solar_miner_lower_ac`, `solar_miner_upstairs_ac`, presence comfort) are not Braiins writers.
 
-Drop [`../package/lard_controller_watchdog.yaml`](../package/lard_controller_watchdog.yaml) into `config/packages/`.
+Drop [`../package/lard_controller_watchdog.yaml`](../package/lard_controller_watchdog.yaml) into `config/packages/` (watchdog) and [`ha_packages/lard_fan_max.yaml`](ha_packages/lard_fan_max.yaml) (fan ceiling helper).
+
+## Fan ceiling helper (required in 0.1.4+)
+
+The add-on owns Braiins auto `max_fan_speed` from **`input_number.lard_fan_max_pct`**. It must exist:
+
+| | |
+| --- | --- |
+| Entity | `input_number.lard_fan_max_pct` |
+| Range | 0–100 |
+| Step | 1 |
+| Default | 100 (unconstrained auto) |
+
+The add-on does **not** create a real HA helper (REST cannot). On startup it POSTs a state stub if the entity is missing and, if `config/packages/` already exists, copies the YAML once. Prefer installing the package and restarting Core:
+
+```yaml
+# configuration.yaml
+homeassistant:
+  packages: !include_dir_named packages
+```
+
+```bash
+cp lard_controller/ha_packages/lard_fan_max.yaml /config/packages/lard_fan_max.yaml
+```
+
+Or create the Number helper in the UI with the same entity id. Writing **100** restores unconstrained auto (`max_fan_speed=100`, `minimum_required_fans=2`). If chip °F ≥ `CHIP_ABORT_F` (180) or a thermal/cooling fault is present, the add-on restores 100 immediately without pausing the miner itself.
+
+Fan-ceiling PUTs run only when `enable_writes` is true. They never set `APPLYING`, never pause, never write power target 0, and never PATCH boards.
 
 ## What this add-on will not do
 
