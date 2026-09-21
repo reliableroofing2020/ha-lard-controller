@@ -667,6 +667,300 @@ class CoolingProfile:
 # ---------------------------------------------------------------------------
 # Braiins OS+ REST (API ~1.8.0)
 # ---------------------------------------------------------------------------
+# Words that prove a hashboard entry when the firmware has no separate health enum.
+_BOARD_HEALTH_OK_WORDS = frozenset({"ok", "healthy", "good", "normal", "nominal"})
+_BOARD_HEALTH_BAD_WORDS = frozenset(
+    {
+        "unhealthy",
+        "dead",
+        "fault",
+        "faulty",
+        "failed",
+        "failure",
+        "missing",
+        "bad",
+        "error",
+        "sick",
+        "critical",
+    }
+)
+# GET /api/v1/miner/errors component names that are safety-relevant.
+_BOARD_SAFETY_COMPONENTS = ("hashboard", "board", "asic", "fan", "psu", "power_supply")
+
+
+def _unwrap_int(val) -> int | None:
+    if isinstance(val, dict):
+        if "value" in val:
+            val = val.get("value")
+        elif "chips_count" in val:
+            val = val.get("chips_count")
+        else:
+            return None
+    if isinstance(val, bool) or val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_optional_bool(val) -> bool | None:
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, (int, float)) and not isinstance(val, bool):
+        return bool(val)
+    if isinstance(val, str):
+        s = val.strip().lower()
+        if s in {"1", "true", "yes"}:
+            return True
+        if s in {"0", "false", "no"}:
+            return False
+    return None
+
+
+def _board_text_blob(board: dict) -> str:
+    parts: list[str] = []
+    for key in ("health", "status", "state", "fault", "error", "condition", "message"):
+        val = board.get(key)
+        if isinstance(val, str) and val.strip():
+            parts.append(val.strip().lower().replace("-", "_"))
+        elif isinstance(val, dict):
+            parts.append(json.dumps(val, default=str).lower().replace("-", "_"))
+    return " ".join(parts)
+
+
+def _canonical_safety_token(*parts: str) -> str:
+    """Map board/error text onto the same HARD_FAULT_TOKENS used everywhere else."""
+    blob = " ".join(p for p in parts if p).lower().replace("-", "_").replace(" ", "_")
+    spaced = " ".join(p for p in parts if p).lower().replace("-", " ").replace("_", " ")
+    for tok in HARD_FAULT_TOKENS:
+        if tok in blob or tok.replace("_", " ") in spaced:
+            return tok
+    compact = blob
+    if "fan" in compact and any(k in compact for k in ("fail", "fault", "broken", "error")):
+        return "fan_failure"
+    if ("psu" in compact or "power_supply" in compact) and any(
+        k in compact for k in ("fail", "fault", "error")
+    ):
+        return "psu_fault"
+    if "asic" in compact and any(k in compact for k in ("fail", "fault", "error")):
+        return "asic_fault"
+    if "board" in compact and any(k in compact for k in ("fail", "fault", "error", "unhealthy")):
+        return "board_fault"
+    return ""
+
+
+def _safety_fault_from_errors(errors) -> str:
+    if not isinstance(errors, list):
+        return ""
+    tokens: list[str] = []
+    for err in errors:
+        if not isinstance(err, dict):
+            continue
+        texts = [str(err.get("message") or "")]
+        for code in err.get("error_codes") or []:
+            if isinstance(code, dict):
+                texts.append(str(code.get("code") or ""))
+                texts.append(str(code.get("reason") or ""))
+                texts.append(str(code.get("hint") or ""))
+            elif code:
+                texts.append(str(code))
+        components = []
+        for comp in err.get("components") or []:
+            if isinstance(comp, dict):
+                components.append(str(comp.get("name") or ""))
+            elif comp:
+                components.append(str(comp))
+        blob = " ".join(texts + components)
+        token = _canonical_safety_token(blob)
+        if token:
+            tokens.append(token)
+            continue
+        comp_blob = " ".join(components).lower()
+        if any(name in comp_blob for name in _BOARD_SAFETY_COMPONENTS) and any(
+            k in blob.lower() for k in ("fail", "fault", "error", "unhealthy", "broken")
+        ):
+            forced = _canonical_safety_token(comp_blob + " fault")
+            if forced:
+                tokens.append(forced)
+    # Stable unique order.
+    out: list[str] = []
+    for tok in tokens:
+        if tok not in out:
+            out.append(tok)
+    return " ".join(out)
+
+
+def _parse_one_hashboard(board: dict) -> dict[str, Any]:
+    """One GET /api/v1/miner/hw/hashboards entry. Incomplete/unknown is not proven."""
+    bid = norm_board_id(board.get("id"))
+    if not bid:
+        bid = norm_board_id(board.get("hashboard_id"))
+    enabled = None
+    if "enabled" in board:
+        enabled = _as_optional_bool(board.get("enabled"))
+    elif "is_enabled" in board:
+        enabled = _as_optional_bool(board.get("is_enabled"))
+    chips = _unwrap_int(board.get("chips_count"))
+    stale = bool(board.get("stale") or board.get("board_stale"))
+    stats = board.get("stats") if isinstance(board.get("stats"), dict) else {}
+    if isinstance(stats, dict) and stats.get("stale"):
+        stale = True
+    blob = _board_text_blob(board)
+    fault = _canonical_safety_token(blob)
+    healthy_flag = _as_optional_bool(board.get("healthy")) if "healthy" in board else None
+    health_word = str(board.get("health") or board.get("status") or board.get("state") or "").strip().lower()
+    health_word = health_word.replace("-", "_").replace(" ", "_")
+    explicit_unhealthy = healthy_flag is False or health_word in _BOARD_HEALTH_BAD_WORDS
+    if health_word and any(bad in health_word for bad in _BOARD_HEALTH_BAD_WORDS):
+        explicit_unhealthy = True
+    if fault:
+        explicit_unhealthy = True
+    complete = bool(bid) and enabled is not None and chips is not None and chips > 0
+    proven = (
+        complete
+        and enabled is True
+        and not stale
+        and not explicit_unhealthy
+        and not fault
+        and (healthy_flag is not False)
+        and (not health_word or health_word in _BOARD_HEALTH_OK_WORDS or healthy_flag is True)
+    )
+    # A firmware payload with no health enum is proven only by a complete enabled
+    # entry (id, enabled, chips_count > 0) and the absence of a fault/stale flag.
+    if healthy_flag is None and not health_word and complete and enabled and not stale and not fault:
+        proven = True
+    reason = "proven"
+    if not bid:
+        reason = "missing_id"
+    elif enabled is None:
+        reason = "enabled_unknown"
+    elif chips is None or chips <= 0:
+        reason = "chips_count_incomplete"
+    elif not enabled:
+        reason = "disabled"
+    elif stale:
+        reason = "stale"
+    elif fault:
+        reason = fault
+    elif explicit_unhealthy:
+        reason = "unhealthy"
+    return {
+        "id": bid,
+        "enabled": enabled,
+        "chips_count": chips,
+        "stale": stale,
+        "complete": complete,
+        "proven_healthy": bool(proven),
+        "explicit_unhealthy": bool(explicit_unhealthy),
+        "fault": fault,
+        "reason": reason,
+    }
+
+
+def parse_board_health_payload(hashboards_body, errors=None, *, errors_checked: bool = True) -> dict[str, Any]:
+    """Fail-closed board health from existing Braiins REST payloads.
+
+    ``GET /api/v1/miner/hw/hashboards`` (proto ``Hashboard``): ``id``,
+    ``enabled`` / ``is_enabled``, ``chips_count`` (u32 or ``{"value": n}``),
+    optional ``stats``, plus any ``healthy`` / ``health`` / ``status`` /
+    ``state`` / ``fault`` / ``stale`` fields the firmware includes.
+    ``GET /api/v1/miner/errors`` (proto ``MinerError``): ``message``,
+    ``error_codes[].code/reason``, ``components[].name``.
+
+    Expected board count is NOT ``len(hashboards)``. Callers compare reports
+    to configured ``BOARD_MAP`` / a prior full discovery. A short list does
+    not redefine how many boards must be proven. Malformed, incomplete,
+    stale, unknown, or unchecked errors are not healthy.
+    """
+    safety = _safety_fault_from_errors(errors) if errors_checked else ""
+    base = {
+        "verified": False,
+        "healthy": False,
+        "stale": False,
+        "incomplete": True,
+        "malformed": False,
+        "errors_checked": bool(errors_checked),
+        "safety_fault": safety,
+        "reason": "unverified",
+        "boards": [],
+        "reported_ids": [],
+    }
+    if not errors_checked:
+        base["reason"] = "errors_not_checked"
+        base["stale"] = True
+        return base
+    if hashboards_body is None:
+        base["reason"] = "hashboards_missing"
+        base["stale"] = True
+        return base
+    if not isinstance(hashboards_body, dict):
+        base["malformed"] = True
+        base["reason"] = "hashboards_malformed"
+        return base
+    if hashboards_body.get("stale") or hashboards_body.get("partial"):
+        base["stale"] = bool(hashboards_body.get("stale"))
+        base["incomplete"] = True
+        base["reason"] = "hashboards_stale" if hashboards_body.get("stale") else "hashboards_partial"
+        return base
+    raw_boards = hashboards_body.get("hashboards")
+    if "hashboards" not in hashboards_body or not isinstance(raw_boards, list):
+        base["malformed"] = True
+        base["reason"] = "hashboards_malformed"
+        return base
+    reports: list[dict[str, Any]] = []
+    for entry in raw_boards:
+        if not isinstance(entry, dict):
+            base["malformed"] = True
+            base["reason"] = "hashboard_entry_malformed"
+            base["boards"] = reports
+            return base
+        reports.append(_parse_one_hashboard(entry))
+    reported_ids = [r["id"] for r in reports if r.get("id")]
+    incomplete = any(not r.get("complete") for r in reports) or not reports
+    stale = any(r.get("stale") for r in reports)
+    explicit_bad = any(r.get("explicit_unhealthy") or r.get("fault") for r in reports)
+    all_enabled_proven = bool(reports) and all(
+        (not r.get("enabled")) or r.get("proven_healthy") for r in reports
+    )
+    # Top-level healthy means every enabled reported board is proven and the
+    # payload itself is current. It does not mean the configured board count
+    # was satisfied — a 2-long list of healthy boards is still not 3 expected.
+    healthy = (
+        bool(reports)
+        and not incomplete
+        and not stale
+        and not explicit_bad
+        and not safety
+        and all_enabled_proven
+        and all(r.get("proven_healthy") for r in reports if r.get("enabled"))
+    )
+    verified = not stale and not base["malformed"]
+    reason = "ok" if healthy else "not_proven"
+    if not reports:
+        reason = "no_boards"
+    elif stale:
+        reason = "stale"
+    elif safety:
+        reason = safety
+    elif explicit_bad:
+        reason = "unhealthy_board"
+    elif incomplete:
+        reason = "incomplete"
+    return {
+        "verified": verified,
+        "healthy": bool(healthy and verified),
+        "stale": stale,
+        "incomplete": incomplete or not reports,
+        "malformed": False,
+        "errors_checked": True,
+        "safety_fault": safety,
+        "reason": reason,
+        "boards": reports,
+        "reported_ids": reported_ids,
+    }
+
+
 class Braiins:
     def __init__(self, settings: Settings, log: Logger):
         self.settings = settings
@@ -793,6 +1087,103 @@ class Braiins:
                 if bid:
                     out.append(bid)
         return sorted(out), code, hb
+
+    def get_miner_errors(self):
+        """GET /api/v1/miner/errors — MinerError list (message, codes, components)."""
+        return self._call("GET", "/api/v1/miner/errors")
+
+    def board_health(self):
+        """Current hashboard health from existing Braiins reads. Fail closed.
+
+        Uses only APIs this client already depends on, plus the documented
+        errors list:
+
+        - ``GET /api/v1/miner/hw/hashboards`` — ``hashboards[].id``,
+          ``enabled``/``is_enabled``, ``chips_count``, ``stats``, and any
+          ``healthy``/``health``/``status``/``fault``/``stale`` fields.
+        - ``GET /api/v1/miner/errors`` — ``errors[].message``,
+          ``error_codes[].code/reason``, ``components[].name``.
+
+        HTTP failure, malformed JSON, a missing ``hashboards`` list, incomplete
+        entries (no id, unknown enabled, missing/zero ``chips_count``), an
+        explicit stale/partial flag, or an unknown health value is not
+        healthy and not verified. There is no cached previous verdict.
+        Expected board count is the caller's configured/discovered topology,
+        not the length of this response.
+        """
+        try:
+            code, hb = self._call("GET", "/api/v1/miner/hw/hashboards")
+        except Exception as e:
+            return {
+                "verified": False,
+                "healthy": False,
+                "stale": True,
+                "incomplete": True,
+                "malformed": False,
+                "errors_checked": False,
+                "safety_fault": "",
+                "reason": f"hashboards_exc:{e}",
+                "boards": [],
+                "reported_ids": [],
+            }
+        if code != 200 or not isinstance(hb, dict):
+            return {
+                "verified": False,
+                "healthy": False,
+                "stale": True,
+                "incomplete": True,
+                "malformed": not isinstance(hb, dict),
+                "errors_checked": False,
+                "safety_fault": "",
+                "reason": f"hashboards_http_{code}",
+                "boards": [],
+                "reported_ids": [],
+            }
+        try:
+            ecode, ej = self.get_miner_errors()
+        except Exception as e:
+            return {
+                "verified": False,
+                "healthy": False,
+                "stale": True,
+                "incomplete": True,
+                "malformed": False,
+                "errors_checked": False,
+                "safety_fault": "",
+                "reason": f"errors_exc:{e}",
+                "boards": [],
+                "reported_ids": [],
+            }
+        if ecode != 200 or not isinstance(ej, dict):
+            return {
+                "verified": False,
+                "healthy": False,
+                "stale": True,
+                "incomplete": True,
+                "malformed": False,
+                "errors_checked": False,
+                "safety_fault": "",
+                "reason": f"errors_http_{ecode}",
+                "boards": [],
+                "reported_ids": [],
+            }
+        errors = ej.get("errors")
+        if errors is None:
+            errors = []
+        if not isinstance(errors, list):
+            return {
+                "verified": False,
+                "healthy": False,
+                "stale": True,
+                "incomplete": True,
+                "malformed": True,
+                "errors_checked": False,
+                "safety_fault": "",
+                "reason": "errors_malformed",
+                "boards": [],
+                "reported_ids": [],
+            }
+        return parse_board_health_payload(hb, errors, errors_checked=True)
 
     def approx_power_w(self):
         """Best-effort live watts. Missing stats are not a write failure."""
@@ -1258,8 +1649,40 @@ class MinerObservation:
     bosminer_uptime_s: float | None = None
     miner_ready: bool | None = None
     not_started: bool = False
-    boards_healthy: bool = True
+    # Fail closed. A missing live board-health read is not healthy.
+    boards_healthy: bool = False
     board_stale: bool = False
+    board_health_verified: bool = False
+    board_reports: list = field(default_factory=list)
+    safety_fault: str = ""
+    board_health_reason: str = ""
+
+
+class CoolingResult:
+    """Explicit cooling-transaction result.
+
+    Truthy only for a closed success: hashing, intentional confirmed pause, or
+    same-value noop. ``degraded`` and ``error`` are closed and falsy.
+    ``interim`` (operational / applying inside the recovery window) is not
+    closed and is not success.
+    """
+
+    _SUCCESS = frozenset({"hashing", "paused", "noop"})
+    _CLOSED = frozenset({"hashing", "paused", "noop", "degraded", "error"})
+
+    def __init__(self, outcome: str):
+        self.outcome = outcome
+        self.closed = outcome in self._CLOSED
+
+    def __bool__(self) -> bool:
+        return self.closed and self.outcome in self._SUCCESS
+
+    def __repr__(self) -> str:
+        return f"CoolingResult({self.outcome!r}, closed={self.closed})"
+
+
+def _txn_result(outcome: str) -> CoolingResult:
+    return CoolingResult(outcome)
 
 
 # ---------------------------------------------------------------------------
@@ -1610,6 +2033,12 @@ class Controller:
         self._health_class = "UNKNOWN"
         self._pending_profile: CoolingProfile | None = None
         self._pending_explicit = False
+        self._pending_hold_logged: tuple | None = None
+        self._cooling_terminal_kind = ""
+        self._cooling_terminal_gen = 0
+        self._resume_gate = ""
+        self._settle_complete = False
+        self._recovery_interim_logged = False
         self._resume_retries_used = 0
         self._resume_retry_used = False
         self._last_cooling_result = ""
@@ -1621,9 +2050,12 @@ class Controller:
         self._telemetry_last_success_ts = 0.0
         self._last_good_power_w = None
         self._last_good_boards = ""
+        self._last_obs: MinerObservation | None = None
         self._recovery_started_ts = 0.0
         self._recovery_elapsed_s = 0.0
         self._recovery_limit_s = 0.0
+        self._primary_recovery_started_ts = 0.0
+        self._primary_recovery_deadline_ts = 0.0
 
     def writes_allowed(self, enable_on: bool) -> bool:
         """Braiins writes require BOTH the add-on option and the HA gate."""
@@ -2275,6 +2707,8 @@ class Controller:
         self._cooling_transition_active = False
         self._cooling_txn_active = False
         self._last_cooling_result = err
+        self._close_cooling_terminal("error")
+        self._note_pending_held("ERROR")
         self._emit("lard_cooling_error", why=err)
 
     def _confirm_cooling(self, profile: CoolingProfile) -> bool:
@@ -2322,6 +2756,11 @@ class Controller:
         self._resume_retry_used = False
         self._recovery_elapsed_s = 0.0
         self._recovery_limit_s = 0.0
+        self._primary_recovery_started_ts = 0.0
+        self._primary_recovery_deadline_ts = 0.0
+        self._recovery_interim_logged = False
+        self._settle_complete = False
+        self._resume_gate = ""
         return self._cooling_txn_id
 
     def _emit(self, event_type: str, **extra) -> None:
@@ -2421,10 +2860,14 @@ class Controller:
         return " ".join(parts)
 
     def _hard_fault(self, obs: MinerObservation) -> bool:
+        """Single hard-fault predicate. Stale or missing telemetry is not a fault."""
         if not obs.ok:
             return False
-        blob = self._lifecycle_text(obs).replace(" ", "_")
-        spaced = self._lifecycle_text(obs)
+        text = self._lifecycle_text(obs)
+        if getattr(obs, "safety_fault", ""):
+            text = f"{text} {obs.safety_fault}".strip()
+        blob = text.replace(" ", "_")
+        spaced = text
         return any(tok in blob or tok in spaced for tok in HARD_FAULT_TOKENS)
 
     def _positive_lifecycle(self, obs: MinerObservation) -> bool:
@@ -2445,8 +2888,50 @@ class Controller:
             return True
         return False
 
+    def _expected_board_ids(self, mode: str) -> list[str]:
+        """Configured topology. Never the length of a partial hashboards response."""
+        if mode in BOARD_MAP and mode != "PAUSED":
+            return list(BOARD_MAP[mode])
+        return []
+
+    def _expected_boards_proven(self, obs: MinerObservation, mode: str) -> bool:
+        """Each configured board must be proven on this read.
+
+        Expected ids come from ``BOARD_MAP`` (the authoritative topology for
+        the mode), not from ``len(board_reports)``. A 2-board payload does
+        not become "expected == 2". A shorter or partial response cannot
+        shrink the configured set.
+        """
+        expect = self._normalize_board_ids(self._expected_board_ids(mode))
+        if not expect:
+            return False
+        reports = {}
+        for rec in obs.board_reports or []:
+            if not isinstance(rec, dict):
+                return False
+            bid = norm_board_id(rec.get("id"))
+            if not bid:
+                return False
+            reports[bid] = rec
+        if len(reports) < len(expect):
+            return False
+        for bid in expect:
+            rec = reports.get(bid)
+            if not rec or not rec.get("proven_healthy"):
+                return False
+        for rec in reports.values():
+            if rec.get("explicit_unhealthy") or rec.get("fault") or rec.get("stale"):
+                return False
+            if rec.get("enabled") and not rec.get("proven_healthy"):
+                return False
+        return True
+
     def _hashing_sample_ok(self, obs: MinerObservation, mode: str) -> bool:
-        """One stable-hash sample. Full HASHING needs several of these in a row."""
+        """One stable-hash sample. Full HASHING needs several of these in a row.
+
+        Board health must be proven by the current read. Cached health, a
+        missing hook, a partial board list, or watts/TH alone are not enough.
+        """
         if not obs.ok or self._hard_fault(obs):
             return False
         if obs.user_paused or self._is_paused(obs) or not obs.running:
@@ -2455,7 +2940,11 @@ class Controller:
             return False
         if obs.hashrate is None or float(obs.hashrate) < SANITY_HASHRATE:
             return False
-        if not obs.boards_healthy or obs.board_stale:
+        if obs.safety_fault:
+            return False
+        if not obs.board_health_verified or obs.board_stale or not obs.boards_healthy:
+            return False
+        if not self._expected_boards_proven(obs, mode):
             return False
         if mode in BOARD_MAP and mode != "PAUSED":
             if not self._boards_match(obs.enabled_ids, BOARD_MAP[mode]):
@@ -2559,7 +3048,51 @@ class Controller:
             return "applying"
         return None
 
-    def _finish_hashing(self, mode: str) -> bool:
+    def _close_cooling_terminal(self, kind: str) -> None:
+        """Record the terminal that just closed this transaction.
+
+        A later coalesced apply must see this generation. DEGRADED and ERROR
+        block automatic pending apply until a newer success terminal replaces
+        them (a fresh txn that actually reaches HASHING or confirmed PAUSED).
+        """
+        self._cooling_terminal_kind = kind
+        self._cooling_terminal_gen += 1
+
+    def _note_pending_held(self, reason: str) -> None:
+        """Keep a coalesced ceiling visible. Do not issue device commands."""
+        pending = self._pending_profile
+        if pending is None:
+            return
+        key = (str(reason), int(pending.max_fan_speed))
+        if self._pending_hold_logged == key:
+            return
+        self._pending_hold_logged = key
+        self._log_txn(
+            f"pending_held max={pending.max_fan_speed} reason={reason} "
+            f"health={self._health_class} terminal={self._cooling_terminal_kind} "
+            f"— no auto apply; explicit operator action required"
+        )
+        self._emit(
+            "lard_cooling_pending_held",
+            reason=reason,
+            pending=pending.max_fan_speed,
+        )
+
+    def _auto_apply_pending_allowed(self) -> bool:
+        """Coalesced pending may start another txn only after a real success.
+
+        HASHING, or an intentional confirmed PAUSE, is success. DEGRADED and
+        ERROR are not. An in-flight transaction cannot apply its own pending.
+        """
+        if self._cooling_txn_active:
+            return False
+        if self._health_class in {"DEGRADED_NEEDS_ATTENTION", "ERROR"}:
+            return False
+        if self._cooling_terminal_kind in {"degraded", "error"}:
+            return False
+        return self._health_class in {"HASHING", "PAUSED"}
+
+    def _finish_hashing(self, mode: str) -> CoolingResult:
         self._last_cooling_result = self._last_cooling_result or "verified"
         self._set_cooling_phase("HASHING", health="HASHING")
         self._log_txn(f"recovery_hashing mode={mode}")
@@ -2570,7 +3103,8 @@ class Controller:
         else:
             self.actual_mode = mode
         self._health_class = "HASHING"
-        return True
+        self._close_cooling_terminal("hashing")
+        return _txn_result("hashing")
 
     def _stage_c_ready(self, obs: MinerObservation, mode: str, hist: dict[str, list]) -> bool:
         """Ramp is healthy: transitional phase and watts or hashrate have started rising."""
@@ -2584,68 +3118,122 @@ class Controller:
         self._record_trend(obs, hist)
         return self._trend_rising(hist)
 
-    def _finish_operational(self, mode: str) -> bool:
-        """Boards are running. Do not call that full HASHING while watts/TH are still warming."""
-        self._log_txn(f"recovery_operational mode={mode}")
-        self.last_error = ""
-        self._cooling_transition_active = False
-        if mode in RANK:
-            self._mark_confirmed(mode)
-        self._health_class = "RECOVERING"
-        self._cooling_phase = "RECOVERING"
-        return True
+    def _note_recovery_interim(self, mode: str, kind: str) -> CoolingResult:
+        """operational/applying stay inside the open recovery transaction.
 
-    def _finish_applying(self, mode: str) -> bool:
-        """Healthy ramp. Stay APPLYING / RECOVERING — not ERROR and not a confirmed mode."""
-        self.actual_mode = "APPLYING"
-        self.last_error = ""
+        Updates visible RECOVERING/APPLYING diagnostics only. Does not clear
+        ``_cooling_txn_active``, release ownership, move the original maximum
+        deadline, or count as success.
+        """
         self._health_class = "RECOVERING"
-        self._cooling_phase = "RECOVERING"
-        self._cooling_transition_active = False
-        self._log_txn(f"recovery_applying mode={mode}")
-        return True
+        if self._cooling_phase not in {"RECOVERING", "RETRY_RESUME_ONCE"}:
+            self._cooling_phase = "RECOVERING"
+        if kind == "applying":
+            self.actual_mode = "APPLYING"
+        if not self._recovery_interim_logged:
+            self._recovery_interim_logged = True
+            self._log_txn(
+                f"recovery_interim kind={kind} mode={mode} "
+                f"txn_active={self._cooling_txn_active} "
+                f"primary_deadline_ts={self._primary_recovery_deadline_ts} "
+                f"(non-terminal; deadlines and retry still apply)"
+            )
+        return CoolingResult("interim")
 
-    def _finish_degraded(self, mode: str, why: str) -> bool:
+    def _finish_operational(self, mode: str) -> CoolingResult:
+        """Non-terminal. Running at low watts is not a closed recovery."""
+        return self._note_recovery_interim(mode, "operational")
+
+    def _finish_applying(self, mode: str) -> CoolingResult:
+        """Non-terminal. A ramp is not a closed recovery."""
+        return self._note_recovery_interim(mode, "applying")
+
+    def _finish_degraded(self, mode: str, why: str) -> CoolingResult:
         self._set_cooling_phase("DEGRADED_NEEDS_ATTENTION")
         self.last_error = f"degraded_needs_attention:{why}"
         self.actual_mode = "APPLYING"
         self._log_txn(f"degraded mode={mode} why={why} (not ERROR)")
         self._cooling_transition_active = False
-        return False
+        self._close_cooling_terminal("degraded")
+        self._note_pending_held("DEGRADED_NEEDS_ATTENTION")
+        return _txn_result("degraded")
 
-    def _fail_hard(self, obs: MinerObservation) -> bool:
+    def _fail_hard(self, obs: MinerObservation) -> CoolingResult:
         why = self._lifecycle_text(obs) or "hard_fault"
+        if getattr(obs, "safety_fault", ""):
+            why = f"{why} {obs.safety_fault}".strip()
         self.last_error = f"hard_fault:{why}"
         self._set_cooling_phase("ERROR", health="ERROR")
         self._log_txn(f"hard_fault {why}")
         self._cooling_transition_active = False
-        return False
+        self._close_cooling_terminal("error")
+        self._note_pending_held("ERROR")
+        return _txn_result("error")
 
-    def _settle_after_cooling(self, profile: CoolingProfile) -> None:
-        """Poll through the post-write settle. Do not resume just because PUT returned."""
+    def _classify_settle_obs(self, obs: MinerObservation) -> str:
+        """``hard_fault``, ``not_clean``, or ``clean``. Missing telemetry is not a fault."""
+        if not obs.ok:
+            self._note_telemetry_failure("settle")
+            return "not_clean"
+        self._note_telemetry_success()
+        if self._hard_fault(obs):
+            return "hard_fault"
+        return "clean"
+
+    def _settle_after_cooling(self, profile: CoolingProfile) -> str:
+        """Poll through the post-write settle. Do not resume just because PUT returned.
+
+        Every poll uses ``_hard_fault``. A hard fault aborts the settle and
+        returns ``hard_fault`` so the caller must not ResumeMining. A stale or
+        failed read is ``not_clean``: not a hard fault, and not authorization
+        to resume blindly.
+        """
+        self._settle_complete = False
         self._set_cooling_phase("COOLING_SETTLING", health="APPLYING")
         settle = self._settle_seconds()
         poll = self._poll_interval()
         self._log_txn(f"settle_begin seconds={settle} poll={poll}")
         if settle <= 0:
+            obs = self.observe_miner()
+            kind = self._classify_settle_obs(obs)
+            if kind == "hard_fault":
+                self._fail_hard(obs)
+                self._log_txn("settle_abort hard_fault seconds=0 — no resume")
+                return "hard_fault"
+            if kind == "not_clean":
+                self._log_txn("settle_poll telemetry_not_clean seconds=0 — not a resume authorization")
             self._confirm_cooling(profile)
+            self._settle_complete = True
             self._log_txn("settle_done seconds=0")
-            return
+            return "settled" if kind == "clean" else "not_clean"
         deadline = self._now() + settle
+        saw_not_clean = False
         while self._now() < deadline:
             obs = self.observe_miner()
             self._refresh_cooling_telemetry()
+            kind = self._classify_settle_obs(obs)
             self._log_txn(
-                f"settle_poll paused={obs.paused} user_paused={obs.user_paused} "
+                f"settle_poll kind={kind} paused={obs.paused} user_paused={obs.user_paused} "
                 f"power_w={obs.power_w} phase={obs.phase} reason={obs.pause_reason} "
                 f"live_max={self._live_max_fan_speed} chip_temp_f={self._chip_temp_f}"
             )
+            if kind == "hard_fault":
+                self._fail_hard(obs)
+                self._log_txn("settle_abort hard_fault — no resume, no retry")
+                return "hard_fault"
+            if kind == "not_clean":
+                saw_not_clean = True
+                self._log_txn(
+                    "settle_poll telemetry_not_clean — not a hard fault, not a resume authorization"
+                )
             remaining = deadline - self._now()
             if remaining <= 0:
                 break
             self._sleep(min(poll, remaining))
         self._confirm_cooling(profile)
+        self._settle_complete = True
         self._log_txn("settle_done")
+        return "not_clean" if saw_not_clean else "settled"
 
     def _recovery_window(
         self,
@@ -2655,11 +3243,28 @@ class Controller:
         expected_s: float,
         label: str,
     ) -> str:
-        """Return hashing, exhausted, or error. 0 W stays RECOVERING when lifecycle is real."""
+        """Return hashing, exhausted, or error.
+
+        ``operational`` and ``applying`` are non-terminal. They may update
+        visible RECOVERING/APPLYING state but they do not end the window,
+        clear the transaction, or move the original maximum deadline.
+        """
         self._set_cooling_phase("RECOVERING", health="RECOVERING")
         start = self._now()
         self._recovery_started_ts = start
         self._recovery_limit_s = float(limit_s)
+        # The primary 600s deadline is fixed for this transaction. Re-observing
+        # APPLYING or running must not start it over. The post-retry window is
+        # its own shorter deadline and does not move the primary one.
+        if label == "primary":
+            self._primary_recovery_started_ts = start
+            self._primary_recovery_deadline_ts = start + float(limit_s)
+        elif self._primary_recovery_deadline_ts:
+            self._log_txn(
+                f"primary_deadline_kept label={label} "
+                f"primary_deadline_ts={self._primary_recovery_deadline_ts}"
+            )
+        deadline = start + float(limit_s)
         poll = self._poll_interval()
         stable_need = max(1, int(self.settings.stable_hash_poll_count or STABLE_HASH_POLLS))
         stable = 0
@@ -2667,7 +3272,8 @@ class Controller:
         hist: dict[str, list] = {"power": [], "hash": []}
         self._log_txn(
             f"recovery_begin label={label} expected_s={expected_s} limit_s={limit_s} "
-            f"stable_polls={stable_need} poll_s={poll}"
+            f"stable_polls={stable_need} poll_s={poll} "
+            f"primary_deadline_ts={self._primary_recovery_deadline_ts}"
         )
         while True:
             elapsed = self._now() - start
@@ -2691,46 +3297,61 @@ class Controller:
                         f"stable={stable}/{stable_need} power_w={obs.power_w} "
                         f"hashrate={obs.hashrate} phase={obs.phase} "
                         f"reason={obs.pause_reason} boards={obs.enabled_ids} "
-                        f"chip_temp_f={self._chip_temp_f}"
+                        f"boards_healthy={obs.boards_healthy} "
+                        f"board_health_verified={obs.board_health_verified} "
+                        f"chip_temp_f={self._chip_temp_f} "
+                        f"txn_active={self._cooling_txn_active} "
+                        f"primary_deadline_ts={self._primary_recovery_deadline_ts}"
                     )
                     if stable >= stable_need:
                         return "hashing"
                 elif self._active_confirmed(mode, obs):
-                    # Running with the expected boards. 0 W warmup is not a
-                    # failure and is not yet full HASHING health.
+                    # Running with the expected boards is interim only.
+                    # 0 W / missing hashrate does not close the txn.
                     stable = 0
                     operational += 1
+                    self._note_recovery_interim(mode, "operational")
                     self._log_txn(
                         f"recovery_poll label={label} elapsed={int(elapsed)} "
-                        f"operational={operational}/{stable_need} power_w={obs.power_w}"
+                        f"operational={operational}/{stable_need} power_w={obs.power_w} "
+                        f"boards_healthy={obs.boards_healthy} "
+                        f"board_health_verified={obs.board_health_verified} "
+                        f"interim=operational txn_active={self._cooling_txn_active} "
+                        f"primary_deadline_ts={self._primary_recovery_deadline_ts}"
                     )
-                    if operational >= stable_need:
-                        return "operational"
                 else:
                     stable = 0
                     operational = 0
+                    interim_kind = ""
+                    if self._stage_c_ready(obs, mode, hist):
+                        interim_kind = "applying"
+                        self._note_recovery_interim(mode, "applying")
+                        self._log_txn(
+                            f"recovery_ramp label={label} elapsed={int(elapsed)} "
+                            f"power_w={obs.power_w} hashrate={obs.hashrate} "
+                            f"interim=applying txn_active={self._cooling_txn_active} "
+                            f"primary_deadline_ts={self._primary_recovery_deadline_ts} "
+                            f"(APPLYING stays inside the window)"
+                        )
                     self._log_txn(
                         f"recovery_poll label={label} elapsed={int(elapsed)} stable=0 "
                         f"power_w={obs.power_w} hashrate={obs.hashrate} phase={obs.phase} "
                         f"reason={obs.pause_reason} lifecycle={self._lifecycle_reason} "
                         f"positive={self._positive_lifecycle(obs)} boards={obs.enabled_ids} "
                         f"boards_healthy={obs.boards_healthy} board_stale={obs.board_stale} "
-                        f"chip_temp_f={self._chip_temp_f}"
+                        f"board_health_verified={obs.board_health_verified} "
+                        f"interim={interim_kind or '-'} "
+                        f"chip_temp_f={self._chip_temp_f} "
+                        f"txn_active={self._cooling_txn_active} "
+                        f"primary_deadline_ts={self._primary_recovery_deadline_ts}"
                     )
-                    if self._stage_c_ready(obs, mode, hist):
-                        self._log_txn(
-                            f"recovery_ramp label={label} elapsed={int(elapsed)} "
-                            f"power_w={obs.power_w} hashrate={obs.hashrate} "
-                            f"(APPLYING, not ERROR, not full HASHING)"
-                        )
-                        return "applying"
                     if elapsed >= float(expected_s) and not self._positive_lifecycle(obs):
                         self._log_txn(
                             f"recovery_no_progress label={label} elapsed={int(elapsed)} "
                             f"(past expected, lifecycle not positive)"
                         )
                         return "exhausted"
-            if elapsed >= float(limit_s):
+            if self._now() >= deadline:
                 self._log_txn(f"recovery_limit label={label} elapsed={int(elapsed)}")
                 return "exhausted"
             self._sleep(poll)
@@ -2757,16 +3378,55 @@ class Controller:
         return int(code)
 
     def _take_pending_if_terminal(self) -> CoolingProfile | None:
+        """Consume coalesced pending only after HASHING or confirmed PAUSED.
+
+        DEGRADED and ERROR keep the pending ceiling visible and issue no
+        further device command. A stale caller must re-check
+        ``_auto_apply_pending_allowed`` immediately before any command.
+        """
         if not self.settings.coalesce_pending_cooling_requests:
             return None
-        if self._health_class not in {"HASHING", "DEGRADED_NEEDS_ATTENTION", "ERROR", "PAUSED"}:
+        if self._cooling_txn_active or not self._auto_apply_pending_allowed():
+            self._note_pending_held(self._health_class or self._cooling_terminal_kind or "not_success")
             return None
         pending = self._pending_profile
+        if pending is None:
+            return None
+        if not self._auto_apply_pending_allowed():
+            self._note_pending_held("stale_callback")
+            return None
         self._pending_profile = None
         self._pending_explicit = False
-        if pending is None or pending.matches(self._cooling_applied):
+        self._pending_hold_logged = None
+        if pending.matches(self._cooling_applied):
             return None
         return pending
+
+    def _gate_resume(self, label: str) -> str:
+        """Re-check the hard-fault predicate immediately before ResumeMining.
+
+        Returns ``ok``, ``hard_fault``, or ``not_clean``. A failed/stale read
+        is not a hard fault and is not a clean authorization to resume.
+        """
+        self._resume_gate = label
+        try:
+            obs = self.observe_miner()
+            if not obs.ok:
+                self._note_telemetry_failure(f"resume_gate_{label}")
+                self._log_txn(
+                    f"resume_gate label={label} telemetry_not_clean "
+                    f"— not a hard fault; refuse blind resume"
+                )
+                return "not_clean"
+            self._note_telemetry_success()
+            if self._hard_fault(obs):
+                self._fail_hard(obs)
+                self._log_txn(f"resume_gate label={label} hard_fault — abort resume")
+                return "hard_fault"
+            self._log_txn(f"resume_gate label={label} clean")
+            return "ok"
+        finally:
+            self._resume_gate = ""
 
     def _cooling_obs_fields(self) -> dict[str, Any]:
         desired = None if self._cooling_desired is None else self._cooling_desired.max_fan_speed
@@ -2791,6 +3451,10 @@ class Controller:
             "resume_retry_used": bool(self._resume_retry_used),
             "lifecycle_reason": self._lifecycle_reason,
             "telemetry_freshness": self._telemetry_freshness,
+            "board_health_verified": bool(
+                getattr(self._last_obs, "board_health_verified", False)
+            ),
+            "board_health_reason": str(getattr(self._last_obs, "board_health_reason", "") or ""),
             "telemetry_fail_streak": self._telemetry_fail_streak,
             "telemetry_last_success_ts": self._telemetry_last_success_ts,
             "auto_fan_ceiling_enabled": bool(self.settings.auto_fan_ceiling_enabled),
@@ -3134,11 +3798,12 @@ class Controller:
 
     def _resume_after_cooling(
         self, previous: CoolingProfile | None, mode: str | None = None
-    ) -> bool:
+    ) -> CoolingResult:
         """One resume, then bounded recovery. 0 W during cooldown/APPLYING is not ERROR.
 
         At most one automatic resume retry per transaction. Start / BOSminer Restart
-        are not used. Device reboot is never issued.
+        are not used. Device reboot is never issued. operational/applying do not
+        close the transaction. A hard fault before either resume aborts.
         """
         if mode not in RANK:
             mode = self.desired_mode if self.desired_mode in RANK else self._settled_mode()
@@ -3150,11 +3815,19 @@ class Controller:
         self.actual_mode = "APPLYING"
         self._cooling_transition_active = True
         self.last_error = ""
-        self._settle_after_cooling(profile)
-        code = self._resume_once("primary")
-        if code != 200 and not is_http_5xx(code):
-            self._cooling_fail(f"cooling_resume_http_{code}", previous)
-            return False
+        settle_status = self._settle_after_cooling(profile)
+        if settle_status == "hard_fault":
+            return _txn_result("error")
+        gate = self._gate_resume("primary")
+        if gate == "hard_fault":
+            return _txn_result("error")
+        if gate == "not_clean":
+            self._log_txn("primary resume withheld — telemetry not clean")
+        else:
+            code = self._resume_once("primary")
+            if code != 200 and not is_http_5xx(code):
+                self._cooling_fail(f"cooling_resume_http_{code}", previous)
+                return _txn_result("error")
         outcome = self._recovery_window(
             mode,
             limit_s=float(self.settings.maximum_recovery_seconds),
@@ -3163,38 +3836,40 @@ class Controller:
         )
         if outcome == "hashing":
             return self._finish_hashing(mode)
-        if outcome == "operational":
-            return self._finish_operational(mode)
-        if outcome == "applying":
-            return self._finish_applying(mode)
+        if outcome in {"operational", "applying"}:
+            # Defensive: these are not terminal. Do not report success.
+            self._log_txn(f"ignored_nonterminal_outcome={outcome}")
+            return self._finish_degraded(mode, f"nonterminal_{outcome}")
         if outcome == "error":
-            return False
+            return _txn_result("error")
         retries_allowed = int(self.settings.max_resume_retries_per_transaction or 0)
         if self.settings.resume_retry_enabled and self._resume_retries_used < retries_allowed:
-            obs = self.observe_miner()
-            if obs.ok and self._hard_fault(obs):
-                return self._fail_hard(obs)
-            self._log_txn("recovery_exhausted — one guarded resume retry")
-            code = self._resume_once("retry")
-            if code != 200 and not is_http_5xx(code):
-                self._cooling_fail(f"cooling_resume_http_{code}", previous)
-                return False
-            post = float(self.settings.post_retry_recovery_seconds or 0)
-            expected = min(float(self.settings.expected_recovery_seconds or 0), post)
-            outcome = self._recovery_window(
-                mode,
-                limit_s=post,
-                expected_s=expected,
-                label="post_retry",
-            )
-            if outcome == "hashing":
-                return self._finish_hashing(mode)
-            if outcome == "operational":
-                return self._finish_operational(mode)
-            if outcome == "applying":
-                return self._finish_applying(mode)
-            if outcome == "error":
-                return False
+            gate = self._gate_resume("retry")
+            if gate == "hard_fault":
+                return _txn_result("error")
+            if gate == "not_clean":
+                self._log_txn("retry resume withheld — telemetry not clean")
+            else:
+                self._log_txn("recovery_exhausted — one guarded resume retry")
+                code = self._resume_once("retry")
+                if code != 200 and not is_http_5xx(code):
+                    self._cooling_fail(f"cooling_resume_http_{code}", previous)
+                    return _txn_result("error")
+                post = float(self.settings.post_retry_recovery_seconds or 0)
+                expected = min(float(self.settings.expected_recovery_seconds or 0), post)
+                outcome = self._recovery_window(
+                    mode,
+                    limit_s=post,
+                    expected_s=expected,
+                    label="post_retry",
+                )
+                if outcome == "hashing":
+                    return self._finish_hashing(mode)
+                if outcome in {"operational", "applying"}:
+                    self._log_txn(f"ignored_nonterminal_outcome={outcome}")
+                    return self._finish_degraded(mode, f"nonterminal_{outcome}")
+                if outcome == "error":
+                    return _txn_result("error")
         return self._finish_degraded(mode, "recovery_window_exhausted")
 
     def _cooling_transaction_body(self, profile: CoolingProfile, resume_mode: str) -> bool:
@@ -3213,7 +3888,8 @@ class Controller:
             self._last_cooling_result = "noop"
             self._log_txn("noop desired matches effective — no pause/resume")
             self._emit("lard_cooling_noop")
-            return True
+            self._close_cooling_terminal("noop")
+            return _txn_result("noop")
         refuse = self._cooling_refuse_reason(obs)
         if refuse == "hard_fault":
             self._cooling_txn_active = True
@@ -3223,7 +3899,7 @@ class Controller:
                 self._cooling_txn_active = False
         if refuse:
             self._defer_profile(profile, refuse, queue=True, explicit=True)
-            return False
+            return _txn_result("refused")
         previous = self._cooling_applied
         self._cooling_txn_active = True
         self._cooling_transition_active = True
@@ -3238,30 +3914,120 @@ class Controller:
                 self._health_class = "PAUSED"
                 self._cooling_phase = "PAUSED_CONFIRMED"
                 self._mark_confirmed("PAUSED")
-                return True
+                self._close_cooling_terminal("paused")
+                return _txn_result("paused")
             return self._resume_after_cooling(previous, resume_mode)
         except Exception as e:
             self._cooling_fail(f"cooling_exc:{e}", previous)
             self.log(f"COOLING exc {traceback.format_exc()}")
-            return False
+            return _txn_result("error")
         finally:
             self._cooling_txn_active = False
             self._cooling_transition_active = False
 
     def _gated_cooling_transition(
-        self, profile: CoolingProfile, resume_mode: str, _depth: int = 0
-    ) -> bool:
-        """Pause-first cooling transaction plus bounded recovery. Per-miner lock held."""
+        self,
+        profile: CoolingProfile,
+        resume_mode: str,
+        _depth: int = 0,
+        _apply_gen: int | None = None,
+    ) -> CoolingResult | bool:
+        """Pause-first cooling transaction plus bounded recovery. Per-miner lock held.
+
+        Recursive coalesced apply runs only after HASHING or confirmed PAUSED.
+        A callback whose generation or terminal no longer matches issues no
+        device command.
+        """
         with self._braiins_mutex:
+            if _depth > 0:
+                if _apply_gen is not None and _apply_gen != self._cooling_terminal_gen:
+                    self._pending_profile = profile
+                    self._pending_explicit = True
+                    self._note_pending_held("stale_callback")
+                    return _txn_result("refused")
+                if not self._auto_apply_pending_allowed():
+                    self._pending_profile = profile
+                    self._pending_explicit = True
+                    self._note_pending_held("stale_callback")
+                    return _txn_result("refused")
             if self._cooling_txn_active:
                 self._defer_profile(profile, "other_transaction", queue=True, explicit=True)
-                return False
+                return _txn_result("refused")
+            gen_at_start = self._cooling_terminal_gen
             ok = self._cooling_transaction_body(profile, resume_mode)
-            pending = self._take_pending_if_terminal()
+            if self._cooling_terminal_kind in {"degraded", "error"} or (
+                self._cooling_terminal_gen != gen_at_start
+                and self._health_class in {"DEGRADED_NEEDS_ATTENTION", "ERROR"}
+            ):
+                self._note_pending_held(self._health_class or self._cooling_terminal_kind)
+                pending = None
+            elif not self._auto_apply_pending_allowed():
+                self._note_pending_held(self._health_class or "not_success")
+                pending = None
+            else:
+                pending = self._take_pending_if_terminal()
+            apply_gen = self._cooling_terminal_gen
         if pending is not None and _depth < 3:
+            if (
+                not self._auto_apply_pending_allowed()
+                or apply_gen != self._cooling_terminal_gen
+            ):
+                self._pending_profile = pending
+                self._pending_explicit = True
+                self._note_pending_held("stale_callback")
+                return ok
             self._log_txn(f"apply_coalesced_pending max={pending.max_fan_speed}")
-            return self._gated_cooling_transition(pending, resume_mode, _depth=_depth + 1)
+            return self._gated_cooling_transition(
+                pending, resume_mode, _depth=_depth + 1, _apply_gen=apply_gen
+            )
         return ok
+
+    def _apply_live_board_health(self, obs: MinerObservation) -> None:
+        """Fill board-health fields from the current read only. Never default healthy.
+
+        A missing ``board_health`` hook, a raised hook, or a payload that does
+        not verify is ``boards_healthy=False`` and ``board_health_verified=False``.
+        Previous polls are not reused.
+        """
+        obs.boards_healthy = False
+        obs.board_stale = False
+        obs.board_health_verified = False
+        obs.board_reports = []
+        obs.safety_fault = ""
+        obs.board_health_reason = "unverified"
+        health_fn = getattr(self.b, "board_health", None)
+        info = None
+        if not callable(health_fn):
+            obs.board_stale = True
+            obs.board_health_reason = "board_health_hook_absent"
+            self._log_txn("board_health hook absent — fail closed (not healthy)")
+            return
+        try:
+            info = health_fn()
+        except Exception as e:
+            obs.board_stale = True
+            obs.board_health_reason = f"board_health_exc:{e}"
+            self._log_txn(f"board_health unavailable — fail closed: {e}")
+            return
+        if not isinstance(info, dict):
+            obs.board_stale = True
+            obs.board_health_reason = "board_health_missing"
+            self._log_txn("board_health empty — fail closed (not healthy)")
+            return
+        obs.board_reports = [rec for rec in (info.get("boards") or []) if isinstance(rec, dict)]
+        obs.board_health_reason = str(info.get("reason") or "")
+        obs.safety_fault = str(info.get("safety_fault") or "")
+        obs.board_stale = bool(info.get("stale")) or bool(info.get("malformed"))
+        # A missing "healthy" key is not healthy. A missing "verified" key is not verified.
+        verified = bool(info.get("verified")) and not obs.board_stale and not info.get("malformed")
+        if "healthy" not in info:
+            healthy = False
+            if not obs.board_health_reason:
+                obs.board_health_reason = "healthy_key_absent"
+        else:
+            healthy = bool(info.get("healthy"))
+        obs.board_health_verified = verified
+        obs.boards_healthy = bool(healthy and verified and not obs.safety_fault and not obs.board_stale)
 
     def observe_miner(self) -> MinerObservation:
         """Read boards + pause/mining state. Topology alone never confirms a live mode."""
@@ -3302,16 +4068,7 @@ class Controller:
         obs.miner_ready = parsed.get("miner_ready")
         obs.not_started = bool(parsed.get("not_started"))
         obs.ok = True
-        obs.boards_healthy = True
-        obs.board_stale = False
-        health_fn = getattr(self.b, "board_health", None)
-        if callable(health_fn):
-            try:
-                info = health_fn() or {}
-                obs.boards_healthy = bool(info.get("healthy", True))
-                obs.board_stale = bool(info.get("stale", False))
-            except Exception as e:
-                self.log(f"board_health_skip: {e}")
+        self._apply_live_board_health(obs)
         self.b.fail_count = 0
         self.miner_paused = self._is_paused(obs)
         self.mining_phase = obs.phase or ("paused" if obs.paused else "")
@@ -3589,9 +4346,19 @@ class Controller:
             if cooling_changed:
                 ok = self._resume_after_cooling(previous_cooling, mode)
                 self._cooling_txn_active = False
-                pending = self._take_pending_if_terminal()
-                if pending is not None:
-                    self._gated_cooling_transition(pending, mode)
+                if self._auto_apply_pending_allowed():
+                    pending = self._take_pending_if_terminal()
+                    if pending is not None:
+                        self._gated_cooling_transition(
+                            pending,
+                            mode,
+                            _depth=1,
+                            _apply_gen=self._cooling_terminal_gen,
+                        )
+                else:
+                    self._note_pending_held(
+                        self._health_class or self._cooling_terminal_kind or "not_success"
+                    )
                 return ok
             else:
                 code, _ = self._http_retry(self.b.resume, "resume")
@@ -3923,11 +4690,20 @@ class Controller:
             return
         self._note_telemetry_success()
 
+        if self._health_class == "ERROR" or self._cooling_terminal_kind == "error":
+            if self._pending_profile is not None:
+                self._note_pending_held("ERROR")
+            self.reason = f"{reason}|error_hold"
+            self.publish(solar_avg, True)
+            return
+
         if (
             self._health_class == "DEGRADED_NEEDS_ATTENTION"
             and desired != "PAUSED"
             and not abort
         ):
+            if self._pending_profile is not None:
+                self._note_pending_held("DEGRADED_NEEDS_ATTENTION")
             self.reason = f"{reason}|degraded_needs_attention"
             self.publish(solar_avg, True)
             return
@@ -3938,13 +4714,29 @@ class Controller:
             and not self._cooling_txn_active
             and self._cooling_refuse_reason(obs) is None
         ):
-            profile = self._pending_profile
-            self._pending_profile = None
-            self._pending_explicit = False
-            resume_mode = desired if desired in RANK else self._settled_mode()
-            self._gated_cooling_transition(profile, resume_mode)
-            self.publish(solar_avg, True)
-            return
+            blocked = self._health_class in {"DEGRADED_NEEDS_ATTENTION", "ERROR"} or (
+                self._cooling_terminal_kind in {"degraded", "error"}
+            )
+            if blocked or self._cooling_txn_active:
+                self._note_pending_held(self._health_class or self._cooling_terminal_kind)
+            else:
+                profile = self._pending_profile
+                gen = self._cooling_terminal_gen
+                self._pending_profile = None
+                self._pending_explicit = False
+                if (
+                    gen != self._cooling_terminal_gen
+                    or self._health_class in {"DEGRADED_NEEDS_ATTENTION", "ERROR"}
+                    or self._cooling_terminal_kind in {"degraded", "error"}
+                ):
+                    self._pending_profile = profile
+                    self._pending_explicit = True
+                    self._note_pending_held("stale_callback")
+                else:
+                    resume_mode = desired if desired in RANK else self._settled_mode()
+                    self._gated_cooling_transition(profile, resume_mode)
+                    self.publish(solar_avg, True)
+                    return
 
         if not self._needs_reconcile(desired, obs):
             if desired == "PAUSED" and self._paused_confirmed(obs):
