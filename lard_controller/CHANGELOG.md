@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.8
+
+- Write-enable hardening only. Does not turn on `enable_writes`, `auto_fan_ceiling_enabled`, or `switch.solar_miner_auto_enable`. The default posture stays observe-only.
+- Immediate pre-emit authorization on every device-changing call (`_authorize_device_write` / `_call_device`). A denial fails closed, logs `lard_write_denied`, and sends no command. Mid-transaction denial holds the miner for manual review.
+- `/actions/start` and `/actions/restart` join reboot and factory reset on the structural deny-list, checked before HTTP. Start and BOSminer Restart escalation helpers stay permanently disabled.
+- Recovery extends past the expected window only for named lifecycle tokens (APPLYING, cooldown, preheat, startup, init, tuner, ramping, and the other exact names). Running at 0 W with no named token exhausts at the expected window, then one resume retry and the post-retry window. `init` does not match `reinitializing`.
+- Transaction deadlines, settle, retry, and budgets use `time.monotonic()`. Wall clock is for human-facing stamps only. A process reload does not reuse a previous monotonic deadline.
+- Reload and cancel publish `INTERRUPTED_MANUAL_REVIEW`, drop pending auto-apply, and do not Resume, Start, Restart, reboot, or PUT.
+- One cooling-transaction owner. Concurrent ceiling requests coalesce to the newest pending value. Device emits are serialized and cannot overlap.
+- Absent, null, or malformed options cannot arm writes or automatic fan ceiling. `cooling_writes_only_when_paused` stays true. B1–B4 protections from 0.1.7 are unchanged.
+
 ## 0.1.7
 
 - Bounded cooling recovery state machine. After a gated pause → cooling PUT → settle, ResumeMining is issued **once**. 0 W / 0 TH/s during cooldown, preheat, startup, init, or APPLYING stays `RECOVERING` and is not `ERROR`.

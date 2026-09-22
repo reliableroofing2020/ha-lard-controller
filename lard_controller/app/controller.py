@@ -131,7 +131,7 @@ COOLING_STABILIZE_S = 5
 COOLING_RESUME_SETTLE_S = 20
 # Kept so 0.1.6 imports stay valid. 0.1.7 does not loop ResumeMining on 500.
 COOLING_RESUME_BACKOFF_S = (5, 10, 20)
-ADDON_VERSION = "0.1.7"
+ADDON_VERSION = "0.1.8"
 # Post-write settle and bounded recovery. 0 W during these windows is not ERROR.
 COOLING_SETTLE_S = 45
 TRANSITION_POLL_S = 10
@@ -143,6 +143,7 @@ TELEMETRY_FAILURES_BEFORE_ERROR = 3
 MAX_RESUME_RETRIES_PER_TXN = 1
 
 # Published health classification. Finer cooling phases stay on attributes.
+# INTERRUPTED_MANUAL_REVIEW is a reload/cancel hold: observe-only, no auto-resume.
 HEALTH_CLASSES = (
     "HASHING",
     "PAUSED",
@@ -150,27 +151,38 @@ HEALTH_CLASSES = (
     "RECOVERING",
     "UNKNOWN",
     "DEGRADED_NEEDS_ATTENTION",
+    "INTERRUPTED_MANUAL_REVIEW",
     "ERROR",
 )
-# 0 W / 0 TH/s is legitimate while Braiins reports one of these.
-LEGITIMATE_LIFECYCLE_TOKENS = (
-    "applying",
-    "cooldown",
-    "cooling_down",
-    "cooling down",
-    "preheating",
-    "preheat",
-    "startup",
-    "starting",
-    "init",
-    "initializing",
-    "autotuning",
-    "autotune",
-    "tuning",
-    "ramping",
-    "warming",
-    "warmup",
-    "booting",
+TERMINAL_HEALTH = frozenset({"DEGRADED_NEEDS_ATTENTION", "ERROR", "INTERRUPTED_MANUAL_REVIEW"})
+# In-flight cooling txn marker. Monotonic deadlines are NOT stored here.
+INFLIGHT_TXN_NAME = "cooling_txn_inflight.json"
+# 0 W / 0 TH/s extends the recovery window only for these exact tokens.
+# Match whole tokens, never substrings: "init" does not match "reinitializing".
+# "running", "paused", unknown strings, and bare watts are not in this set.
+LEGITIMATE_LIFECYCLE_TOKENS = frozenset(
+    {
+        "applying",
+        "cooldown",
+        "cooling_down",
+        "preheating",
+        "preheat",
+        "startup",
+        "starting",
+        "init",
+        "initializing",
+        "autotuning",
+        "autotune",
+        "tuning",
+        "tuner",
+        "ramping",
+        "ramp",
+        "quick_ramping",
+        "quickramping",
+        "warming",
+        "warmup",
+        "booting",
+    }
 )
 # Explicit miner faults. A telemetry timeout is not in this set.
 HARD_FAULT_TOKENS = (
@@ -217,15 +229,16 @@ TRANSITIONAL_PHASES = frozenset(
     }
 )
 
-# Device reboot / factory reset are denied. 0.1.7 cooling recovery does not
-# call Start or BOSminer Restart either: _cooling_escalate_start and
-# _cooling_escalate_restart are hard-disabled and issue no device command.
-# Full device reboot is never issued by this controller.
+# Structural deny before any HTTP. Device reboot, factory reset, Start, and
+# BOSminer Restart never leave this process. Cooling recovery has no
+# last-resort Start or Restart.
 BRAIINS_DENY_PATHS = (
     "/actions/reboot",
     "/system/reboot",
     "/actions/factory-reset",
     "/factory-reset",
+    "/actions/start",
+    "/actions/restart",
 )
 
 
@@ -1003,7 +1016,7 @@ class Braiins:
     def _call(self, method: str, path: str, body=None, timeout=30):
         lowered = "/" + path.lower().lstrip("/")
         if any(lowered.endswith(deny) or deny in lowered for deny in BRAIINS_DENY_PATHS):
-            raise RuntimeError(f"refused Braiins path {path} (device reboot/factory denied)")
+            raise RuntimeError(f"refused Braiins path {path} (structurally denied before HTTP)")
         # Serialize all Braiins I/O so a cooling transition cannot race other writers.
         with self._io_lock:
             return self._call_locked(method, path, body=body, timeout=timeout)
@@ -1050,11 +1063,11 @@ class Braiins:
         return self._call("PUT", "/api/v1/actions/resume")
 
     def start(self):
-        """PUT /api/v1/actions/start — start bosminer/mining. Not a device reboot."""
+        """Structurally denied. Raises in ``_call`` before any HTTP."""
         return self._call("PUT", "/api/v1/actions/start")
 
     def restart(self):
-        """PUT /api/v1/actions/restart — restart bosminer. Not /actions/reboot."""
+        """Structurally denied. Raises in ``_call`` before any HTTP."""
         return self._call("PUT", "/api/v1/actions/restart")
 
     def set_power(self, watt: int):
@@ -2057,6 +2070,15 @@ class Controller:
         self._recovery_limit_s = 0.0
         self._primary_recovery_started_ts = 0.0
         self._primary_recovery_deadline_ts = 0.0
+        self._txn_lock = threading.RLock()
+        self._emit_lock = threading.Lock()
+        self._emit_inflight: str | None = None
+        self._emit_overlap_violations = 0
+        self._txn_owner: int | None = None
+        self._owner_txn_id = ""
+        self._cancel_requested = False
+        self._reload_hold = False
+        self._emit_generation = 0
 
     def writes_allowed(self, enable_on: bool) -> bool:
         """Braiins writes require BOTH the add-on option and the HA gate."""
@@ -2198,7 +2220,7 @@ class Controller:
         return "PAUSED"
 
     def _anti_flap(self, candidate: str, reason: str, _solar_avg: float):
-        now = time.time()
+        now = self._wall()
         settled = self._settled_mode()
         if candidate != settled:
             elapsed = now - self.mode_entered_ts
@@ -2218,6 +2240,15 @@ class Controller:
         return candidate, reason
 
     def _now(self) -> float:
+        """Monotonic clock for txn deadlines, settle, retry, and budgets.
+
+        Wall clock is not used here. An NTP step must not stretch or compress
+        a recovery window. Tests replace this method with a fake clock.
+        """
+        return time.monotonic()
+
+    def _wall(self) -> float:
+        """Wall clock for human-facing stamps only. Never a txn deadline."""
         return time.time()
 
     def _sleep(self, seconds: float) -> None:
@@ -2234,6 +2265,240 @@ class Controller:
 
     def _board_wait_s(self) -> int:
         return max(60, int(self.settings.board_wait_seconds))
+
+    def _policy_denial(self) -> str | None:
+        """Shared write policy. None means the gates currently allow a write."""
+        if self._reload_hold or self._health_class == "INTERRUPTED_MANUAL_REVIEW":
+            return "interrupted_manual_review"
+        if not bool(self.settings.enable_writes):
+            return "enable_writes_false"
+        try:
+            enable_on = self.ha.state(ENT_ENABLE) == "on"
+        except Exception:
+            enable_on = False
+        if not enable_on:
+            return "master_gate_off"
+        try:
+            old_auto = self.ha.state(ENT_OLD_AUTO) == "on"
+        except Exception:
+            old_auto = True
+        if old_auto:
+            return "old_auto_on"
+        return None
+
+    def _authorize_device_write(self, action: str) -> str | None:
+        """Fail-closed reason, or None when this exact command may be emitted.
+
+        Called again immediately before the socket/client call. Cooling
+        commands also require the live transaction id, a non-terminal phase
+        that allows that command, fresh pause for a cooling PUT, and a retry
+        count still inside the per-transaction maximum.
+        """
+        if action in {"start", "restart", "reboot"}:
+            return "structural_deny"
+        policy = self._policy_denial()
+        if policy:
+            return policy
+        cooling = action in {
+            "pause",
+            "cooling_put",
+            "resume",
+            "failsafe_pause",
+            "failsafe_restore",
+        }
+        if self._health_class in TERMINAL_HEALTH or (
+            not self._cooling_txn_active and self._cooling_terminal_kind in {"degraded", "error"}
+        ):
+            return "terminal"
+        if cooling:
+            if not self._cooling_txn_active or self._txn_owner != threading.get_ident():
+                return "no_txn_owner"
+            if (
+                not self._owner_txn_id
+                or self._owner_txn_id != self._cooling_txn_id
+            ):
+                return "txn_id_mismatch"
+            if self._cancel_requested:
+                return "cancelled"
+            phase = self._cooling_phase
+            allowed = {
+                "pause": {"PAUSE_REQUESTED"},
+                "cooling_put": {"COOLING_APPLYING"},
+                "resume": {"RESUME_REQUESTED", "RETRY_RESUME_ONCE"},
+            }.get(action)
+            if allowed is not None and phase not in allowed:
+                return f"phase_{phase or 'none'}"
+            if action == "resume" and phase == "RETRY_RESUME_ONCE":
+                limit = int(self.settings.max_resume_retries_per_transaction or 0)
+                if not self.settings.resume_retry_enabled or self._resume_retries_used > limit:
+                    return "retry_limit"
+            obs = self._last_obs
+            if action == "pause" and obs is not None and obs.ok and self._hard_fault(obs):
+                return "hard_fault"
+            if action == "cooling_put":
+                if self._telemetry_freshness != "FRESH":
+                    return "stale"
+                if obs is None or not obs.ok:
+                    return "stale"
+                if self._hard_fault(obs):
+                    return "hard_fault"
+                if not self._cooling_paused_idle(obs):
+                    return "not_paused"
+                if obs.running and not self._cooling_paused_idle(obs):
+                    return "hashing"
+            return None
+        me = threading.get_ident()
+        if self._cooling_txn_active and self._txn_owner not in (None, me):
+            return "other_owner"
+        if self._cancel_requested and self._cooling_txn_active:
+            return "cancelled"
+        return None
+
+    def _deny_write(self, action: str, reason: str) -> None:
+        """Log a denial. A mid-transaction denial holds the miner for review."""
+        self._log_txn(f"write_denied action={action} reason={reason}")
+        self._emit("lard_write_denied", action=action, reason=reason)
+        self._last_cooling_result = f"denied_{reason}"
+        if self._cooling_txn_active:
+            self._cancel_requested = True
+            self._reload_hold = True
+            if self._health_class not in {"DEGRADED_NEEDS_ATTENTION", "ERROR"}:
+                self._health_class = "INTERRUPTED_MANUAL_REVIEW"
+                self._cooling_phase = "INTERRUPTED"
+            self.last_error = f"write_denied:{action}:{reason}"
+
+    def _call_device(self, action: str, fn):
+        """Re-check authorization immediately before a device-changing call.
+
+        Returns None when denied. The client function is not called.
+        ``_emit_lock`` serializes device calls so two commands cannot overlap.
+        """
+        reason = self._authorize_device_write(action)
+        if reason:
+            self._deny_write(action, reason)
+            return None
+        with self._emit_lock:
+            reason = self._authorize_device_write(action)
+            if reason:
+                self._deny_write(action, reason)
+                return None
+            if self._emit_inflight:
+                self._emit_overlap_violations += 1
+                self._deny_write(action, "overlap")
+                return None
+            self._emit_inflight = action
+            try:
+                return fn()
+            finally:
+                self._emit_inflight = None
+
+    def _device_tuple(self, action: str, fn):
+        result = self._call_device(action, fn)
+        if result is None:
+            return 0, {"denied": True}
+        return result
+
+    def _denied_body(self, body) -> bool:
+        return isinstance(body, dict) and bool(body.get("denied"))
+
+    def _claim_cooling_owner(self) -> None:
+        self._cooling_txn_active = True
+        self._txn_owner = threading.get_ident()
+        self._cancel_requested = False
+        self._write_inflight_marker()
+
+    def _release_cooling_owner(self) -> None:
+        self._cooling_txn_active = False
+        self._txn_owner = None
+        self._clear_inflight_marker()
+
+    def _inflight_path(self) -> Path:
+        return Path(self.settings.data_dir) / INFLIGHT_TXN_NAME
+
+    def _write_inflight_marker(self) -> None:
+        """Persist phase for reload detection. Do not store a monotonic deadline."""
+        payload = {
+            "txn_id": self._cooling_txn_id,
+            "phase": self._cooling_phase,
+            "wall_iso": utc_iso(),
+            "monotonic_deadline": None,
+            "resume_on_load": False,
+        }
+        try:
+            self._inflight_path().parent.mkdir(parents=True, exist_ok=True)
+            self._inflight_path().write_text(json.dumps(payload))
+        except Exception as e:
+            self.log(f"inflight marker skip: {e}")
+
+    def _clear_inflight_marker(self) -> None:
+        try:
+            self._inflight_path().unlink(missing_ok=True)
+        except Exception:
+            return
+
+    def cancel_cooling_transaction(self, reason: str = "cancel") -> None:
+        """Invalidate the in-flight txn. Do not Resume, Start, Restart, or PUT."""
+        with self._txn_lock:
+            self._cancel_requested = True
+            self._emit_generation += 1
+            self._cooling_txn_id = ""
+            self._reload_hold = True
+            self._health_class = "INTERRUPTED_MANUAL_REVIEW"
+            self._cooling_phase = "INTERRUPTED"
+            self.last_error = f"cancelled:{reason}"
+            self._log_txn(f"cancel reason={reason} — no resume, no start, no restart")
+            self._emit("lard_cooling_interrupted", reason=reason, source="cancel")
+
+    def reconcile_after_reload(self) -> str:
+        """New process. Drop in-memory deadlines. Never auto-resume a paused txn.
+
+        A monotonic timestamp from a previous process is not a deadline here.
+        Default posture after an interrupted marker is observe-only manual review.
+        """
+        raw = None
+        path = self._inflight_path()
+        try:
+            if path.is_file():
+                raw = json.loads(path.read_text())
+        except Exception:
+            raw = {"txn_id": "", "phase": "unreadable", "malformed": True}
+        self._clear_inflight_marker()
+        self._primary_recovery_started_ts = 0.0
+        self._primary_recovery_deadline_ts = 0.0
+        self._recovery_started_ts = 0.0
+        self._recovery_limit_s = 0.0
+        self._recovery_elapsed_s = 0.0
+        self._cooling_txn_active = False
+        self._cooling_txn_id = ""
+        self._owner_txn_id = ""
+        self._txn_owner = None
+        self._cancel_requested = False
+        self._pending_profile = None
+        self._pending_explicit = False
+        self._emit_generation += 1
+        if not raw:
+            self._reload_hold = False
+            return "clean"
+        prior = str(raw.get("txn_id") or "")
+        prior_phase = str(raw.get("phase") or "")
+        # Ignore any deadline number a crashed process might have written.
+        self._reload_hold = True
+        self._health_class = "INTERRUPTED_MANUAL_REVIEW"
+        self._cooling_phase = "INTERRUPTED"
+        self._cooling_terminal_kind = "interrupted"
+        self.last_error = "interrupted_manual_review"
+        self._lifecycle_reason = "reload_interrupted"
+        self._log_txn(
+            f"reload_interrupted prior_txn={prior} prior_phase={prior_phase} "
+            f"monotonic_deadline_ignored=1 — no auto resume"
+        )
+        self._emit(
+            "lard_cooling_interrupted",
+            reason="reload",
+            prior_txn=prior,
+            prior_phase=prior_phase,
+        )
+        return "interrupted"
 
     def _http_retry(self, fn, what: str):
         """Call fn() -> (code, body). Retry transient 5xx; fail only after backoff."""
@@ -2388,14 +2653,28 @@ class Controller:
         to_disable = [i for i in all_ids if i not in enabled_ids]
 
         if to_disable:
-            code, _ = self._http_retry(lambda: self.b.patch_boards(False, to_disable), "PATCH disable")
+            code, _ = self._http_retry(
+                lambda: self._device_tuple(
+                    "patch_boards", lambda: self.b.patch_boards(False, to_disable)
+                ),
+                "PATCH disable",
+            )
             self.log(f"PATCH disable {to_disable} http={code}")
+            if self._denied_body(_) or code == 0:
+                return False
             if code != 200:
                 self.last_error = f"board_disable_http_{code}"
                 return False
         if to_enable:
-            code, _ = self._http_retry(lambda: self.b.patch_boards(True, to_enable), "PATCH enable")
+            code, _ = self._http_retry(
+                lambda: self._device_tuple(
+                    "patch_boards", lambda: self.b.patch_boards(True, to_enable)
+                ),
+                "PATCH enable",
+            )
             self.log(f"PATCH enable {to_enable} http={code}")
+            if self._denied_body(_) or code == 0:
+                return False
             if code != 200:
                 self.last_error = f"board_enable_http_{code}"
                 return False
@@ -2414,7 +2693,7 @@ class Controller:
                 actual, code = [], 0
             self.log(f"board_poll expect={expect} actual={actual} http={code}")
             if code == 200 and self._boards_match(actual, expect):
-                self.last_board_change_ts = self._now()
+                self.last_board_change_ts = self._wall()
                 self.boards_str = ",".join(sorted(expect)) if expect else "none"
                 return True
             transient = is_http_5xx(code) or (
@@ -2438,11 +2717,15 @@ class Controller:
                 return True
         except Exception as e:
             self.log(f"power_target_read_skip: {e}")
-        code, _ = self._http_retry(
-            lambda: self.b.set_power(self.settings.power_target_w),
+        code, body = self._http_retry(
+            lambda: self._device_tuple(
+                "set_power", lambda: self.b.set_power(self.settings.power_target_w)
+            ),
             "power_target",
         )
         self.log(f"power_target http={code}")
+        if self._denied_body(body) or code == 0:
+            return False
         if code != 200:
             self.last_error = f"power_target_http_{code}"
             return False
@@ -2670,7 +2953,14 @@ class Controller:
         target = previous or self._unconstrained_cooling("PAUSED")
         try:
             extra = target.extra_auto()
-            code, body = self.b.set_cooling_auto(target.max_fan_speed, extra or None)
+            result = self._call_device(
+                "failsafe_restore",
+                lambda: self.b.set_cooling_auto(target.max_fan_speed, extra or None),
+            )
+            if result is None:
+                self.log("cooling restore denied")
+                return
+            code, body = result
             self.log(
                 f"cooling restore known-good max={target.max_fan_speed} "
                 f"http={code} body={_summarize_http_body(body)}"
@@ -2682,7 +2972,11 @@ class Controller:
 
     def _pause_safely(self) -> None:
         try:
-            code, _ = self.b.pause()
+            result = self._call_device("failsafe_pause", lambda: self.b.pause())
+            if result is None:
+                self.log("cooling fail-safe pause denied")
+                return
+            code, _ = result
             self.log(f"cooling fail-safe pause http={code}")
         except Exception as e:
             self.log(f"cooling fail-safe pause: {e}")
@@ -2762,6 +3056,8 @@ class Controller:
         self._recovery_interim_logged = False
         self._settle_complete = False
         self._resume_gate = ""
+        self._owner_txn_id = self._cooling_txn_id
+        self._write_inflight_marker()
         return self._cooling_txn_id
 
     def _emit(self, event_type: str, **extra) -> None:
@@ -2797,6 +3093,12 @@ class Controller:
             self._log_txn(f"event_skip {event_type}: {e}")
 
     def _set_cooling_phase(self, phase: str, *, health: str | None = None) -> None:
+        if self._health_class in TERMINAL_HEALTH and phase not in {
+            "DEGRADED_NEEDS_ATTENTION",
+            "ERROR",
+            "INTERRUPTED",
+        }:
+            return
         prev = self._cooling_phase
         self._cooling_phase = phase
         if phase in {"PAUSE_REQUESTED", "COOLING_APPLYING", "COOLING_SETTLING", "RESUME_REQUESTED"}:
@@ -2871,23 +3173,42 @@ class Controller:
         spaced = text
         return any(tok in blob or tok in spaced for tok in HARD_FAULT_TOKENS)
 
+    def _lifecycle_exact_tokens(self, obs: MinerObservation) -> set[str]:
+        """Whole words plus adjacent pairs. Substrings do not count."""
+        blob = self._lifecycle_text(obs)
+        words: list[str] = []
+        cur: list[str] = []
+        for ch in blob:
+            if ch.isalnum():
+                cur.append(ch)
+            elif cur:
+                words.append("".join(cur))
+                cur = []
+        if cur:
+            words.append("".join(cur))
+        tokens = set(words)
+        for left, right in zip(words, words[1:]):
+            tokens.add(f"{left}_{right}")
+        return tokens
+
     def _positive_lifecycle(self, obs: MinerObservation) -> bool:
-        """0 W is acceptable only while Braiins is in a real startup/cooldown phase."""
+        """Named transitional evidence only.
+
+        Allowed: exact tokens (APPLYING, cooldown, preheat, startup, init,
+        tuner, ramping, and the other names in ``LEGITIMATE_LIFECYCLE_TOKENS``)
+        and the parser's exact phase flags ``starting`` / ``preheating`` /
+        ``ramping``. Those flags are equality checks in ``parse_mining_state``,
+        not substrings.
+
+        Not positive: blanket ``running``, "not paused", unqualified watts,
+        unknown strings, ``miner_ready is False``, or ``init`` inside
+        ``reinitializing``. Hard fault wins over any token.
+        """
         if not obs.ok or self._hard_fault(obs):
             return False
         if obs.starting or obs.preheating or obs.ramping:
             return True
-        blob = self._lifecycle_text(obs)
-        if any(tok in blob for tok in LEGITIMATE_LIFECYCLE_TOKENS):
-            return True
-        # Left user_pause but not hashing yet (cooldown/preheat often looks like this).
-        if not obs.user_paused and not self._is_paused(obs) and not obs.running:
-            return True
-        if (obs.miner_ready is False or obs.not_started) and not obs.user_paused:
-            return True
-        if obs.running and not self._hard_fault(obs):
-            return True
-        return False
+        return bool(self._lifecycle_exact_tokens(obs) & LEGITIMATE_LIFECYCLE_TOKENS)
 
     def _expected_board_ids(self, mode: str) -> list[str]:
         """Configured topology. Never the length of a partial hashboards response."""
@@ -2958,7 +3279,7 @@ class Controller:
         self._telemetry_fail_streak = 0
         self._telemetry_fault = False
         self._telemetry_freshness = "FRESH"
-        self._telemetry_last_success_ts = self._now()
+        self._telemetry_last_success_ts = self._wall()
         if self.power_w is not None:
             self._last_good_power_w = self.power_w
         if self.boards_str:
@@ -3085,11 +3406,11 @@ class Controller:
         Confirmed PAUSED, DEGRADED, and ERROR are not automatic success.
         An in-flight transaction cannot apply its own pending.
         """
-        if self._cooling_txn_active:
+        if self._cooling_txn_active or self._reload_hold or self._cancel_requested:
             return False
-        if self._health_class in {"DEGRADED_NEEDS_ATTENTION", "ERROR"}:
+        if self._health_class in TERMINAL_HEALTH:
             return False
-        if self._cooling_terminal_kind in {"degraded", "error"}:
+        if self._cooling_terminal_kind in {"degraded", "error", "interrupted"}:
             return False
         return self._health_class == "HASHING"
 
@@ -3126,6 +3447,8 @@ class Controller:
         ``_cooling_txn_active``, release ownership, move the original maximum
         deadline, or count as success.
         """
+        if self._health_class in TERMINAL_HEALTH or self._cancel_requested:
+            return CoolingResult("interim")
         self._health_class = "RECOVERING"
         if self._cooling_phase not in {"RECOVERING", "RETRY_RESUME_ONCE"}:
             self._cooling_phase = "RECOVERING"
@@ -3210,6 +3533,9 @@ class Controller:
         deadline = self._now() + settle
         saw_not_clean = False
         while self._now() < deadline:
+            if self._cancel_requested or self._owner_txn_id != self._cooling_txn_id:
+                self._log_txn("settle_cancelled — no resume")
+                return "cancelled"
             obs = self.observe_miner()
             self._refresh_cooling_telemetry()
             kind = self._classify_settle_obs(obs)
@@ -3318,8 +3644,18 @@ class Controller:
                         f"boards_healthy={obs.boards_healthy} "
                         f"board_health_verified={obs.board_health_verified} "
                         f"interim=operational txn_active={self._cooling_txn_active} "
+                        f"positive={self._positive_lifecycle(obs)} "
                         f"primary_deadline_ts={self._primary_recovery_deadline_ts}"
                     )
+                    if self._cancel_requested or self._owner_txn_id != self._cooling_txn_id:
+                        self._log_txn(f"recovery_cancelled label={label}")
+                        return "exhausted"
+                    if elapsed >= float(expected_s) and not self._positive_lifecycle(obs):
+                        self._log_txn(
+                            f"recovery_no_progress label={label} elapsed={int(elapsed)} "
+                            f"(past expected, running without named lifecycle)"
+                        )
+                        return "exhausted"
                 else:
                     stable = 0
                     operational = 0
@@ -3346,26 +3682,39 @@ class Controller:
                         f"txn_active={self._cooling_txn_active} "
                         f"primary_deadline_ts={self._primary_recovery_deadline_ts}"
                     )
+                    if self._cancel_requested or self._owner_txn_id != self._cooling_txn_id:
+                        self._log_txn(f"recovery_cancelled label={label}")
+                        return "exhausted"
                     if elapsed >= float(expected_s) and not self._positive_lifecycle(obs):
                         self._log_txn(
                             f"recovery_no_progress label={label} elapsed={int(elapsed)} "
                             f"(past expected, lifecycle not positive)"
                         )
                         return "exhausted"
+            if self._cancel_requested or (
+                self._owner_txn_id and self._owner_txn_id != self._cooling_txn_id
+            ):
+                self._log_txn(f"recovery_cancelled label={label}")
+                return "exhausted"
             if self._now() >= deadline:
                 self._log_txn(f"recovery_limit label={label} elapsed={int(elapsed)}")
                 return "exhausted"
             self._sleep(poll)
 
-    def _resume_once(self, label: str) -> int:
+    def _resume_once(self, label: str) -> int | None:
         if label == "retry":
-            self._resume_retry_used = True
-            self._resume_retries_used += 1
             self._set_cooling_phase("RETRY_RESUME_ONCE", health="RECOVERING")
         else:
             self._set_cooling_phase("RESUME_REQUESTED", health="APPLYING")
+        result = self._call_device("resume", lambda: self.b.resume())
+        if result is None:
+            self._log_txn(f"resume_denied label={label}")
+            return None
+        if label == "retry":
+            self._resume_retry_used = True
+            self._resume_retries_used += 1
         try:
-            code, body = self.b.resume()
+            code, body = result
         except Exception as e:
             self._log_txn(f"resume_exc label={label} exc={e}")
             code, body = 500, {"exc": str(e)}
@@ -3492,9 +3841,21 @@ class Controller:
         fans = MIN_REQUIRED_FANS if n >= FAN_MAX_DEFAULT else None
         profile = CoolingProfile("EXPLICIT", n, None, fans)
         self._cooling_desired = profile
-        if self._cooling_txn_active:
-            self._defer_profile(profile, "txn_active", queue=True, explicit=True)
-            return False
+        with self._txn_lock:
+            if self._cooling_txn_active:
+                self._defer_profile(profile, "txn_active", queue=True, explicit=True)
+                return False
+            policy = self._policy_denial()
+            if policy or self._health_class in TERMINAL_HEALTH:
+                self._log_txn(
+                    f"write_denied action=request_cooling reason={policy or 'terminal'}"
+                )
+                self._emit(
+                    "lard_write_denied",
+                    action="request_cooling",
+                    reason=policy or "terminal",
+                )
+                return False
         mode = resume_mode or (
             self.desired_mode if self.desired_mode in RANK else self._settled_mode()
         )
@@ -3506,7 +3867,7 @@ class Controller:
         """Pause, confirm, resume once, then bounded recovery. No cooling PUT."""
         with self._braiins_mutex:
             self._assign_txn_id()
-            self._cooling_txn_active = True
+            self._claim_cooling_owner()
             self._cooling_transition_active = True
             try:
                 obs = self.observe_miner()
@@ -3518,7 +3879,7 @@ class Controller:
                     return False
                 return self._resume_after_cooling(self._cooling_applied, mode)
             finally:
-                self._cooling_txn_active = False
+                self._release_cooling_owner()
                 self._cooling_transition_active = False
 
     def _ensure_paused_idle_for_cooling(self) -> bool:
@@ -3554,8 +3915,12 @@ class Controller:
             else:
                 consecutive = 0
                 if not sent:
+                    result = self._call_device("pause", lambda: self.b.pause())
+                    if result is None:
+                        self._log_txn("pause_denied — fail closed")
+                        return False
                     try:
-                        code, body = self.b.pause()
+                        code, body = result
                     except Exception as e:
                         self._log_txn(f"pause_exc {e}")
                         code, body = 500, {"exc": str(e)}
@@ -3567,8 +3932,12 @@ class Controller:
                         return False
                     if is_http_5xx(code):
                         self._sleep(poll)
+                        result = self._call_device("pause", lambda: self.b.pause())
+                        if result is None:
+                            self._log_txn("pause_retry_denied — fail closed")
+                            return False
                         try:
-                            code, body = self.b.pause()
+                            code, body = result
                         except Exception as e:
                             code, body = 500, {"exc": str(e)}
                         self._log_txn(f"pause_retry http={code} body={_summarize_http_body(body)}")
@@ -3583,6 +3952,7 @@ class Controller:
 
     def _apply_cooling_while_paused(self, profile: CoolingProfile) -> bool:
         """PUT tagged auto envelope, confirm it stuck. Never while hashing."""
+        self._set_cooling_phase("COOLING_APPLYING", health="APPLYING")
         obs = self.observe_miner()
         paused_idle = self._cooling_paused_idle(obs)
         hashing = bool(obs.ok and obs.running and not paused_idle)
@@ -3597,11 +3967,17 @@ class Controller:
         before = self._readiness_snapshot("pre_cooling_put")
         try:
             code, body = self._http_retry(
-                lambda: self.b.set_cooling_auto(profile.max_fan_speed, extra or None),
+                lambda: self._device_tuple(
+                    "cooling_put",
+                    lambda: self.b.set_cooling_auto(profile.max_fan_speed, extra or None),
+                ),
                 "cooling_put",
             )
         except Exception as e:
             self._cooling_fail(f"cooling_put_exc:{e}", previous)
+            return False
+        if self._denied_body(body):
+            self._log_txn("cooling_put_denied — no resume")
             return False
         self._log_txn(
             f"cooling PUT profile={profile.name} max={profile.max_fan_speed} "
@@ -3766,6 +4142,9 @@ class Controller:
         settle_status = self._settle_after_cooling(profile)
         if settle_status == "hard_fault":
             return _txn_result("error")
+        if settle_status == "cancelled" or self._cancel_requested or self._reload_hold:
+            self._log_txn("primary resume withheld — settle cancelled")
+            return CoolingResult("denied")
         gate = self._gate_resume("primary")
         if gate == "hard_fault":
             return _txn_result("error")
@@ -3773,6 +4152,8 @@ class Controller:
             self._log_txn("primary resume withheld — telemetry not clean")
         else:
             code = self._resume_once("primary")
+            if code is None:
+                return CoolingResult("denied")
             if code != 200 and not is_http_5xx(code):
                 self._cooling_fail(f"cooling_resume_http_{code}", previous)
                 return _txn_result("error")
@@ -3790,6 +4171,9 @@ class Controller:
             return self._finish_degraded(mode, f"nonterminal_{outcome}")
         if outcome == "error":
             return _txn_result("error")
+        if self._cancel_requested or self._reload_hold or self._owner_txn_id != self._cooling_txn_id:
+            self._log_txn("retry withheld — txn cancelled or no longer owned")
+            return CoolingResult("denied")
         retries_allowed = int(self.settings.max_resume_retries_per_transaction or 0)
         if self.settings.resume_retry_enabled and self._resume_retries_used < retries_allowed:
             gate = self._gate_resume("retry")
@@ -3800,6 +4184,8 @@ class Controller:
             else:
                 self._log_txn("recovery_exhausted — one guarded resume retry")
                 code = self._resume_once("retry")
+                if code is None:
+                    return CoolingResult("denied")
                 if code != 200 and not is_http_5xx(code):
                     self._cooling_fail(f"cooling_resume_http_{code}", previous)
                     return _txn_result("error")
@@ -3837,19 +4223,21 @@ class Controller:
             self._log_txn("noop desired matches effective — no pause/resume")
             self._emit("lard_cooling_noop")
             self._close_cooling_terminal("noop")
+            self._clear_inflight_marker()
             return _txn_result("noop")
         refuse = self._cooling_refuse_reason(obs)
         if refuse == "hard_fault":
-            self._cooling_txn_active = True
+            self._claim_cooling_owner()
             try:
                 return self._fail_hard(obs)
             finally:
-                self._cooling_txn_active = False
+                self._release_cooling_owner()
         if refuse:
             self._defer_profile(profile, refuse, queue=True, explicit=True)
+            self._clear_inflight_marker()
             return _txn_result("refused")
         previous = self._cooling_applied
-        self._cooling_txn_active = True
+        self._claim_cooling_owner()
         self._cooling_transition_active = True
         try:
             if not self._ensure_paused_idle_for_cooling():
@@ -3870,7 +4258,7 @@ class Controller:
             self.log(f"COOLING exc {traceback.format_exc()}")
             return _txn_result("error")
         finally:
-            self._cooling_txn_active = False
+            self._release_cooling_owner()
             self._cooling_transition_active = False
 
     def _gated_cooling_transition(
@@ -4097,8 +4485,8 @@ class Controller:
     def _mark_confirmed(self, mode: str) -> None:
         self.actual_mode = mode
         self.confirmed_operational = mode
-        self.mode_entered_ts = self._now()
-        self.last_transition_ts = self._now()
+        self.mode_entered_ts = self._wall()
+        self.last_transition_ts = self._wall()
         self.last_error = ""
 
     def _mark_error(self, err: str) -> None:
@@ -4200,7 +4588,10 @@ class Controller:
             return False
         finally:
             self._cooling_transition_active = False
-            self._cooling_txn_active = False
+            if self._txn_owner == threading.get_ident():
+                self._release_cooling_owner()
+            else:
+                self._cooling_txn_active = False
 
     def _apply_mode_locked(
         self,
@@ -4216,8 +4607,13 @@ class Controller:
 
         if mode == "PAUSED":
             if not self._paused_confirmed(obs):
-                code, _ = self._http_retry(self.b.pause, "pause")
+                code, body = self._http_retry(
+                    lambda: self._device_tuple("mode_pause", lambda: self.b.pause()),
+                    "pause",
+                )
                 self.log(f"pause http={code}")
+                if self._denied_body(body) or code == 0:
+                    return False
                 if code != 200:
                     self._mark_error(f"pause_http_{code}")
                     return False
@@ -4231,8 +4627,13 @@ class Controller:
                 return False
             obs = self._observe_retrying()
             if not self._paused_confirmed(obs):
-                code, _ = self._http_retry(self.b.pause, "pause")
+                code, body = self._http_retry(
+                    lambda: self._device_tuple("mode_pause", lambda: self.b.pause()),
+                    "pause",
+                )
                 self.log(f"pause http={code}")
+                if self._denied_body(body) or code == 0:
+                    return False
                 if code != 200:
                     self._mark_error(f"pause_http_{code}")
                     return False
@@ -4247,14 +4648,16 @@ class Controller:
                 self._defer_profile(cooling_profile, "auto_fan_ceiling_disabled", queue=False)
             elif paused_cooling:
                 self._assign_txn_id()
-                self._cooling_txn_active = True
+                self._claim_cooling_owner()
                 self._set_applying_cooling()
                 if not self._ensure_paused_idle_for_cooling():
+                    self._release_cooling_owner()
                     return False
                 if not self._apply_cooling_while_paused(cooling_profile):
+                    self._release_cooling_owner()
                     return False
                 self._cooling_transition_active = False
-                self._cooling_txn_active = False
+                self._release_cooling_owner()
             self._mark_confirmed("PAUSED")
             return True
 
@@ -4270,11 +4673,13 @@ class Controller:
             cooling_needed = False
         if cooling_needed:
             self._assign_txn_id()
-            self._cooling_txn_active = True
+            self._claim_cooling_owner()
             self._set_applying_cooling()
             if not self._ensure_paused_idle_for_cooling():
+                self._release_cooling_owner()
                 return False
             if not self._apply_cooling_while_paused(cooling_profile):
+                self._release_cooling_owner()
                 return False
             cooling_changed = True
             self.actual_mode = "APPLYING"
@@ -4293,7 +4698,7 @@ class Controller:
         if needs_resume:
             if cooling_changed:
                 ok = self._resume_after_cooling(previous_cooling, mode)
-                self._cooling_txn_active = False
+                self._release_cooling_owner()
                 if self._auto_apply_pending_allowed():
                     pending = self._take_pending_if_terminal()
                     if pending is not None:
@@ -4309,8 +4714,13 @@ class Controller:
                     )
                 return ok
             else:
-                code, _ = self._http_retry(self.b.resume, "resume")
+                code, body = self._http_retry(
+                    lambda: self._device_tuple("mode_resume", lambda: self.b.resume()),
+                    "resume",
+                )
                 self.log(f"resume http={code}")
+                if self._denied_body(body) or code == 0:
+                    return False
                 if code != 200:
                     self._mark_error(f"resume_http_{code}")
                     return False
@@ -4621,6 +5031,19 @@ class Controller:
             self.publish(solar_avg, enable_on)
             return
 
+        if (
+            self._cooling_txn_active
+            or self._reload_hold
+            or self._health_class == "INTERRUPTED_MANUAL_REVIEW"
+        ):
+            self.acting = False
+            if self._reload_hold or self._health_class == "INTERRUPTED_MANUAL_REVIEW":
+                self.reason = f"{reason}|interrupted_manual_review"
+            else:
+                self.reason = f"{reason}|txn_busy"
+            self.publish(solar_avg, enable_on)
+            return
+
         self.acting = True
         try:
             obs = self.observe_miner()
@@ -4775,6 +5198,7 @@ def main() -> int:
     ha = HA(ha_bases(settings), token, log)
     braiins = Braiins(settings, log)
     ctrl = Controller(ha, braiins, settings, log, health)
+    ctrl.reconcile_after_reload()
     if token:
         ctrl.mqtt.discover_broker(token)
     ctrl.mqtt.start()
