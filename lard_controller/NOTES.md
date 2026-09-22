@@ -1,3 +1,24 @@
+# Operator Fahrenheit helpers (0.1.10)
+
+Addon version **0.1.10**. Base is `main` at 0.1.9 (PR #9). Operator cooling helpers are Fahrenheit. Braiins `PUT /api/v1/cooling/mode` bodies stay `degree_c`, converted with `round((f - 32) * 5 / 9)` only at that boundary. This does not enable writes, AUTO, or any live control. Do not merge from this note, do not deploy, do not set `enable_writes`, and do not turn on `switch.solar_miner_auto_enable`. The miner stays PAUSED.
+
+## Unit scheme
+
+Two layers, on purpose:
+
+- HA helpers are the operator unit, °F. The package keeps historical IDs `lard_cooling_target_c` / `_hot_c` / `_dangerous_c`; the numeric state is still °F. Optional IDs `lard_cooling_target_f` / `_hot_f` / `_dangerous_f` win when they have a number. The package does not create those aliases, so a new slider cannot hide the helpers the site is about to set to 158 / 174 / 203.
+- Add-on options `cooling_*_temperature_c` stay internal °C (defaults 70 / 85 / 95, schema 0–200). They are the fallback when no helper state exists. A stored 70 is not reread as 70 °F.
+
+Order is `target < hot < dangerous` in °F before convert. After convert, each integer must be in 0–200 and still strictly ordered. Package slider is 100–250 °F, mode slider, initials 158 / 185 / 203. A site on 70 / 79 / 95 °C sets helpers to 158 / 174 / 203 (174 °F → 79 °C). `enable_writes` stays false.
+
+## Tests
+
+`python3 -m unittest test_controller` from `lard_controller/app`.
+
+Covered: 158 °F helper → `degree_c` 70 in the PUT body; `_f` preferred over the `_c` id; `_c` id alone is still °F (158 / 174 / 203 → 70 / 79 / 95); order checked in °F; rounding collapse and OpenAPI range refuse; absent helpers use internal 70 / 85 / 95 °C rather than 70 °F; missing stubs seed 158 / 185 / 203 and do not invent `_f`; disarmed changes are not replayed; `enable_writes` default remains false.
+
+---
+
 # Cooling temperature-target ownership (0.1.9)
 
 Addon version **0.1.9**. Base is `main` at 0.1.8 (PR #8). This change flips cooling ownership to Braiins Automatic `target_temperature`. It does not enable writes, AUTO, or any live control. Do not merge from this note, do not deploy, do not set `enable_writes`, and do not turn on `switch.solar_miner_auto_enable`. The miner stays PAUSED.

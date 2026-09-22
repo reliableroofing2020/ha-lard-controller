@@ -49,7 +49,13 @@ ENT_COOLING_ONE_MAX = "input_number.lard_cooling_one_board_max_pct"
 ENT_COOLING_TWO_MAX = "input_number.lard_cooling_two_board_max_pct"
 ENT_COOLING_THREE_MAX = "input_number.lard_cooling_three_board_max_pct"
 ENT_COOLING_PAUSED_MAX = "input_number.lard_cooling_paused_max_pct"
-# Native Automatic cooling setpoints (°C). Missing → add-on options.
+# Operator cooling setpoints are Fahrenheit (same unit as chip_temp_f).
+# Preferred entity IDs:
+ENT_COOLING_TARGET_F = "input_number.lard_cooling_target_f"
+ENT_COOLING_HOT_F = "input_number.lard_cooling_hot_f"
+ENT_COOLING_DANGEROUS_F = "input_number.lard_cooling_dangerous_f"
+# Compatibility IDs. The "_c" suffix is historical and awkward: the numeric
+# state is °F, not °C. Used only when the matching _f entity has no number.
 ENT_COOLING_TARGET_C = "input_number.lard_cooling_target_c"
 ENT_COOLING_HOT_C = "input_number.lard_cooling_hot_c"
 ENT_COOLING_DANGEROUS_C = "input_number.lard_cooling_dangerous_c"
@@ -138,7 +144,7 @@ COOLING_STABILIZE_S = 5
 COOLING_RESUME_SETTLE_S = 20
 # Kept so 0.1.6 imports stay valid. 0.1.7 does not loop ResumeMining on 500.
 COOLING_RESUME_BACKOFF_S = (5, 10, 20)
-ADDON_VERSION = "0.1.9"
+ADDON_VERSION = "0.1.10"
 # Cooling policy. Native Automatic target is the control plane.
 # legacy_fan_ceiling keeps the 0.1.5–0.1.8 per-board max_fan_speed path,
 # still gated by auto_fan_ceiling_enabled (default false).
@@ -146,15 +152,31 @@ COOLING_POLICY_NATIVE = "native_auto_target"
 COOLING_POLICY_LEGACY = "legacy_fan_ceiling"
 COOLING_POLICIES = frozenset({COOLING_POLICY_NATIVE, COOLING_POLICY_LEGACY})
 # OpenAPI CoolingAutoMode: target/hot/dangerous are Temperature.degree_c,
-# allowed range 0–200 °C. These LARD operator defaults follow published
+# allowed range 0–200 °C. These LARD *add-on option* defaults follow published
 # Braiins Toolbox examples (target 70, hot 85, dangerous 95) for BOS ≥ 25.01.
-# They are not a claimed 26.09 firmware default. Model min/max/default live
-# on GET /api/v1/configuration/constraints and are observed, not invented.
+# They are internal Celsius fallbacks when no HA helper state exists.
+# They are not a claimed 26.09 firmware default, and they are not the
+# operator unit. Home Assistant helpers are Fahrenheit (see TEMP_F_*).
+# Model min/max/default live on GET /api/v1/configuration/constraints
+# and are observed, not invented.
 TEMP_C_MIN = 0
 TEMP_C_MAX = 200
 COOLING_TARGET_C = 70
 COOLING_HOT_C = 85
 COOLING_DANGEROUS_C = 95
+# Exact °F equivalents of the Toolbox Celsius defaults (integer °F).
+# 70 °C → 158 °F, 85 °C → 185 °F, 95 °C → 203 °F.
+# A site that was on 79 °C hot uses 174 °F (round-trips to 79 °C).
+COOLING_TARGET_F = 158
+COOLING_HOT_F = 185
+COOLING_DANGEROUS_F = 203
+# Helper slider band in the package (sensible mining temps). The converter
+# still accepts any °F that lands in OpenAPI 0–200 °C after rounding.
+# 32 °F = 0 °C and 392 °F = 200 °C are that full mapping.
+TEMP_F_OPENAPI_MIN = 32
+TEMP_F_OPENAPI_MAX = 392
+HELPER_F_SLIDER_MIN = 100
+HELPER_F_SLIDER_MAX = 250
 # Wide safety envelope. Braiins modulates PWM inside this band.
 # 0 min is omitted from the PUT (same as the legacy optional-min rule).
 COOLING_ENVELOPE_MIN_PCT = 0
@@ -305,6 +327,7 @@ class Settings:
     cooling_paused_min_fan_pct: int = 0
     # 0.1.7 recovery. auto_fan_ceiling_enabled stays false until a proof run.
     # 0.1.9: native_auto_target is the default policy. It does not arm writes.
+    # 0.1.10: these three options stay internal °C. HA helpers are °F.
     cooling_writes_only_when_paused: bool = True
     auto_fan_ceiling_enabled: bool = False
     cooling_policy: str = COOLING_POLICY_NATIVE
@@ -1378,15 +1401,6 @@ def clamp_fan_max_pct(val) -> int:
     return max(FAN_MAX_MIN, min(FAN_MAX_MAX, n))
 
 
-def clamp_temp_c(val, default: int = COOLING_TARGET_C) -> int:
-    """Integer °C inside the OpenAPI CoolingAutoMode range 0–200."""
-    try:
-        n = int(round(float(val)))
-    except (TypeError, ValueError):
-        n = int(default)
-    return max(TEMP_C_MIN, min(TEMP_C_MAX, n))
-
-
 def _degree_c(node) -> float | None:
     """Read Temperature.degree_c. Does not invent a value when the field is absent."""
     if not isinstance(node, dict):
@@ -1460,6 +1474,58 @@ def parse_configured_cooling(body) -> dict[str, Any]:
 
 def celsius_to_fahrenheit(c) -> float:
     return float(c) * 9.0 / 5.0 + 32.0
+
+
+def fahrenheit_to_celsius_int(f) -> int:
+    """Integer °C for Braiins Temperature.degree_c.
+
+    c = round((f - 32) * 5 / 9). Called only when a PUT body (or the
+    desired profile that becomes that body) is built. Helper state stays °F.
+    """
+    return int(round((float(f) - 32.0) * 5.0 / 9.0))
+
+
+def parse_helper_temp(raw) -> float | None:
+    """Numeric helper state, or None when missing / unreadable.
+
+    Does not substitute a default and does not convert units.
+    """
+    if raw in (None, "unknown", "unavailable", ""):
+        return None
+    if isinstance(raw, bool):
+        return None
+    try:
+        n = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if n != n or n in (float("inf"), float("-inf")):
+        return None
+    return n
+
+
+def operator_setpoints_to_degree_c(
+    target_f, hot_f, dangerous_f
+) -> tuple[int, int, int] | None:
+    """Validate target < hot < dangerous in °F, then convert for Braiins.
+
+    Returns integer degree_c values, or None to refuse the PUT.
+    After conversion each value must sit in OpenAPI 0–200 and stay strictly
+    ordered, so two Fahrenheit steps cannot collapse onto the same integer.
+    """
+    try:
+        target_f = float(target_f)
+        hot_f = float(hot_f)
+        dangerous_f = float(dangerous_f)
+    except (TypeError, ValueError):
+        return None
+    if not (target_f < hot_f < dangerous_f):
+        return None
+    target_c = fahrenheit_to_celsius_int(target_f)
+    hot_c = fahrenheit_to_celsius_int(hot_f)
+    danger_c = fahrenheit_to_celsius_int(dangerous_f)
+    if not (TEMP_C_MIN <= target_c < hot_c < danger_c <= TEMP_C_MAX):
+        return None
+    return target_c, hot_c, danger_c
 
 
 def parse_cooling_telemetry(state) -> dict[str, Any]:
@@ -2957,65 +3023,89 @@ class Controller:
         self._install_fan_max_package()
 
     def ensure_cooling_target_helpers(self) -> None:
-        """State stubs for native °C setpoints. REST cannot create a real input_number.
+        """State stubs for native setpoints. REST cannot create a real input_number.
 
-        This writes Home Assistant state only. It does not call the miner.
+        Operator unit is °F. The compatibility entity IDs still end in _c;
+        the stub number is Fahrenheit (158 from a 70 °C option, not 70).
+        Preferred *_f entities are not stubbed: a phantom _f state would
+        hide a real _c helper. This writes Home Assistant state only.
+        It does not call the miner.
         """
         specs = (
             (
                 ENT_COOLING_TARGET_C,
-                self.settings.cooling_target_temperature_c,
-                "LARD Cooling Target °C",
+                int(round(celsius_to_fahrenheit(self.settings.cooling_target_temperature_c))),
+                "LARD Cooling Target °F",
                 "mdi:thermometer",
+                "°F",
+                HELPER_F_SLIDER_MIN,
+                HELPER_F_SLIDER_MAX,
+                "slider",
             ),
             (
                 ENT_COOLING_HOT_C,
-                self.settings.cooling_hot_temperature_c,
-                "LARD Cooling Hot °C",
+                int(round(celsius_to_fahrenheit(self.settings.cooling_hot_temperature_c))),
+                "LARD Cooling Hot °F",
                 "mdi:thermometer-high",
+                "°F",
+                HELPER_F_SLIDER_MIN,
+                HELPER_F_SLIDER_MAX,
+                "slider",
             ),
             (
                 ENT_COOLING_DANGEROUS_C,
-                self.settings.cooling_dangerous_temperature_c,
-                "LARD Cooling Dangerous °C",
+                int(round(celsius_to_fahrenheit(self.settings.cooling_dangerous_temperature_c))),
+                "LARD Cooling Dangerous °F",
                 "mdi:thermometer-alert",
+                "°F",
+                HELPER_F_SLIDER_MIN,
+                HELPER_F_SLIDER_MAX,
+                "slider",
             ),
             (
                 ENT_COOLING_ENVELOPE_MIN,
                 self.settings.cooling_envelope_min_fan_pct,
                 "LARD Cooling Envelope Min %",
                 "mdi:fan",
+                "%",
+                FAN_MAX_MIN,
+                FAN_MAX_MAX,
+                "box",
             ),
             (
                 ENT_COOLING_ENVELOPE_MAX,
                 self.settings.cooling_envelope_max_fan_pct,
                 "LARD Cooling Envelope Max %",
                 "mdi:fan",
+                "%",
+                FAN_MAX_MIN,
+                FAN_MAX_MAX,
+                "box",
             ),
         )
-        for entity_id, initial, name, icon in specs:
+        for entity_id, initial, name, icon, unit, lo, hi, mode in specs:
             try:
                 raw = self.ha.state(entity_id)
                 if raw not in (None, "unknown", "unavailable", ""):
                     continue
-                unit = "°C" if entity_id.endswith("_c") else "%"
-                hi = TEMP_C_MAX if unit == "°C" else FAN_MAX_MAX
-                self.ha.set_state(
-                    entity_id,
-                    int(initial),
-                    {
-                        "friendly_name": name,
-                        "min": 0,
-                        "max": hi,
-                        "step": 1,
-                        "mode": "box",
-                        "unit_of_measurement": unit,
-                        "icon": icon,
-                        "source": "lard_controller",
-                    },
-                )
+                attrs = {
+                    "friendly_name": name,
+                    "min": lo,
+                    "max": hi,
+                    "step": 1,
+                    "mode": mode,
+                    "unit_of_measurement": unit,
+                    "icon": icon,
+                    "source": "lard_controller",
+                }
+                if unit == "°F":
+                    attrs["operator_unit"] = "°F"
+                    attrs["entity_id_note"] = (
+                        "historical _c suffix; numeric state is Fahrenheit"
+                    )
+                self.ha.set_state(entity_id, int(initial), attrs)
                 self.log(
-                    f"ensured {entity_id}={initial} via HA state API "
+                    f"ensured {entity_id}={initial} {unit} via HA state API "
                     "(install ha_packages/lard_cooling_target.yaml for real helpers)"
                 )
             except Exception as e:
@@ -3135,27 +3225,56 @@ class Controller:
         """True unless the operator explicitly selected the legacy fan-ceiling policy."""
         return str(self.settings.cooling_policy).strip().lower() != COOLING_POLICY_LEGACY
 
-    def _read_temp_entity(self, entity_id: str, default: int) -> int:
-        raw = self.ha.state(entity_id)
-        if raw in (None, "unknown", "unavailable", ""):
-            return clamp_temp_c(default, default)
-        return clamp_temp_c(raw, default)
+    def _operator_temp_f(self, f_entity: str, c_entity: str, default_c: int) -> float | None:
+        """One setpoint in operator °F.
+
+        Prefer the _f helper. If it has no number, use the historical _c
+        entity id — that suffix is compatibility only; the state is still °F.
+        If neither helper has a number, express the add-on option (internal
+        °C) as °F so the order check uses one unit. The option is not
+        reinterpreted as Fahrenheit.
+        """
+        for entity_id in (f_entity, c_entity):
+            parsed = parse_helper_temp(self.ha.state(entity_id))
+            if parsed is not None:
+                return parsed
+        try:
+            return celsius_to_fahrenheit(default_c)
+        except (TypeError, ValueError):
+            return None
 
     def temperature_setpoints(self) -> tuple[int, int, int] | None:
-        """target < hot < dangerous, each inside OpenAPI 0–200 °C. Else refuse."""
-        target = self._read_temp_entity(
-            ENT_COOLING_TARGET_C, self.settings.cooling_target_temperature_c
+        """Operator °F setpoints converted to integer degree_c for the PUT.
+
+        Order is checked in °F first. Conversion is
+        c = round((f - 32) * 5 / 9). OpenAPI 0–200 °C is checked after that,
+        and the converted integers must stay strictly ordered. Else refuse.
+        """
+        target_f = self._operator_temp_f(
+            ENT_COOLING_TARGET_F,
+            ENT_COOLING_TARGET_C,
+            self.settings.cooling_target_temperature_c,
         )
-        hot = self._read_temp_entity(ENT_COOLING_HOT_C, self.settings.cooling_hot_temperature_c)
-        danger = self._read_temp_entity(
-            ENT_COOLING_DANGEROUS_C, self.settings.cooling_dangerous_temperature_c
+        hot_f = self._operator_temp_f(
+            ENT_COOLING_HOT_F,
+            ENT_COOLING_HOT_C,
+            self.settings.cooling_hot_temperature_c,
         )
-        if not (TEMP_C_MIN <= target < hot < danger <= TEMP_C_MAX):
+        danger_f = self._operator_temp_f(
+            ENT_COOLING_DANGEROUS_F,
+            ENT_COOLING_DANGEROUS_C,
+            self.settings.cooling_dangerous_temperature_c,
+        )
+        if target_f is None or hot_f is None or danger_f is None:
             return None
-        return target, hot, danger
+        return operator_setpoints_to_degree_c(target_f, hot_f, danger_f)
 
     def desired_temperature_policy(self) -> CoolingProfile | None:
-        """Automatic cooling setpoint plus a wide fan envelope. Not per-board fan max."""
+        """Automatic cooling setpoint plus a wide fan envelope. Not per-board fan max.
+
+        Temperatures on the returned profile are already integer °C for the
+        PUT body. Helpers were read as °F and converted here.
+        """
         temps = self.temperature_setpoints()
         if temps is None:
             self._temperature_policy_valid = False
@@ -3208,7 +3327,9 @@ class Controller:
             if not self._temperature_policy_invalid_logged:
                 self.log(
                     "temperature policy invalid "
-                    "(need 0 ≤ target < hot < dangerous ≤ 200 and max_fan > min_fan) "
+                    "(need target < hot < dangerous in °F, then "
+                    "degree_c = round((f - 32) * 5 / 9) inside 0–200 "
+                    "and still strictly ordered, and max_fan > min_fan) "
                     "— no cooling PUT"
                 )
                 self._temperature_policy_invalid_logged = True
@@ -5753,6 +5874,7 @@ def main() -> int:
         f"cooling_resume_settle={settings.cooling_resume_settle_seconds}s "
         f"auto_fan_ceiling={settings.auto_fan_ceiling_enabled} "
         f"cooling_policy={settings.cooling_policy} "
+        f"helper_unit=F option_unit=C "
         f"target_c={settings.cooling_target_temperature_c}/"
         f"hot_c={settings.cooling_hot_temperature_c}/"
         f"dangerous_c={settings.cooling_dangerous_temperature_c} "

@@ -1,5 +1,5 @@
 name: LARD Controller
-version: "0.1.9"
+version: "0.1.10"
 slug: lard_controller
 description: >
   Supervises the LARD board-priority Braiins actuator. Observe-and-publish
@@ -70,6 +70,9 @@ options:
   cooling_writes_only_when_paused: true
   auto_fan_ceiling_enabled: false
   cooling_policy: native_auto_target
+  # Internal Celsius fallbacks when no HA helper state exists.
+  # Operator helpers are Fahrenheit. Do not store °F in these keys.
+  # A stored 70 must stay 70 °C, not be reread as 70 °F.
   cooling_target_temperature_c: 70
   cooling_hot_temperature_c: 85
   cooling_dangerous_temperature_c: 95

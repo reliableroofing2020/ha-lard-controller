@@ -17,14 +17,22 @@ from controller import (
     API_5XX_BACKOFF_S,
     CHIP_ABORT_F,
     COOLING_DANGEROUS_C,
+    COOLING_DANGEROUS_F,
     COOLING_HOT_C,
+    COOLING_HOT_F,
     COOLING_IDLE_POWER_W,
     COOLING_POLICY_LEGACY,
     COOLING_POLICY_NATIVE,
     COOLING_TARGET_C,
+    COOLING_TARGET_F,
+    TEMP_F_OPENAPI_MAX,
+    TEMP_F_OPENAPI_MIN,
     ENT_COOLING_DANGEROUS_C,
+    ENT_COOLING_DANGEROUS_F,
     ENT_COOLING_HOT_C,
+    ENT_COOLING_HOT_F,
     ENT_COOLING_TARGET_C,
+    ENT_COOLING_TARGET_F,
     ENT_ENABLE,
     ENT_FAN_MAX,
     ENT_FAULT,
@@ -46,6 +54,8 @@ from controller import (
     metric_trend_rising,
     norm_board_id,
     parse_board_health_payload,
+    fahrenheit_to_celsius_int,
+    operator_setpoints_to_degree_c,
     parse_configured_cooling,
     parse_cooling_telemetry,
     parse_mining_state,
@@ -2912,7 +2922,10 @@ class WriteEnableHardeningTests(unittest.TestCase):
 
 
 class TemperatureTargetPolicyTests(unittest.TestCase):
-    """0.1.9: Braiins Automatic target owns PWM. Fan-ceiling chasing stays legacy."""
+    """0.1.10: operator helpers are °F. Braiins PUT bodies stay degree_c.
+
+    Fan-ceiling chasing stays legacy. Add-on temperature options stay internal °C.
+    """
 
     def _native(self, braiins, mode="ONE_BOARD", enable_writes=True):
         ctrl = make_controller(braiins, mode, enable_writes=enable_writes)
@@ -2932,8 +2945,118 @@ class TemperatureTargetPolicyTests(unittest.TestCase):
         self.assertEqual(fresh.cooling_dangerous_temperature_c, COOLING_DANGEROUS_C)
         self.assertEqual(fresh.cooling_envelope_min_fan_pct, 0)
         self.assertEqual(fresh.cooling_envelope_max_fan_pct, 100)
-        self.assertEqual(ADDON_VERSION, "0.1.9")
+        self.assertEqual(ADDON_VERSION, "0.1.10")
         self.assertEqual((COOLING_TARGET_C, COOLING_HOT_C, COOLING_DANGEROUS_C), (70, 85, 95))
+        self.assertEqual((COOLING_TARGET_F, COOLING_HOT_F, COOLING_DANGEROUS_F), (158, 185, 203))
+        self.assertEqual(fahrenheit_to_celsius_int(158), 70)
+        self.assertEqual(fahrenheit_to_celsius_int(185), 85)
+        self.assertEqual(fahrenheit_to_celsius_int(203), 95)
+        self.assertEqual(fahrenheit_to_celsius_int(174), 79)
+        self.assertEqual(fahrenheit_to_celsius_int(TEMP_F_OPENAPI_MIN), 0)
+        self.assertEqual(fahrenheit_to_celsius_int(TEMP_F_OPENAPI_MAX), 200)
+
+    def test_absent_helpers_use_internal_celsius_not_fahrenheit(self):
+        """Fail closed: a stored option of 70 °C must not be read as 70 °F."""
+        b = paused_one_board()
+        ctrl = self._native(b, enable_writes=False)
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertEqual(ctrl.temperature_setpoints(), (70, 85, 95))
+        profile = ctrl.desired_temperature_policy()
+        self.assertIsNotNone(profile)
+        body = {"auto": {"max_fan_speed": profile.max_fan_speed, **profile.extra_auto()}}
+        self.assertEqual(body["auto"]["target_temperature"], {"degree_c": 70})
+        self.assertEqual(body["auto"]["hot_temperature"], {"degree_c": 85})
+        self.assertEqual(body["auto"]["dangerous_temperature"], {"degree_c": 95})
+        ctrl.tick()
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertEqual(b.write_names(), [])
+
+    def test_fahrenheit_helper_158_puts_degree_c_70(self):
+        b = running_boards(["1"])
+        ctrl = self._native(b)
+        ctrl.settings.auto_fan_ceiling_enabled = False
+        ctrl.ha._states[ENT_COOLING_TARGET_F] = "149"
+        ctrl.tick()
+        self.assertEqual(b.cooling_puts(), [])
+        ctrl.ha._states[ENT_COOLING_TARGET_F] = "158"
+        ctrl.ha._states[ENT_COOLING_HOT_F] = "185"
+        ctrl.ha._states[ENT_COOLING_DANGEROUS_F] = "203"
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "100"
+        ctrl.tick()
+        self.assertEqual(len(b.cooling_puts()), 1)
+        auto = (b.last_cooling_body or {}).get("auto") or {}
+        self.assertEqual(auto.get("target_temperature"), {"degree_c": 70})
+        self.assertEqual(auto.get("hot_temperature"), {"degree_c": 85})
+        self.assertEqual(auto.get("dangerous_temperature"), {"degree_c": 95})
+        self.assertNotIn("manual", b.last_cooling_body or {})
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertFalse(Settings().enable_writes)
+
+    def test_compatibility_c_id_is_fahrenheit_when_f_entity_absent(self):
+        b = paused_one_board()
+        ctrl = self._native(b, enable_writes=False)
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "158"
+        ctrl.ha._states[ENT_COOLING_HOT_C] = "174"
+        ctrl.ha._states[ENT_COOLING_DANGEROUS_C] = "203"
+        self.assertEqual(ctrl.temperature_setpoints(), (70, 79, 95))
+        profile = ctrl.desired_temperature_policy()
+        body = {"auto": {"max_fan_speed": profile.max_fan_speed, **profile.extra_auto()}}
+        self.assertEqual(body["auto"]["target_temperature"], {"degree_c": 70})
+        self.assertEqual(body["auto"]["hot_temperature"], {"degree_c": 79})
+        self.assertEqual(body["auto"]["dangerous_temperature"], {"degree_c": 95})
+        self.assertFalse(ctrl.settings.enable_writes)
+
+    def test_ordering_checked_in_fahrenheit_before_convert(self):
+        b = running_boards(["1"])
+        ctrl = self._native(b)
+        ctrl.tick()
+        ctrl.ha._states[ENT_COOLING_TARGET_F] = "190"
+        ctrl.ha._states[ENT_COOLING_HOT_F] = "180"
+        ctrl.ha._states[ENT_COOLING_DANGEROUS_F] = "203"
+        self.assertIsNone(ctrl.temperature_setpoints())
+        self.assertIsNone(operator_setpoints_to_degree_c(190, 180, 203))
+        self.assertFalse(ctrl.request_temperature_policy())
+        ctrl.tick()
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+
+    def test_rounding_collapse_and_openapi_range_refuse(self):
+        b = paused_one_board()
+        ctrl = self._native(b, enable_writes=False)
+        ctrl.ha._states[ENT_COOLING_TARGET_F] = "159"
+        ctrl.ha._states[ENT_COOLING_HOT_F] = "160"
+        ctrl.ha._states[ENT_COOLING_DANGEROUS_F] = "203"
+        self.assertEqual(fahrenheit_to_celsius_int(159), fahrenheit_to_celsius_int(160))
+        self.assertIsNone(ctrl.temperature_setpoints())
+        ctrl.ha._states[ENT_COOLING_TARGET_F] = "31"
+        ctrl.ha._states[ENT_COOLING_HOT_F] = "185"
+        ctrl.ha._states[ENT_COOLING_DANGEROUS_F] = "203"
+        self.assertLess(fahrenheit_to_celsius_int(31), 0)
+        self.assertIsNone(ctrl.temperature_setpoints())
+        ctrl.ha._states[ENT_COOLING_TARGET_F] = "158"
+        ctrl.ha._states[ENT_COOLING_HOT_F] = "185"
+        ctrl.ha._states[ENT_COOLING_DANGEROUS_F] = "400"
+        self.assertGreater(fahrenheit_to_celsius_int(400), 200)
+        self.assertIsNone(ctrl.temperature_setpoints())
+        self.assertFalse(ctrl.request_temperature_policy())
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertFalse(ctrl.settings.enable_writes)
+
+    def test_missing_helper_stub_is_fahrenheit(self):
+        b = paused_one_board()
+        ctrl = self._native(b, enable_writes=False)
+        ctrl.ensure_cooling_target_helpers()
+        self.assertEqual(ctrl.ha.state(ENT_COOLING_TARGET_C), 158)
+        self.assertEqual(ctrl.ha.state(ENT_COOLING_HOT_C), 185)
+        self.assertEqual(ctrl.ha.state(ENT_COOLING_DANGEROUS_C), 203)
+        self.assertIsNone(ctrl.ha.state(ENT_COOLING_TARGET_F))
+        self.assertEqual(ctrl.temperature_setpoints(), (70, 85, 95))
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "174"
+        ctrl.ensure_cooling_target_helpers()
+        self.assertEqual(ctrl.ha.state(ENT_COOLING_TARGET_C), "174")
+        self.assertFalse(ctrl.settings.enable_writes)
 
     def test_policy_prefers_target_temperature_across_board_modes(self):
         b = paused_one_board()
@@ -3003,7 +3126,7 @@ class TemperatureTargetPolicyTests(unittest.TestCase):
         ctrl.settings.auto_fan_ceiling_enabled = False
         ctrl.tick()
         self.assertEqual(b.cooling_puts(), [])
-        ctrl.ha._states[ENT_COOLING_TARGET_C] = "65"
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "149"
         ctrl.tick()
         self.assertEqual(len(b.cooling_puts()), 1)
         auto = (b.last_cooling_body or {}).get("auto") or {}
@@ -3025,13 +3148,13 @@ class TemperatureTargetPolicyTests(unittest.TestCase):
         b = running_boards(["1"])
         ctrl = self._native(b, enable_writes=False)
         ctrl.tick()
-        ctrl.ha._states[ENT_COOLING_TARGET_C] = "65"
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "149"
         ctrl.tick()
         self.assertEqual(b.write_names(), [])
         ctrl.settings.enable_writes = True
         ctrl.tick()
         self.assertEqual(b.cooling_puts(), [])
-        ctrl.ha._states[ENT_COOLING_TARGET_C] = "66"
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "151"
         ctrl.tick()
         self.assertEqual(len(b.cooling_puts()), 1)
         auto = (b.last_cooling_body or {}).get("auto") or {}
@@ -3043,8 +3166,8 @@ class TemperatureTargetPolicyTests(unittest.TestCase):
         b = running_boards(["1"])
         ctrl = self._native(b)
         ctrl.tick()
-        ctrl.ha._states[ENT_COOLING_TARGET_C] = "80"
-        ctrl.ha._states[ENT_COOLING_HOT_C] = "70"
+        ctrl.ha._states[ENT_COOLING_TARGET_F] = "200"
+        ctrl.ha._states[ENT_COOLING_HOT_F] = "180"
         ctrl.tick()
         self.assertFalse(ctrl.request_temperature_policy())
         self.assertEqual(b.cooling_puts(), [])

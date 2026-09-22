@@ -1,6 +1,8 @@
-# Cooling temperature target (0.1.9)
+# Cooling temperature target (0.1.10)
 
-Braiins OS owns continuous fan PWM. Home Assistant writes cooling policy rarely. This note is the ownership contract for LARD Controller 0.1.9. It does not arm writes, AUTO, or any live miner command.
+Braiins OS owns continuous fan PWM. Home Assistant writes cooling policy rarely. This note is the ownership contract for LARD Controller 0.1.10. It does not arm writes, AUTO, or any live miner command.
+
+Operator setpoints are Fahrenheit, the same unit as the chip temperature sensors. Braiins REST still requires `{"degree_c": number}`. LARD converts only when it builds the cooling-mode PUT.
 
 ## What the miner actually accepts
 
@@ -51,8 +53,8 @@ A partial auto PUT on this site has been observed to null fields that were omitt
 
 Example, after a future window where writes are intentionally armed. This repository change does not arm them.
 
-1. Sunrise automation sets `input_number.lard_cooling_target_c` (for example 70). LARD sees one operator change.
-2. LARD runs the existing pause → confirm (two idle polls) → `PUT /api/v1/cooling/mode` → settle → one ResumeMining → bounded recovery. The body is `{"auto":{"target_temperature":{"degree_c":70},"hot_temperature":{"degree_c":85},"dangerous_temperature":{"degree_c":95},"max_fan_speed":100,...}}`.
+1. Sunrise automation sets `input_number.lard_cooling_target_c` (for example 158 °F). The `_c` suffix is historical; the number is Fahrenheit. An optional `input_number.lard_cooling_target_f` wins when it has a numeric state. LARD sees one operator change.
+2. LARD runs the existing pause → confirm (two idle polls) → `PUT /api/v1/cooling/mode` → settle → one ResumeMining → bounded recovery. 158 °F converts with `round((158 - 32) * 5 / 9)` = 70. The body is `{"auto":{"target_temperature":{"degree_c":70},"hot_temperature":{"degree_c":85},"dangerous_temperature":{"degree_c":95},"max_fan_speed":100,...}}` when hot and dangerous are 185 °F and 203 °F.
 3. For the rest of the day Braiins fans toward 70 °C. HA only watches chip temp, RPM, and PWM. It does not PUT because the sun moved or a board-count mode changed.
 4. Overnight the same helper moves to a different target. That is another single gated write, subject to `cooling_dwell_seconds` (default 600) so a flapping helper cannot thrash pause/resume.
 5. Mining mode and reserve pauses stay on the board-priority state machine. They are not PWM tweaks and they do not carry a cooling PUT just because the board count changed.
@@ -72,7 +74,7 @@ Every cooling-mode PUT still goes through:
 - at most one resume retry; Start, Restart, and reboot stay denied
 - pending auto-apply only after `HASHING` (not after `DEGRADED` / `ERROR`)
 
-Unordered setpoints (`target < hot < dangerous` inside 0–200) or `max_fan_speed <= min_fan_speed` refuse the PUT.
+Unordered setpoints refuse the PUT. The check is `target < hot < dangerous` in °F **before** conversion. After `c = round((f - 32) * 5 / 9)`, each integer must sit in OpenAPI 0–200 °C and stay strictly ordered (159 °F and 160 °F both round to 71 °C, so that pair is refused). `max_fan_speed <= min_fan_speed` also refuses the PUT.
 
 Thermal abort (`CHIP_ABORT_F` 180) still opens the fan envelope to 100% through that same gated sequence. On the native path it keeps the temperature fields in the body so the abort does not clear the target.
 
@@ -84,20 +86,27 @@ Thermal abort (`CHIP_ABORT_F` 180) still opens the fan envelope to 100% through 
 | `auto_fan_ceiling_enabled` | false |
 | `cooling_writes_only_when_paused` | true |
 | `cooling_policy` | `native_auto_target` |
-| `cooling_target_temperature_c` | 70 |
-| `cooling_hot_temperature_c` | 85 |
-| `cooling_dangerous_temperature_c` | 95 |
+| `cooling_target_temperature_c` | 70 °C internal |
+| `cooling_hot_temperature_c` | 85 °C internal |
+| `cooling_dangerous_temperature_c` | 95 °C internal |
 | `cooling_envelope_min_fan_pct` | 0 (omitted) |
 | `cooling_envelope_max_fan_pct` | 100 |
 
-70 / 85 / 95 are the published Braiins Toolbox examples for `--target-temp`, `--hot-temp`, and `--dangerous-temp` (BOS ≥ 25.01, range 0–200). Academy also suggests about 10 °C between the three levels. They are **LARD operator defaults**, not a claim that 26.09 on this S19j Pro ships those numbers. Model min/max/default belong to `GET /api/v1/configuration/constraints` and are observed, not overwritten by a guessed firmware constant.
+70 / 85 / 95 are the published Braiins Toolbox examples for `--target-temp`, `--hot-temp`, and `--dangerous-temp` (BOS ≥ 25.01, range 0–200). Academy also suggests about 10 °C between the three levels. They are **internal add-on option defaults**, not the operator unit, and not a claim that 26.09 on this S19j Pro ships those numbers. Model min/max/default belong to `GET /api/v1/configuration/constraints` and are observed, not overwritten by a guessed firmware constant.
 
-Helpers (package `ha_packages/lard_cooling_target.yaml`):
+The options stay Celsius on purpose. An installed add-on already has 70 / 85 / 95 stored. Reading those numbers as Fahrenheit would PUT about 21 °C. When no helper has a numeric state, LARD converts the option to °F only for the order check, then back to the same integer °C for the body.
 
-- `input_number.lard_cooling_target_c` — °C, 0–200, step 1, initial 70
-- `input_number.lard_cooling_hot_c` — initial 85
-- `input_number.lard_cooling_dangerous_c` — initial 95
+Helpers (package `ha_packages/lard_cooling_target.yaml`) are Fahrenheit, mode slider, min 100, max 250, step 1. The package keeps the historical entity IDs so existing automations still resolve. The `_c` suffix is not the unit.
+
+- `input_number.lard_cooling_target_c` — initial 158 °F (Toolbox 70 °C). State is °F.
+- `input_number.lard_cooling_hot_c` — initial 185 °F (Toolbox 85 °C). State is °F.
+- `input_number.lard_cooling_dangerous_c` — initial 203 °F (Toolbox 95 °C). State is °F.
+- Optional aliases `input_number.lard_cooling_target_f` / `_hot_f` / `_dangerous_f` — not created by the package. If one of them has a numeric state, it wins over the matching `_c` id. Create them only when they should be the source of truth.
 - `input_number.lard_cooling_envelope_min_pct` / `lard_cooling_envelope_max_pct` — optional band, initial 0 and 100
+
+100–250 °F is the mining slider (about 38–121 °C). Values outside that slider still convert if they land in 32–392 °F (OpenAPI 0–200 °C) and keep strict order.
+
+A site that was running helper values 70 / 79 / 95 °C should set the Fahrenheit helpers to **158 / 174 / 203** before any armed write. 174 °F converts back to 79 °C. Do not leave 70 in the helper: that state is now 70 °F.
 
 `input_number.lard_fan_max_pct` and `ha_packages/lard_cooling_profiles.yaml` remain for the legacy policy only. They are envelope leftovers, not the native actuator.
 

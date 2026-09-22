@@ -1,13 +1,39 @@
-# LARD Controller — native Automatic cooling setpoints (0.1.9)
+# LARD Controller — native Automatic cooling setpoints (0.1.10)
 #
-# Braiins OS regulates fan PWM toward target °C. These helpers are policy,
-# not a fan-speed loop. Changing one schedules at most one gated
+# Operator unit is Fahrenheit, matching chip temperature sensors in °F.
+# Braiins REST still requires Temperature.degree_c. LARD converts only when
+# it builds PUT /api/v1/cooling/mode:
+#   c = round((f - 32) * 5 / 9)
+# Order is checked in °F first (target < hot < dangerous). After conversion
+# each degree_c must sit in the OpenAPI range 0–200 and stay strictly ordered.
+#
+# Entity IDs below keep the historical "_c" suffix so existing automations
+# still resolve. That suffix is not the unit. The number is °F.
+#
+# Optional aliases, accepted when they have a numeric state (they win over
+# these _c IDs). Do not create them unless they should be the source of
+# truth — a present _f entity hides the matching _c helper:
+#   input_number.lard_cooling_target_f
+#   input_number.lard_cooling_hot_f
+#   input_number.lard_cooling_dangerous_f
+#
+# Slider 100–250 °F is the mining band (about 38–121 °C). The converter
+# still accepts 32–392 °F, which maps onto OpenAPI 0–200 °C, when a helper
+# is wider than this slider.
+#
+# Initials 158 / 185 / 203 °F are Braiins Toolbox 70 / 85 / 95 °C.
+# `initial` applies only when the entity is first created. A site that
+# already has these helpers at 70 / 79 / 95 °C must set them to
+# 158 / 174 / 203 °F (174 °F round-trips to 79 °C). Leaving 70 in the
+# helper makes LARD read 70 °F (about 21 °C).
+#
+# Add-on options cooling_*_temperature_c stay internal °C (defaults 70/85/95,
+# schema 0–200). They are the fallback only when no helper state exists.
+# They are not the operator slider and they are not reinterpreted as °F.
+#
+# Changing one helper schedules at most one gated
 # pause → PUT /api/v1/cooling/mode → resume, and only when writes are armed.
 # The first sample after startup is a seed and does not write.
-#
-# Units are °C. OpenAPI CoolingAutoMode range is 0–200.
-# Defaults 70 / 85 / 95 match Braiins Toolbox examples, not a claimed
-# 26.09 firmware default. Keep target < hot < dangerous.
 # Envelope min/max is a wide safety band (default 0–100), not a PWM actuator.
 #
 # Install: copy to config/packages/lard_cooling_target.yaml, enable
@@ -18,34 +44,35 @@
 # Leave enable_writes false until a planned window.
 
 input_number:
+  # Compatibility IDs. Numeric state is Fahrenheit. The "_c" suffix is historical.
   lard_cooling_target_c:
-    name: LARD Cooling Target °C
-    min: 0
-    max: 200
+    name: LARD Cooling Target °F
+    min: 100
+    max: 250
     step: 1
-    initial: 70
-    mode: box
-    unit_of_measurement: "°C"
+    initial: 158
+    mode: slider
+    unit_of_measurement: "°F"
     icon: mdi:thermometer
 
   lard_cooling_hot_c:
-    name: LARD Cooling Hot °C
-    min: 0
-    max: 200
+    name: LARD Cooling Hot °F
+    min: 100
+    max: 250
     step: 1
-    initial: 85
-    mode: box
-    unit_of_measurement: "°C"
+    initial: 185
+    mode: slider
+    unit_of_measurement: "°F"
     icon: mdi:thermometer-high
 
   lard_cooling_dangerous_c:
-    name: LARD Cooling Dangerous °C
-    min: 0
-    max: 200
+    name: LARD Cooling Dangerous °F
+    min: 100
+    max: 250
     step: 1
-    initial: 95
-    mode: box
-    unit_of_measurement: "°C"
+    initial: 203
+    mode: slider
+    unit_of_measurement: "°F"
     icon: mdi:thermometer-alert
 
   lard_cooling_envelope_min_pct:

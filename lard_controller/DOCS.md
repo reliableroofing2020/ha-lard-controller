@@ -44,7 +44,7 @@ Braiins pause / resume / hashboard PATCH / power-target are issued only when:
 1. Add-on option `enable_writes` is **true**, and
 2. `input_boolean.lard_board_priority_enable` is **on**
 
-Cooling writes (`PUT /api/v1/cooling/mode`, the only cooling mutate on this API) use the **same dual write gates** as pause/resume/boards. 0.1.9 default policy sends Automatic `target_temperature` (°C), not a per-board fan ceiling. They are never issued live while hashing. A live cooling PUT on this site's BOS+ (~26.09 / Antminer) stalls mining (PAUSED/0W then APPLYING/0W / `read_boards_http_500`). See [docs/cooling-temperature-target.md](docs/cooling-temperature-target.md).
+Cooling writes (`PUT /api/v1/cooling/mode`, the only cooling mutate on this API) use the **same dual write gates** as pause/resume/boards. The default policy sends Automatic `target_temperature` as `degree_c`. The operator sets that target in °F; conversion is `round((f - 32) * 5 / 9)` and happens only for the PUT body. They are never issued live while hashing. A live cooling PUT on this site's BOS+ (~26.09 / Antminer) stalls mining (PAUSED/0W then APPLYING/0W / `read_boards_http_500`). See [docs/cooling-temperature-target.md](docs/cooling-temperature-target.md).
 
 Default `enable_writes` is **false**. First boot cannot write the miner.
 
@@ -79,7 +79,7 @@ Board-priority / anti-flap / async PATCH semantics are unchanged:
 
 Power target stays **944 W** until someone measures a higher floor.
 
-## Cooling owner (0.1.9 — Braiins PWM, HA policy)
+## Cooling owner (0.1.10 — Braiins PWM, operator °F)
 
 The add-on is the **only** Braiins cooling writer. Not Adv SSH. Not a separate HA fan automation. Keep `automation.solar_miner_fan_watchdog` **off**.
 
@@ -94,10 +94,10 @@ A live `PUT /api/v1/cooling/mode` while hashing is unsafe on this BOS+ build. An
 | Read telemetry | `GET /api/v1/cooling/state` (RPM / `target_speed_ratio`). No ceiling. `GET /cooling/mode` is **405** |
 | Read setpoints | `GET /api/v1/configuration/miner` → `temperature.mode` |
 | Auth | `Authorization: <raw token>` (no Bearer) |
-| Policy helpers | `input_number.lard_cooling_target_c` / `_hot_c` / `_dangerous_c` (°C). Envelope min/max default 0–100 |
+| Policy helpers | `input_number.lard_cooling_target_c` / `_hot_c` / `_dangerous_c` keep those IDs; the number is °F (the `_c` suffix is historical). Optional `lard_cooling_target_f` / `_hot_f` / `_dangerous_f` win when they have a numeric state. Envelope min/max default 0–100 |
 | Legacy helpers | `lard_fan_max_pct` and per-board profiles. Not scheduled under the native policy |
 
-Operator defaults are target 70 °C, hot 85 °C, dangerous 95 °C (Braiins Toolbox examples inside the OpenAPI 0–200 range). They are not a claimed 26.09 firmware default.
+Add-on options stay internal Celsius: target 70 °C, hot 85 °C, dangerous 95 °C (Braiins Toolbox examples inside the OpenAPI 0–200 range). They are the fallback when no helper state exists, not the operator unit, and not a claimed 26.09 firmware default. Operator helpers are Fahrenheit. Package initials are 158 / 185 / 203 °F. A site moving off 70 / 79 / 95 °C sets the helpers to 158 / 174 / 203 °F. Order is `target < hot < dangerous` in °F before convert. After convert, each `degree_c` must be in 0–200 and still strictly ordered.
 
 Legacy per-board placeholders (TBD/measured — unused unless the legacy policy is selected and auto fan ceiling is on):
 
@@ -138,7 +138,7 @@ Rules:
 - `CHIP_ABORT_F=180`: unconstrained 100 still applies, through the same gated sequence (dwell bypassed). Existing SOC / heartbeat / stale / fault **mining-pause** policy is unchanged.
 - Startup / reconnect no longer force a cooling PUT.
 
-Install `ha_packages/lard_cooling_target.yaml` for the °C helpers. `input_number.lard_fan_max_pct` is only a legacy envelope cap. REST cannot create a real `input_number`; on startup the add-on POSTs a state stub if an entity is missing and copies the packages into `/config/packages/` only when that directory already exists.
+Install `ha_packages/lard_cooling_target.yaml` for the °F helpers (slider, 100–250, initials 158 / 185 / 203). `input_number.lard_fan_max_pct` is only a legacy envelope cap. REST cannot create a real `input_number`; on startup the add-on POSTs a °F state stub on the compatibility `_c` entities if they are missing, does not invent `_f` stubs, and copies the packages into `/config/packages/` only when that directory already exists.
 
 ## Mode reconciliation contract
 

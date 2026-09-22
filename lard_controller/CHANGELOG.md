@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.10
+
+- Operator cooling helpers are Fahrenheit, matching chip temperature sensors in °F. Braiins REST still requires `degree_c`. Conversion happens only when the `PUT /api/v1/cooling/mode` body is built: `c = round((f - 32) * 5 / 9)`.
+- Order is checked in °F first (`target < hot < dangerous`). After conversion each integer must sit in the OpenAPI range 0–200 °C and stay strictly ordered, so rounding cannot collapse two levels. Unordered or out-of-range values refuse the PUT.
+- Historical helper IDs `input_number.lard_cooling_target_c`, `lard_cooling_hot_c`, and `lard_cooling_dangerous_c` keep their names, but their numeric state is °F. The `_c` suffix is not the unit. Optional aliases `lard_cooling_target_f`, `_hot_f`, and `_dangerous_f` win when they have a number.
+- Add-on options `cooling_target_temperature_c`, `cooling_hot_temperature_c`, and `cooling_dangerous_temperature_c` stay internal Celsius (defaults 70 / 85 / 95, schema 0–200). They are the fallback when no helper state exists. A stored 70 is still 70 °C, not 70 °F. `enable_writes` still defaults false.
+- Package `ha_packages/lard_cooling_target.yaml` keeps the historical `_c` entity IDs and switches them to unit °F, mode slider, range 100–250, initials 158 / 185 / 203 (Toolbox 70 / 85 / 95 °C). The `_f` IDs are optional aliases and are not created by the package. A site that was on 70 / 79 / 95 °C should set the helpers to 158 / 174 / 203 °F before any armed write. Leaving 70 in the helper sends about 21 °C. `initial` does not overwrite an existing helper.
+
 ## 0.1.9
 
 - Cooling ownership moves to Braiins Automatic mode. The control plane is `target_temperature` (°C) on the only cooling mutate path, `PUT /api/v1/cooling/mode` (`CoolingAutoMode`). Home Assistant sets that target rarely. Braiins modulates fan PWM. HA does not chase `max_fan_speed` on a timer or on every board-mode change.
