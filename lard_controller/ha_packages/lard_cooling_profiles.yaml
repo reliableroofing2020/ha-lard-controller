@@ -1,4 +1,9 @@
-# LARD Controller — per-mode cooling envelopes (TBD/measured placeholders)
+# LARD Controller — legacy per-mode fan ceilings (TBD/measured placeholders)
+#
+# 0.1.9 default policy is native_auto_target. These per-board max-fan
+# helpers are not consulted in that mode and do not schedule PUTs.
+# They apply only when cooling_policy is legacy_fan_ceiling and
+# auto_fan_ceiling_enabled is true (default false).
 #
 # 0.1.5+: cooling writes are maintenance-gated (pause → PUT → resume).
 # These helpers override add-on options when present. They never live-PUT

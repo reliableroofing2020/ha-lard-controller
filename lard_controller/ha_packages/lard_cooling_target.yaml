@@ -1,0 +1,69 @@
+# LARD Controller — native Automatic cooling setpoints (0.1.9)
+#
+# Braiins OS regulates fan PWM toward target °C. These helpers are policy,
+# not a fan-speed loop. Changing one schedules at most one gated
+# pause → PUT /api/v1/cooling/mode → resume, and only when writes are armed.
+# The first sample after startup is a seed and does not write.
+#
+# Units are °C. OpenAPI CoolingAutoMode range is 0–200.
+# Defaults 70 / 85 / 95 match Braiins Toolbox examples, not a claimed
+# 26.09 firmware default. Keep target < hot < dangerous.
+# Envelope min/max is a wide safety band (default 0–100), not a PWM actuator.
+#
+# Install: copy to config/packages/lard_cooling_target.yaml, enable
+# packages in configuration.yaml, restart Core.
+#
+# Do not add a separate HA automation that writes Braiins fans.
+# Keep automation.solar_miner_fan_watchdog off.
+# Leave enable_writes false until a planned window.
+
+input_number:
+  lard_cooling_target_c:
+    name: LARD Cooling Target °C
+    min: 0
+    max: 200
+    step: 1
+    initial: 70
+    mode: box
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer
+
+  lard_cooling_hot_c:
+    name: LARD Cooling Hot °C
+    min: 0
+    max: 200
+    step: 1
+    initial: 85
+    mode: box
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-high
+
+  lard_cooling_dangerous_c:
+    name: LARD Cooling Dangerous °C
+    min: 0
+    max: 200
+    step: 1
+    initial: 95
+    mode: box
+    unit_of_measurement: "°C"
+    icon: mdi:thermometer-alert
+
+  lard_cooling_envelope_min_pct:
+    name: LARD Cooling Envelope Min %
+    min: 0
+    max: 100
+    step: 1
+    initial: 0
+    mode: box
+    unit_of_measurement: "%"
+    icon: mdi:fan
+
+  lard_cooling_envelope_max_pct:
+    name: LARD Cooling Envelope Max %
+    min: 0
+    max: 100
+    step: 1
+    initial: 100
+    mode: box
+    unit_of_measurement: "%"
+    icon: mdi:fan

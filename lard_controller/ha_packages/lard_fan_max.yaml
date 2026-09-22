@@ -1,7 +1,11 @@
-# LARD Controller — envelope cap helper (not a live fan writer)
+# LARD Controller — legacy fan-ceiling cap (not a live fan writer)
 #
-# 0.1.5+: this helper only caps the *desired* cooling profile
-# (min(mode_profile_max, this value)). The add-on never PUTs
+# 0.1.9 default policy is native_auto_target. This helper is NOT the
+# control knob in that mode and does not schedule cooling PUTs.
+# It only caps per-board max_fan_speed when cooling_policy is
+# legacy_fan_ceiling AND auto_fan_ceiling_enabled is true (default false).
+#
+# 0.1.5+: even on the legacy path the add-on never PUTs
 # /api/v1/cooling/mode while hashing. Cooling changes go through
 # the gated pause → PUT → resume owner.
 #

@@ -78,8 +78,26 @@ configuration:
     name: Cooling writes only when paused
     description: When true (default), a cooling PUT is refused unless the miner is paused and idle. Never a live mid-hash PUT.
   auto_fan_ceiling_enabled:
-    name: Auto fan ceiling
-    description: Leave false. Automatic fan-ceiling changes stay off until a proof run. Explicit maintenance transitions still use the gated pause path.
+    name: Auto fan ceiling (legacy)
+    description: Leave false. This is not the path to efficient mining. It only arms legacy per-board max_fan_speed chasing when cooling_policy is legacy_fan_ceiling. Native policy ignores it.
+  cooling_policy:
+    name: Cooling policy
+    description: native_auto_target (default) lets Braiins Automatic cooling hold chip temperature. legacy_fan_ceiling keeps the old per-board fan-max profiles and still requires auto_fan_ceiling_enabled. Neither value arms enable_writes.
+  cooling_target_temperature_c:
+    name: Target chip temperature (°C)
+    description: CoolingAutoMode target_temperature.degree_c. Braiins regulates fan PWM toward this. OpenAPI range 0–200. Default 70 is a Braiins Toolbox example, not a claimed firmware default. Must be below hot.
+  cooling_hot_temperature_c:
+    name: Hot temperature (°C)
+    description: CoolingAutoMode hot_temperature.degree_c. Fans go to 100% at this threshold. OpenAPI range 0–200. Default 85 (Toolbox example). Must be above target and below dangerous.
+  cooling_dangerous_temperature_c:
+    name: Dangerous temperature (°C)
+    description: CoolingAutoMode dangerous_temperature.degree_c. BOSMiner stops to avoid overheating. OpenAPI range 0–200. Default 95 (Toolbox example). Must be above hot.
+  cooling_envelope_min_fan_pct:
+    name: Fan envelope minimum (%)
+    description: Optional CoolingAutoMode min_fan_speed safety floor. 0 omits the field. Not a PWM control loop. Default 0. Must be less than the envelope maximum.
+  cooling_envelope_max_fan_pct:
+    name: Fan envelope maximum (%)
+    description: Optional CoolingAutoMode max_fan_speed safety ceiling. Default 100 leaves Braiins free to modulate PWM. Not a per-board fan profile.
   cooling_settle_seconds:
     name: Cooling settle (seconds)
     description: Poll after a confirmed cooling PUT before ResumeMining. Default 45. Do not resume just because the PUT returned.

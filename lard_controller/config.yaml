@@ -1,5 +1,5 @@
 name: LARD Controller
-version: "0.1.8"
+version: "0.1.9"
 slug: lard_controller
 description: >
   Supervises the LARD board-priority Braiins actuator. Observe-and-publish
@@ -69,6 +69,12 @@ options:
   cooling_paused_min_fan_pct: 0
   cooling_writes_only_when_paused: true
   auto_fan_ceiling_enabled: false
+  cooling_policy: native_auto_target
+  cooling_target_temperature_c: 70
+  cooling_hot_temperature_c: 85
+  cooling_dangerous_temperature_c: 95
+  cooling_envelope_min_fan_pct: 0
+  cooling_envelope_max_fan_pct: 100
   cooling_settle_seconds: 45
   transition_poll_interval_seconds: 10
   expected_recovery_seconds: 240
@@ -107,6 +113,12 @@ schema:
   cooling_paused_min_fan_pct: int(0,100)
   cooling_writes_only_when_paused: bool
   auto_fan_ceiling_enabled: bool
+  cooling_policy: list(native_auto_target|legacy_fan_ceiling)
+  cooling_target_temperature_c: int(0,200)
+  cooling_hot_temperature_c: int(0,200)
+  cooling_dangerous_temperature_c: int(0,200)
+  cooling_envelope_min_fan_pct: int(0,100)
+  cooling_envelope_max_fan_pct: int(0,100)
   cooling_settle_seconds: int(0,3600)
   transition_poll_interval_seconds: int(1,120)
   expected_recovery_seconds: int(0,7200)

@@ -1,3 +1,37 @@
+# Cooling temperature-target ownership (0.1.9)
+
+Addon version **0.1.9**. Base is `main` at 0.1.8 (PR #8). This change flips cooling ownership to Braiins Automatic `target_temperature`. It does not enable writes, AUTO, or any live control. Do not merge from this note, do not deploy, do not set `enable_writes`, and do not turn on `switch.solar_miner_auto_enable`. The miner stays PAUSED.
+
+## Ownership
+
+Inventory conclusion, carried into the design note `docs/cooling-temperature-target.md`: the only cooling mutate path is `PUT /api/v1/cooling/mode`. `GET /cooling/state` is RPM/PWM telemetry with no ceiling. `GET /cooling/mode` is 405. Setpoints are read from `GET /configuration/miner`. There is no separate live fan-max primitive.
+
+Default `cooling_policy` is `native_auto_target`. The desired body is Automatic mode with target/hot/dangerous °C and a wide fan envelope (min 0, max 100). Board-count `max_fan_speed` profiles are not consulted. `auto_fan_ceiling_enabled` stays false and is not the efficient-mining path. `legacy_fan_ceiling` keeps the old per-board ceilings and still requires that flag.
+
+Operator defaults 70 / 85 / 95 °C are Braiins Toolbox examples inside the OpenAPI 0–200 range. They are not a claimed 26.09 firmware default.
+
+## What still holds
+
+H1–H7 and B1–B4 are unchanged. A policy write still re-checks authorization immediately before emit, pauses until two idle polls, issues one PUT, settles, resumes once, and allows at most one retry. Deadlines stay monotonic. Cancel and reload still publish `INTERRUPTED_MANUAL_REVIEW` with no Resume. Start, Restart, and reboot stay on the deny-list. Pending still auto-applies only after `HASHING`.
+
+The first setpoint sample is a seed. Changes while writes are disarmed are absorbed, so arming `enable_writes` does not itself pause the miner or PUT. An operator change after writes are armed schedules one gated transaction. The same value is a no-op. Unordered temperatures refuse the PUT. Thermal abort opens the envelope to 100% and keeps the target fields in the body.
+
+## Tests
+
+`python3 -m unittest test_controller` from `lard_controller/app`.
+
+New `TemperatureTargetPolicyTests` cover: native defaults and fail-closed writes; target_temperature preferred across board modes; fan-max and board-mode changes do not schedule a cooling PUT; legacy ceiling still requires `auto_fan_ceiling_enabled`; one operator target change PUTs the auto body then no-ops; a disarmed change is not replayed when writes arm; invalid order, a disarmed explicit request, and an explicit fan-ceiling request under the native policy do not PUT; thermal abort keeps `target_temperature`; configuration parse and the real client PUT path; unknown policy strings stay native and disarmed. No Start/Restart on those paths. Full suite: 122 tests OK.
+
+## Remaining risks
+
+- Defaults stay observe-only. This change was not deployed and did not call the miner.
+- A future armed window will pause the miner once per real setpoint change, because that PUT is still disruptive on 26.09. Dwell (600s) limits repeats. It will not pause for PWM or board-count fan profiles.
+- 70/85/95 are operator defaults, not read from this miner's `configuration/constraints`. A later observe-only read should confirm the live constraints before anyone arms writes.
+- GUI Apply is still not HAR-proven. The schema allows only the cooling-mode PUT.
+- Partial auto PUTs on this firmware have nulled omitted temperatures. The native body sends target, hot, and dangerous together so a target change does not clear the others. A legacy fan-only PUT still omits them, which matches 0.1.8 and can clear setpoints if that legacy path is ever armed.
+
+---
+
 # Write-Enable Hardening PR Report
 
 Addon version **0.1.8**. Base is `main` at 0.1.7 (PR #7, `2d3edfc`). This change hardens write paths only. It does not enable writes, AUTO, or any live control. Do not merge, do not deploy, do not set `enable_writes`, and do not turn on `switch.solar_miner_auto_enable`.
