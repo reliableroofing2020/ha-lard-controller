@@ -94,7 +94,7 @@ A live `PUT /api/v1/cooling/mode` while hashing is unsafe on this BOS+ build. An
 | Read telemetry | `GET /api/v1/cooling/state` (RPM / `target_speed_ratio`). No ceiling. `GET /cooling/mode` is **405** |
 | Read setpoints | `GET /api/v1/configuration/miner` → `temperature.mode` |
 | Auth | `Authorization: <raw token>` (no Bearer) |
-| Policy helpers | `input_number.lard_cooling_target_c` / `_hot_c` / `_dangerous_c` keep those IDs; the number is °F (the `_c` suffix is historical). Optional `lard_cooling_target_f` / `_hot_f` / `_dangerous_f` win when they have a numeric state. Envelope min/max default 0–100 |
+| Policy helpers | `input_number.lard_cooling_target_c` / `_hot_c` / `_dangerous_c` are canonical; the number is °F (the `_c` suffix is not unit metadata and is not converted). Optional `lard_cooling_*_f` is used only when the canonical helper has no number, and a missing alias is not polled every tick. Envelope min/max default 0–100. Phase 1 observe-only: [docs/phase1-observe-only.md](docs/phase1-observe-only.md) |
 | Legacy helpers | `lard_fan_max_pct` and per-board profiles. Not scheduled under the native policy |
 
 Add-on options stay internal Celsius: target 70 °C, hot 85 °C, dangerous 95 °C (Braiins Toolbox examples inside the OpenAPI 0–200 range). They are the fallback when no helper state exists, not the operator unit, and not a claimed 26.09 firmware default. Operator helpers are Fahrenheit. Package initials are 158 / 185 / 203 °F. A site moving off 70 / 79 / 95 °C sets the helpers to 158 / 174 / 203 °F. Order is `target < hot < dangerous` in °F before convert. After convert, each `degree_c` must be in 0–200 and still strictly ordered.
@@ -121,7 +121,7 @@ When **desired profile ≠ applied profile** (and dwell has elapsed, unless ther
 7. Short stabilize (`cooling_stabilize_seconds`, default 5), then the 0.1.7 post-write settle (`cooling_settle_seconds`, default 45, poll every `transition_poll_interval_seconds`, default 10). Do **not** resume merely because the PUT returned.
 8. Poll miner readiness (`GET /api/v1/miner/details`: pause flag, `bosminer_uptime_s`, status / `detailed_status` reason, watts). `bosminer_uptime_s == 0` means the bosminer process is not running — that is unreadiness, not a confirmed hard fail.
 9. Resume mining **once** (`RESUME_REQUESTED`). HTTP 500 is not an immediate `ERROR`. Device reboot is never used. 0.1.7 does **not** escalate to `PUT /api/v1/actions/start` or BOSminer Restart for this recovery.
-10. Enter `RECOVERING`. 0 W / 0 TH/s is acceptable while the miner is reachable and in a legitimate lifecycle (APPLYING, cooldown, cooling down, preheat, startup, init, autotune) and there is no hard fault.
+10. Enter `RECOVERING`. 0 W / 0 TH/s is acceptable while the miner is reachable and in a miner-reported lifecycle (cooldown, cooling down, preheat, startup, init, autotune, ramping) and there is no hard fault. The controller word `applying` is not that evidence.
 11. Before `expected_recovery_seconds` (default 240), stay `RECOVERING` when lifecycle is positive. Between expected and `maximum_recovery_seconds` (default 600), keep waiting only with positive lifecycle or progress.
 12. At the maximum, if still reachable, not hashing, and not a hard fault: exactly one guarded resume retry, then `post_retry_recovery_seconds` (default 180). If that fails: health `DEGRADED_NEEDS_ATTENTION` (actual stays `APPLYING`). Not `ERROR`.
 13. Full `HASHING` (`sensor.lard_controller_health`) requires `stable_hash_poll_count` (default 3) consecutive polls with plausible watts, hashrate above the startup threshold, expected boards present and healthy, and no hard fault. Only then publish the operating mode as confirmed actual. A missing or unhealthy board with nonzero watts is not full `HASHING`.
@@ -142,7 +142,7 @@ Install `ha_packages/lard_cooling_target.yaml` for the °F helpers (slider, 100�
 
 ## Mode reconciliation contract
 
-Desired mode and confirmed operational/actual mode are separate. Published `actual_mode` is one of `PAUSED`, `APPLYING`, `ONE_BOARD`, `TWO_BOARD`, `THREE_BOARD`, `ERROR`.
+Desired mode and confirmed operational/actual mode are separate. The compatibility sensor `actual_mode` is one of `PAUSED`, `ONE_BOARD`, `TWO_BOARD`, `THREE_BOARD`, `APPLYING`, `ERROR`, `WAITING_FOR_BRAIINS`, `FAULT_LATCHED`. Only the first four are verified physical miner modes (`observed_miner_mode`). `APPLYING`, `WAITING_FOR_BRAIINS`, `FAULT_LATCHED`, and `ERROR` are controller lifecycle (`controller_state`). `WAITING_FOR_BRAIINS` expires on the monotonic evidence deadline. `enable_writes` false returns `WRITE_BLOCKED` before a miner request is built. A failed required read publishes power as `unknown` and boards as `unverified`. See `docs/phase1-observe-only.md` and `docs/phase1-writer-inventory.md`.
 
 Hashboard topology alone never confirms a non-`PAUSED` mode. Board set `{1}` while Braiins is still `user_pause` / `MINER_STATUS_PAUSED` is **`PAUSED`**, not `ONE_BOARD`. That is what used to skip resume after an add-on restart (`desired == actual`).
 
@@ -188,7 +188,7 @@ Dual write gates (`enable_writes` + HA master boolean) and the old-auto refuse p
 | `binary_sensor.lard_controller_online` | `on` while the loop is publishing |
 | `sensor.lard_controller_last_seen` | UTC ISO-8601 of last publish |
 | `sensor.lard_controller_requested_mode` | Mode the actuator wants |
-| `sensor.lard_controller_actual_mode` | Mode inferred / last applied |
+| `sensor.lard_controller_actual_mode` | Compatibility mode. Physical only for `PAUSED` / `ONE_BOARD` / `TWO_BOARD` / `THREE_BOARD`. Controller lifecycle otherwise. Attribute `observed_miner_mode` is the physical mode |
 | `sensor.lard_controller_error` | Last error or `ok` |
 | `sensor.lard_controller_api_fail_count` | HA + Braiins transport failures |
 | `sensor.lard_controller_last_braiins_ok` | UTC ISO of last Braiins HTTP 200 |

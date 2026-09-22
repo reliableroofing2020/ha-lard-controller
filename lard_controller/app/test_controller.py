@@ -13,8 +13,12 @@ from collections import deque
 from pathlib import Path
 
 from controller import (
+    ACTUAL_MODES,
     ADDON_VERSION,
     API_5XX_BACKOFF_S,
+    CONTROLLER_STATES,
+    LEGITIMATE_LIFECYCLE_TOKENS,
+    OBSERVED_MINER_MODES,
     CHIP_ABORT_F,
     COOLING_DANGEROUS_C,
     COOLING_DANGEROUS_F,
@@ -31,6 +35,7 @@ from controller import (
     ENT_COOLING_DANGEROUS_F,
     ENT_COOLING_HOT_C,
     ENT_COOLING_HOT_F,
+    ENT_COMPETING_WRITER,
     ENT_COOLING_TARGET_C,
     ENT_COOLING_TARGET_F,
     ENT_ENABLE,
@@ -44,6 +49,12 @@ from controller import (
     RESUME_WAIT_S,
     Braiins,
     Controller,
+    FORBIDDEN_HA_WRITES,
+    HA,
+    WRITER_INVENTORY,
+    WritePermission,
+    board_patch_readback,
+    classify_miner_telemetry,
     CoolingProfile,
     HealthState,
     Logger,
@@ -68,16 +79,21 @@ class FakeHA:
         self.fail_count = 0
         self.writes: list[tuple[str, object]] = []
         self.events: list[tuple[str, dict]] = []
+        self.state_reads: list[tuple[str, bool]] = []
+        self.last_read_absent = False
+        self._attrs: dict[str, dict] = {}
 
     def fire_event(self, event_type, data=None):
         self.events.append((event_type, dict(data or {})))
 
-    def state(self, entity_id: str):
+    def state(self, entity_id: str, *, quiet: bool = False):
+        self.state_reads.append((entity_id, quiet))
         return self._states.get(entity_id)
 
     def set_state(self, entity_id: str, state, attributes=None):
         self.writes.append((entity_id, state))
         self._states[entity_id] = state
+        self._attrs[entity_id] = dict(attributes or {})
 
 
 class FakeBraiins:
@@ -442,7 +458,8 @@ class FakeBraiins:
         code = self._next_http("boards_http")
         self._note_http(code)
         if code != 200:
-            return [], code, {}
+            body = getattr(self, "boards_error_body", None) or {}
+            return [], code, body
         if self._pending_enabled is not None:
             if self._board_delay_left <= 0:
                 self.enabled = self._pending_enabled
@@ -2600,7 +2617,8 @@ class WriteEnableHardeningTests(unittest.TestCase):
         self.assertTrue(ctrl._positive_lifecycle(obs(phase="init")))
         self.assertTrue(ctrl._positive_lifecycle(obs(phase="cooldown")))
         self.assertTrue(ctrl._positive_lifecycle(obs(phase="preheat", preheating=True)))
-        self.assertTrue(ctrl._positive_lifecycle(obs(phase="applying")))
+        # "applying" is a controller label, not miner-side lifecycle evidence.
+        self.assertFalse(ctrl._positive_lifecycle(obs(phase="applying", power_w=0.0, hashrate=0.0)))
         self.assertTrue(ctrl._positive_lifecycle(obs(phase="ramping", ramping=True)))
         self.assertFalse(
             ctrl._positive_lifecycle(obs(phase="preheat", pause_reason="overheat", preheating=True))
@@ -2948,7 +2966,7 @@ class TemperatureTargetPolicyTests(unittest.TestCase):
         self.assertEqual(fresh.cooling_dangerous_temperature_c, COOLING_DANGEROUS_C)
         self.assertEqual(fresh.cooling_envelope_min_fan_pct, 0)
         self.assertEqual(fresh.cooling_envelope_max_fan_pct, 100)
-        self.assertEqual(ADDON_VERSION, "0.1.11")
+        self.assertEqual(ADDON_VERSION, "0.1.12")
         self.assertFalse(fresh.cooling_control_enabled)
         self.assertEqual((COOLING_TARGET_C, COOLING_HOT_C, COOLING_DANGEROUS_C), (70, 85, 95))
         self.assertEqual((COOLING_TARGET_F, COOLING_HOT_F, COOLING_DANGEROUS_F), (158, 185, 203))
@@ -2982,10 +3000,12 @@ class TemperatureTargetPolicyTests(unittest.TestCase):
         ctrl.ha._states[ENT_COOLING_TARGET_F] = "149"
         ctrl.tick()
         self.assertEqual(b.cooling_puts(), [])
-        ctrl.ha._states[ENT_COOLING_TARGET_F] = "158"
-        ctrl.ha._states[ENT_COOLING_HOT_F] = "185"
-        ctrl.ha._states[ENT_COOLING_DANGEROUS_F] = "203"
-        ctrl.ha._states[ENT_COOLING_TARGET_C] = "100"
+        # Canonical _c wins. The _f value is a decoy and must not override it.
+        # 158/185/203 °F are the historical helper numbers (not converted from the _c suffix).
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "158"
+        ctrl.ha._states[ENT_COOLING_HOT_C] = "185"
+        ctrl.ha._states[ENT_COOLING_DANGEROUS_C] = "203"
+        ctrl.ha._states[ENT_COOLING_TARGET_F] = "100"
         ctrl.tick()
         self.assertEqual(len(b.cooling_puts()), 1)
         auto = (b.last_cooling_body or {}).get("auto") or {}
@@ -3258,6 +3278,7 @@ class TemperatureTargetPolicyTests(unittest.TestCase):
             data_dir=tmp,
             share_dir=tmp / "share",
             cooling_control_enabled=True,
+            enable_writes=True,
         )
         client = Braiins(settings, Logger(settings))
         captured = {}
@@ -3341,7 +3362,7 @@ class BraiinsOwnsCoolingTests(unittest.TestCase):
         self.assertFalse(fresh.cooling_control_enabled)
         self.assertEqual(fresh.cooling_policy, COOLING_POLICY_NATIVE)
         self.assertFalse(fresh.enable_writes)
-        self.assertEqual(ADDON_VERSION, "0.1.11")
+        self.assertEqual(ADDON_VERSION, "0.1.12")
         old_opt = os.environ.get("LARD_OPTIONS")
         old_sec = os.environ.get("LARD_SECRETS")
         try:
@@ -3519,6 +3540,7 @@ class BraiinsOwnsCoolingTests(unittest.TestCase):
         self.assertIn("/api/v1/cooling/mode", str(raised.exception))
 
         settings.cooling_control_enabled = True
+        settings.enable_writes = True
         client.set_cooling_auto(100, {"target_temperature": {"degree_c": 70}})
         self.assertEqual(called[0][0], "PUT")
         self.assertEqual(called[0][1], "/api/v1/cooling/mode")
@@ -3538,11 +3560,992 @@ class BraiinsOwnsCoolingTests(unittest.TestCase):
         ctrl.tick()
         self.assertEqual(b.cooling_puts(), [])
         self.assertNotIn("pause", b.write_names())
-        ctrl.ha._states[ENT_COOLING_TARGET_F] = "176"
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "176"
         ctrl.tick()
         self.assertEqual(len(b.cooling_puts()), 1)
         self.assertNotIn("start", b.write_names())
         self.assertNotIn("restart", b.write_names())
+
+
+class _AbsentOptionalHA(FakeHA):
+    """Transport-absent optional _f helpers. Canonical _c still comes from _states."""
+
+    _F_IDS = {
+        ENT_COOLING_TARGET_F,
+        ENT_COOLING_HOT_F,
+        ENT_COOLING_DANGEROUS_F,
+    }
+
+    def state(self, entity_id: str, *, quiet: bool = False):
+        self.state_reads.append((entity_id, quiet))
+        if entity_id in self._F_IDS and entity_id not in self._states:
+            self.last_read_absent = True
+            if not quiet:
+                self.fail_count += 1
+            return None
+        self.last_read_absent = False
+        return self._states.get(entity_id)
+
+
+class Phase1ObserveGateTests(unittest.TestCase):
+    """Phase 1: disarmed writes, helper resolution, telemetry classes, no live Braiins."""
+
+    def test_startup_and_reload_are_disarmed(self):
+        fresh = Settings()
+        self.assertFalse(fresh.enable_writes)
+        self.assertFalse(fresh.cooling_control_enabled)
+        b = paused_one_board()
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.write_permission.reason, "startup_disarmed")
+        self.assertEqual(ctrl.write_permission.source, "startup")
+        ctrl.reconcile_after_reload()
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.write_permission.reason, "reload_disarmed")
+        self.assertEqual(ctrl.write_permission.source, "reload")
+        self.assertFalse(ctrl.recovery_ready)
+
+    def test_write_gate_blocks_before_http_and_observe_only_sends_nothing(self):
+        b = paused_one_board()
+        b.power_target = 500
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        ctrl.settings.cooling_control_enabled = True
+        ctrl.tick()
+        self.assertEqual(b.write_names(), [])
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertIn("enable_writes_false", ctrl.reason)
+        self.assertFalse(ctrl.write_permission.permitted)
+        for op, fn in (
+            ("mode_pause", lambda: b.pause()),
+            ("mode_resume", lambda: b.resume()),
+            ("set_power", lambda: b.set_power(944)),
+            ("patch_boards", lambda: b.patch_boards(True, ["2", "3"])),
+            ("cooling_put", lambda: b.set_cooling_auto(100, {"target_temperature": {"degree_c": 70}})),
+        ):
+            code, body = ctrl._device_tuple(op, fn)
+            self.assertEqual(code, 0, op)
+            self.assertTrue(body.get("denied"), op)
+        self.assertEqual(b.write_names(), [])
+        self.assertEqual(b.cooling_puts(), [])
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertIn("write blocked", log)
+        self.assertIn("op=mode_pause", log)
+        self.assertIn("source=controller", log)
+        self.assertIn("reason=enable_writes_false", log)
+        self.assertIn("state=", log)
+
+        tmp = Path(tempfile.mkdtemp(prefix="lard-gate-"))
+        settings = Settings(
+            braiins_password="x",
+            data_dir=tmp,
+            share_dir=tmp / "share",
+            cooling_control_enabled=True,
+            enable_writes=False,
+        )
+        client = Braiins(settings, Logger(settings))
+        client.write_permission = WritePermission()
+        called = []
+
+        def _call(method, path, body=None, timeout=30):
+            called.append((method, path, body))
+            return 200, body or {}
+
+        client._call = _call  # type: ignore[method-assign]
+        for op, result in (
+            ("pause", client.pause()),
+            ("resume", client.resume()),
+            ("set_power", client.set_power(944)),
+            ("patch_boards", client.patch_boards(True, ["1", "2", "3"])),
+            ("cooling_put", client.set_cooling_auto(80, None)),
+        ):
+            self.assertEqual(result[0], 0, op)
+            self.assertTrue(result[1].get("write_blocked"), op)
+        self.assertEqual(called, [])
+        blog = (tmp / "controller.log").read_text()
+        self.assertIn("write blocked", blog)
+        self.assertIn("source=braiins", blog)
+        self.assertIn("op=pause", blog)
+        self.assertIn("op=set_power", blog)
+        self.assertIn("op=patch_boards", blog)
+        self.assertIn("op=cooling_put", blog)
+        client.write_permission.permitted = True
+        still_blocked = client.pause()
+        self.assertEqual(still_blocked[0], 0)
+        self.assertTrue(still_blocked[1].get("write_blocked"))
+        self.assertEqual(called, [])
+        settings.enable_writes = True
+        client.pause()
+        self.assertEqual(called[0][0], "PUT")
+        self.assertIn("/api/v1/actions/pause", called[0][1])
+
+    def test_competing_writer_denies_arming(self):
+        b = paused_one_board()
+        b.power_target = 100
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=True)
+        ctrl.ha._states[ENT_COMPETING_WRITER] = "on"
+        ctrl.tick()
+        self.assertEqual(b.write_names(), [])
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertEqual(ctrl.last_error, "refusing_writes_competing_writer")
+        self.assertIn("competing_writer", ctrl.reason)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.competing_writer_blocks_arming(), "competing_writer")
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertIn("write blocked", log)
+        self.assertIn("op=arm", log)
+        self.assertIn("reason=competing_writer", log)
+
+    def test_canonical_c_helper_skips_missing_f_and_does_not_convert(self):
+        b = paused_one_board()
+        ctrl = make_controller(b, "PAUSED", enable_writes=False)
+        ctrl.settings.cooling_control_enabled = False
+        ctrl.ha = _AbsentOptionalHA(ha_states("PAUSED"))
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "158"
+        ctrl.ha._states[ENT_COOLING_HOT_C] = "185"
+        ctrl.ha._states[ENT_COOLING_DANGEROUS_C] = "203"
+        self.assertEqual(
+            ctrl._operator_temp_f(ENT_COOLING_TARGET_F, ENT_COOLING_TARGET_C, 70),
+            158.0,
+        )
+        self.assertEqual(ctrl.temperature_setpoints(), (70, 85, 95))
+        f_reads = [ent for ent, _quiet in ctrl.ha.state_reads if ent.endswith("_f")]
+        self.assertEqual(f_reads, [])
+        before = ctrl.ha.fail_count
+        streak = ctrl._telemetry_fail_streak
+        for _ in range(4):
+            ctrl.temperature_setpoints()
+        self.assertEqual(ctrl.ha.fail_count, before)
+        self.assertEqual(ctrl._telemetry_fail_streak, streak)
+        self.assertEqual(
+            [ent for ent, _quiet in ctrl.ha.state_reads if ent.endswith("_f")],
+            [],
+        )
+
+    def test_missing_f_helper_backs_off_on_monotonic_clock(self):
+        b = paused_one_board()
+        ctrl = make_controller(b, "PAUSED", enable_writes=False)
+        ctrl.settings.cooling_control_enabled = False
+        ctrl.ha = _AbsentOptionalHA(ha_states("PAUSED"))
+        started = ctrl._now()
+        self.assertIsNotNone(ctrl.temperature_setpoints())
+        self.assertEqual(ctrl._telemetry_fail_streak, 0)
+        self.assertEqual(ctrl.ha.fail_count, 0)
+        target_until = ctrl._helper_miss_until[ENT_COOLING_TARGET_F]
+        self.assertEqual(target_until, started + 30.0)
+        first_f = [ent for ent, _q in ctrl.ha.state_reads if ent.endswith("_f")]
+        self.assertEqual(len(first_f), 3)
+        ctrl.ha.state_reads.clear()
+        ctrl._clock.t = started + 10
+        ctrl.temperature_setpoints()
+        self.assertEqual(
+            [ent for ent, _q in ctrl.ha.state_reads if ent.endswith("_f")],
+            [],
+        )
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertEqual(log.count(f"helper_miss entity={ENT_COOLING_TARGET_F}"), 1)
+        self.assertIn("not miner telemetry", log)
+        ctrl._clock.t = target_until
+        ctrl.temperature_setpoints()
+        self.assertIn(
+            ENT_COOLING_TARGET_F,
+            [ent for ent, _q in ctrl.ha.state_reads if ent.endswith("_f")],
+        )
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertEqual(log.count(f"helper_miss entity={ENT_COOLING_TARGET_F}"), 2)
+        self.assertEqual(ctrl._telemetry_fail_streak, 0)
+        self.assertEqual(ctrl.ha.fail_count, 0)
+
+    def test_telemetry_classes_are_deterministic(self):
+        refused = "BOSminer API connection error: Connection refused (os error 111)"
+        self.assertEqual(
+            classify_miner_telemetry(ok=False, http_code=500, error_text=refused),
+            "BOSMINER_UNAVAILABLE",
+        )
+        self.assertEqual(
+            classify_miner_telemetry(
+                ok=False, http_code=412, error_text="BOSminer is not running"
+            ),
+            "BOSMINER_UNAVAILABLE",
+        )
+        self.assertEqual(
+            classify_miner_telemetry(
+                ok=False,
+                http_code=401,
+                error_text="Missing or invalid authentication token",
+            ),
+            "AUTHENTICATION_FAILED",
+        )
+        self.assertEqual(
+            classify_miner_telemetry(ok=False, http_code=500, error_text="timeout"),
+            "API_UNREACHABLE",
+        )
+        self.assertEqual(
+            classify_miner_telemetry(ok=False, error_text="hashboards malformed"),
+            "REQUIRED_TELEMETRY_MALFORMED",
+        )
+        self.assertEqual(
+            classify_miner_telemetry(
+                ok=True, paused=True, user_paused=True, power_w=0.0
+            ),
+            "VALID_PAUSED",
+        )
+        self.assertEqual(
+            classify_miner_telemetry(
+                ok=True, positive_lifecycle=True, power_w=0.0, running=False
+            ),
+            "VALID_TRANSITION",
+        )
+        self.assertNotEqual(
+            classify_miner_telemetry(
+                ok=True,
+                running=True,
+                power_w=0.0,
+                positive_lifecycle=False,
+                paused=False,
+            ),
+            "FAULT_LATCHED",
+        )
+        self.assertNotEqual(
+            classify_miner_telemetry(
+                ok=True,
+                running=True,
+                power_w=0.0,
+                positive_lifecycle=False,
+                paused=False,
+            ),
+            "VALID_TRANSITION",
+        )
+        self.assertEqual(
+            classify_miner_telemetry(ok=True, running=True, power_w=400.0),
+            "RUNNING_HEALTHY",
+        )
+        self.assertEqual(
+            classify_miner_telemetry(ok=True, critical_fault=True, running=True, power_w=400),
+            "FAULT_LATCHED",
+        )
+        self.assertEqual(board_patch_readback(["1", "2", "3"], ["1"], 200), "faulted_unverified")
+        self.assertEqual(board_patch_readback(["1", "2", "3"], [], 200), "faulted_unverified")
+        self.assertEqual(
+            board_patch_readback(["1", "2", "3"], ["1", "2", "3"], 200),
+            "verified",
+        )
+        self.assertNotEqual(board_patch_readback(["1", "2", "3"], ["1", "2", "3"], 500), "verified")
+
+    def test_board_patch_200_without_readback_is_not_success(self):
+        b = paused_one_board()
+        b.board_reads = deque([["1"]])
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=True)
+        ok = ctrl.apply_mode("THREE_BOARD")
+        self.assertFalse(ok)
+        self.assertNotEqual(ctrl.actual_mode, "THREE_BOARD")
+        self.assertIn("faulted_unverified", ctrl.last_error)
+        self.assertEqual(ctrl.telemetry_class, "FAULT_LATCHED")
+        self.assertIn("patch_boards", b.write_names())
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertIn("board_readback faulted_unverified", log)
+        self.assertIn("patch_http=200", log)
+
+        empty = paused_one_board()
+        empty.board_reads = deque([[]])
+        ctrl_empty = make_controller(empty, "THREE_BOARD", enable_writes=True)
+        self.assertFalse(ctrl_empty.apply_mode("THREE_BOARD"))
+        self.assertIn("faulted_unverified", ctrl_empty.last_error)
+        self.assertNotEqual(ctrl_empty.actual_mode, "THREE_BOARD")
+
+    def test_applying_clears_when_bosminer_unavailable(self):
+        b = paused_one_board()
+        b.boards_http = 500
+        b.boards_error_body = {
+            "error": "Internal error",
+            "message": "BOSminer API connection error: Connection refused (os error 111)",
+        }
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        ctrl.actual_mode = "APPLYING"
+        ctrl._cooling_transition_active = True
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "FAULT_LATCHED")
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.observed_state, "FAULT_LATCHED")
+        self.assertEqual(ctrl.desired_mode, "THREE_BOARD")
+        self.assertNotEqual(ctrl.observed_state, ctrl.desired_mode)
+        self.assertFalse(ctrl._cooling_transition_active)
+        self.assertEqual(b.write_names(), [])
+        self.assertFalse(ctrl.write_permission.permitted)
+
+        b2 = paused_one_board()
+        b2.boards_http = 500
+        b2.boards_error_body = b.boards_error_body
+        ctrl2 = make_controller(b2, "THREE_BOARD", enable_writes=False)
+        ctrl2.actual_mode = "APPLYING"
+        ctrl2._transition_evidence = True
+        ctrl2._transition_evidence_mono = ctrl2._now()
+        ctrl2.tick()
+        self.assertEqual(ctrl2.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(ctrl2.telemetry_class, "WAITING_FOR_BRAIINS")
+        self.assertEqual(b2.write_names(), [])
+
+        ctrl2._transition_evidence_mono = ctrl2._now() - 10_000
+        ctrl2.tick()
+        self.assertEqual(ctrl2.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl2.controller_state, "FAULT_LATCHED")
+        self.assertNotEqual(ctrl2.observed_miner_mode, "WAITING_FOR_BRAIINS")
+        self.assertNotEqual(ctrl2.observed_miner_mode, "APPLYING")
+        self.assertEqual(b2.write_names(), [])
+
+    def test_recovery_ready_does_not_rearm_writes(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        for _ in range(4):
+            ctrl.tick()
+            self.assertFalse(ctrl.recovery_ready)
+        ctrl.tick()
+        self.assertTrue(ctrl.recovery_ready)
+        self.assertGreaterEqual(ctrl._valid_poll_streak, 5)
+        self.assertTrue(ctrl._auth_ok)
+        self.assertTrue(ctrl._bosminer_available)
+        self.assertFalse(ctrl._critical_fault)
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(b.write_names(), [])
+        self.assertEqual(b.cooling_puts(), [])
+
+        blocked = running_boards(["1"])
+        ctrl_b = make_controller(blocked, "ONE_BOARD", enable_writes=False)
+        ctrl_b.ha._states[ENT_COMPETING_WRITER] = "on"
+        for _ in range(5):
+            ctrl_b.tick()
+        self.assertFalse(ctrl_b.recovery_ready)
+        self.assertEqual(blocked.write_names(), [])
+
+
+_BOSMINER_REFUSED = {
+    "error": "Internal error",
+    "message": "BOSminer API connection error: Connection refused (os error 111)",
+}
+_BOSMINER_NOT_RUNNING = {
+    "error": "Precondition Failed",
+    "message": "BOSminer is not running",
+}
+
+
+class VerificationSafetyTests(unittest.TestCase):
+    """Adversarial checks for the three observe-only blockers.
+
+    Fake monotonic clock only. These fail on the previous PR #12 implementation:
+    settlement ran only in APPLYING, and the token "applying" was positive evidence.
+    """
+
+    def _refused(self, braiins, body=None):
+        braiins.boards_http = 500
+        braiins.boards_error_body = body or _BOSMINER_REFUSED
+
+    def test_applying_waiting_then_fault_on_bosminer_loss(self):
+        b = running_boards(["1"])
+        b.phase = "preheating"
+        b.running = False
+        b.paused = False
+        b.user_paused = False
+        b.power_w = 0.0
+        b.hashrate = 0.0
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        ctrl.actual_mode = "APPLYING"
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertTrue(ctrl._transition_evidence)
+        self._refused(b)
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(ctrl.controller_state, "WAITING_FOR_BRAIINS")
+        ctx = ctrl._verification_ctx
+        self.assertIn("transaction_id", ctx)
+        self.assertGreater(ctx["entered_mono"], 0)
+        self.assertEqual(ctx["expected_operation"], ctrl.desired_mode)
+        self.assertGreater(ctx["evidence_deadline_mono"], ctrl._now())
+        self.assertEqual(ctx["reason"], "BOSMINER_UNAVAILABLE")
+        self.assertNotEqual(ctrl.observed_miner_mode, "WAITING_FOR_BRAIINS")
+        self.assertNotEqual(ctrl.observed_miner_mode, "APPLYING")
+        deadline = ctx["evidence_deadline_mono"]
+        ctrl._clock.t = deadline + 1
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertNotEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertIn("bosminer_unavailable_during_verification", ctrl.last_error)
+        self.assertIn("valid_transition_evidence_expired", ctrl.last_error)
+        self.assertEqual(b.write_names(), [])
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.desired_mode, "ONE_BOARD")
+
+    def test_waiting_expires_without_being_applying(self):
+        b = paused_one_board()
+        self._refused(b, _BOSMINER_NOT_RUNNING)
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        now = ctrl._now()
+        ctrl.actual_mode = "WAITING_FOR_BRAIINS"
+        ctrl.controller_state = "WAITING_FOR_BRAIINS"
+        ctrl._transition_evidence = True
+        ctrl._transition_evidence_mono = now
+        window = float(ctrl.settings.expected_recovery_seconds)
+        ctrl._verification_ctx = {
+            "transaction_id": "txn-observe",
+            "entered_mono": now,
+            "expected_operation": "THREE_BOARD",
+            "evidence_deadline_mono": now + window,
+            "last_valid_telemetry_mono": now,
+            "reason": "BOSMINER_UNAVAILABLE",
+            "evidence": "preheating",
+        }
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertNotEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        ctrl._clock.t = now + window + 1
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertIn("bosminer_unavailable_during_verification", ctrl.last_error)
+        self.assertEqual(b.write_names(), [])
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.desired_mode, "THREE_BOARD")
+
+    def test_applying_token_at_zero_power_is_not_a_transition(self):
+        self.assertNotIn("applying", LEGITIMATE_LIFECYCLE_TOKENS)
+        b = FakeBraiins(
+            enabled=["1"],
+            paused=False,
+            running=False,
+            user_paused=False,
+            phase="applying",
+            status="applying",
+            power_w=0.0,
+            hashrate=0.0,
+        )
+        b.pause_reason = ""
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        ctrl.actual_mode = "APPLYING"
+        obs = MinerObservation(
+            ok=True,
+            phase="applying",
+            power_w=0.0,
+            hashrate=0.0,
+            enabled_ids=["1"],
+        )
+        self.assertFalse(ctrl._positive_lifecycle(obs))
+        self.assertNotEqual(
+            classify_miner_telemetry(
+                ok=True,
+                positive_lifecycle=ctrl._positive_lifecycle(obs),
+                power_w=0.0,
+                running=False,
+                paused=False,
+            ),
+            "VALID_TRANSITION",
+        )
+        ctrl.tick()
+        self.assertNotEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertNotEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertIn("required_telemetry_malformed", ctrl.last_error)
+        self.assertEqual(ctrl.observed_miner_mode, "UNVERIFIED")
+        self.assertEqual(b.write_names(), [])
+        self.assertFalse(ctrl.settings.enable_writes)
+
+    def test_independent_preheat_is_valid_and_removal_fails_closed(self):
+        b = running_boards(["1"])
+        b.phase = "preheating"
+        b.running = False
+        b.paused = False
+        b.user_paused = False
+        b.power_w = 0.0
+        b.hashrate = 0.0
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertTrue(ctrl._positive_lifecycle(ctrl._last_obs))
+        self.assertEqual(ctrl.actual_mode, "APPLYING")
+        self.assertEqual(b.write_names(), [])
+        b.phase = "applying"
+        b.status = "applying"
+        b.pause_reason = ""
+        b.power_w = 0.0
+        b.hashrate = 0.0
+        ctrl.tick()
+        self.assertNotEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertFalse(ctrl._transition_evidence)
+        self.assertEqual(b.write_names(), [])
+
+    def test_valid_paused_zero_power_is_not_a_fault(self):
+        b = paused_one_board()
+        ctrl = make_controller(b, "PAUSED", enable_writes=False)
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "VALID_PAUSED")
+        self.assertEqual(ctrl.actual_mode, "PAUSED")
+        self.assertEqual(ctrl.observed_miner_mode, "PAUSED")
+        self.assertEqual(ctrl.controller_state, "OBSERVING")
+        self.assertNotEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertNotEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertEqual(b.power_w, 0.0)
+        self.assertEqual(b.hashrate, 0.0)
+        self.assertEqual(b.write_names(), [])
+
+    def test_actual_modes_split_physical_from_controller(self):
+        for physical in ("PAUSED", "ONE_BOARD", "TWO_BOARD", "THREE_BOARD"):
+            self.assertIn(physical, OBSERVED_MINER_MODES)
+            self.assertIn(physical, ACTUAL_MODES)
+        for controller_only in ("APPLYING", "WAITING_FOR_BRAIINS", "FAULT_LATCHED", "ERROR"):
+            self.assertIn(controller_only, ACTUAL_MODES)
+            self.assertNotIn(controller_only, OBSERVED_MINER_MODES)
+            self.assertIn(controller_only, CONTROLLER_STATES)
+        self.assertIn("OBSERVING", CONTROLLER_STATES)
+        self.assertIn("DISARMED", CONTROLLER_STATES)
+        self.assertIn("RUNNING", CONTROLLER_STATES)
+        b = running_boards(["1", "2", "3"])
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "THREE_BOARD")
+        self.assertEqual(ctrl.observed_miner_mode, "THREE_BOARD")
+        self.assertTrue(ctrl.actual_mode in OBSERVED_MINER_MODES)
+        self.assertEqual(ctrl.controller_state, "RUNNING")
+        self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_actual_mode"], "THREE_BOARD")
+        self.assertEqual(ctrl.ha._states["sensor.lard_miner_mode_desired"], "THREE_BOARD")
+
+    def test_poll_loop_fault_then_recovery_ready_without_rearm(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self.assertEqual(ctrl.observed_miner_mode, "ONE_BOARD")
+        self.assertEqual(ctrl.controller_state, "RUNNING")
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+
+        b.phase = "preheating"
+        b.running = False
+        b.paused = False
+        b.user_paused = False
+        b.power_w = 0.0
+        b.hashrate = 0.0
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertEqual(ctrl.actual_mode, "APPLYING")
+        self.assertEqual(ctrl.controller_state, "APPLYING")
+
+        self._refused(b)
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(ctrl.controller_state, "WAITING_FOR_BRAIINS")
+        self.assertNotEqual(ctrl.observed_miner_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(b.write_names(), [])
+
+        ctrl._clock.t = ctrl._verification_ctx["evidence_deadline_mono"] + 1
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertNotEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertIn("bosminer_unavailable_during_verification", ctrl.last_error)
+        self.assertEqual(b.write_names(), [])
+
+        b.boards_http = 200
+        b.phase = "running"
+        b.status = "normal"
+        b.running = True
+        b.paused = False
+        b.user_paused = False
+        b.power_w = 400.0
+        b.hashrate = 20.0
+        b.enabled = ["1"]
+        for _ in range(5):
+            ctrl.tick()
+            self.assertEqual(b.write_names(), [])
+            self.assertFalse(ctrl.settings.enable_writes)
+            self.assertFalse(ctrl.write_permission.permitted)
+        self.assertTrue(ctrl.recovery_ready)
+        self.assertGreaterEqual(ctrl._valid_poll_streak, 5)
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.observed_miner_mode, "ONE_BOARD")
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertNotIn("pause", b.write_names())
+        self.assertNotIn("resume", b.write_names())
+        self.assertNotIn("patch_boards", b.write_names())
+        self.assertNotIn("set_power", b.write_names())
+
+
+class FoundationFinishTests(unittest.TestCase):
+    """Observe-only fence, freshness, and inventory. Fake clock. No live HTTP.
+
+    Sticky WAITING and the applying-token false transition are still proved by
+    VerificationSafetyTests. Those assertions fail on commit 132dbaa.
+    """
+
+    def _blocked(self, result, operation: str) -> dict:
+        self.assertIsInstance(result, tuple, operation)
+        code, body = result
+        self.assertEqual(code, 0, operation)
+        self.assertEqual(body.get("result"), "WRITE_BLOCKED", operation)
+        self.assertEqual(body.get("requested_operation"), operation)
+        self.assertEqual(body.get("op"), operation)
+        self.assertIn(body.get("source"), {"braiins", "controller"})
+        self.assertIn("controller_state", body)
+        self.assertFalse(body.get("enable_writes"), operation)
+        self.assertTrue(body.get("reason"), operation)
+        self.assertFalse(body.get("network_write_sent"), operation)
+        self.assertTrue(body.get("denied"), operation)
+        self.assertTrue(body.get("write_blocked"), operation)
+        return body
+
+    def test_startup_and_reload_stay_disarmed_with_no_write(self):
+        self.assertFalse(Settings().enable_writes)
+        b = paused_one_board()
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        self.assertEqual(ctrl.controller_state, "DISARMED")
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        self.assertEqual(ctrl.observed_miner_mode, "UNVERIFIED")
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.write_permission.reason, "startup_disarmed")
+        ctrl._pending_profile = CoolingProfile("EXPLICIT", 80, None, None)
+        ctrl._pending_explicit = True
+        self.assertEqual(ctrl.reconcile_after_reload(), "clean")
+        self.assertIsNone(ctrl._pending_profile)
+        self.assertFalse(ctrl._pending_explicit)
+        self.assertEqual(ctrl.controller_state, "DISARMED")
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        self.assertEqual(ctrl.observed_miner_mode, "UNVERIFIED")
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.write_permission.controller_state, "DISARMED")
+        self.assertFalse(ctrl.apply_mode("THREE_BOARD"))
+        self.assertEqual(ctrl.actual_mode, "PAUSED")
+        self.assertEqual(b.write_names(), [])
+        self.assertEqual(ctrl._last_write_blocked["result"], "WRITE_BLOCKED")
+        self.assertFalse(ctrl._last_write_blocked["network_write_sent"])
+        ctrl.tick()
+        self.assertEqual(b.write_names(), [])
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertNotEqual(ctrl.controller_state, "ARMED")
+        self.assertEqual(ctrl.observed_miner_mode, "PAUSED")
+
+    def test_unbound_client_blocks_before_request_construction(self):
+        tmp = Path(tempfile.mkdtemp(prefix="lard-unbound-"))
+        settings = Settings(
+            braiins_password="x",
+            data_dir=tmp,
+            share_dir=tmp / "share",
+            enable_writes=False,
+            cooling_control_enabled=True,
+        )
+        client = Braiins(settings, Logger(settings))
+        self.assertIsNone(client.write_permission)
+        with unittest.mock.patch("urllib.request.Request") as request, unittest.mock.patch(
+            "urllib.request.urlopen"
+        ) as urlopen:
+            self._blocked(client.pause(), "pause")
+            self._blocked(client.resume(), "resume")
+            self._blocked(client.set_power(944), "set_power")
+            self._blocked(client.patch_boards(True, ["1", "2", "3"]), "patch_boards")
+            self._blocked(client.set_cooling_auto(80, None), "cooling_put")
+            with self.assertRaises(RuntimeError):
+                client.start()
+            with self.assertRaises(RuntimeError):
+                client.restart()
+            request.assert_not_called()
+            urlopen.assert_not_called()
+        self.assertIsNone(client.write_permission)
+
+    def test_legacy_controller_paths_block_before_client_writes(self):
+        b = paused_one_board()
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        self.assertTrue(ctrl.settings.cooling_control_enabled)
+        ctrl._pending_profile = CoolingProfile("EXPLICIT", 70, None, None)
+        self.assertFalse(ctrl.request_cooling_ceiling(80))
+        self.assertFalse(ctrl.request_temperature_policy())
+        self.assertFalse(ctrl.apply_mode("PAUSED"))
+        self.assertIsNone(ctrl._pending_profile)
+        self.assertEqual(b.write_names(), [])
+        self.assertEqual(b.cooling_puts(), [])
+        record = ctrl._last_write_blocked
+        self.assertEqual(record["result"], "WRITE_BLOCKED")
+        self.assertEqual(record["source"], "controller")
+        self.assertFalse(record["network_write_sent"])
+        self.assertFalse(record["enable_writes"])
+        log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertIn("result=WRITE_BLOCKED", log)
+        self.assertIn("network_write_sent=false", log)
+
+    def test_writer_inventory_matches_code_and_gates_network_paths(self):
+        path = Path(__file__).resolve().parents[1] / "docs" / "phase1-writer-inventory.json"
+        data = json.loads(path.read_text())
+        self.assertEqual(data["writers"], [dict(item) for item in WRITER_INVENTORY])
+        self.assertTrue(data["observe_only_deploy_blocked"])
+        self.assertFalse(data["ha_inventory"]["applied_live"])
+        bypasses = {item["path"] for item in data["ha_hard_bypasses"]}
+        for required in (
+            "button.lard_mining_pause",
+            "button.lard_mining_resume",
+            "button.lard_bosminer_start",
+            "button.lard_bosminer_stop",
+            "button.lard_bosminer_restart",
+            "button.lard_device_reboot",
+            "button.lard_tuner_increase_power_target",
+            "number.lard_power_target",
+            "number.lard_hashrate_target",
+            "select.lard_performance_mode",
+            "switch.lard_device_locate_led_blinking",
+            "script.solar_miner_pause",
+            "script.solar_miner_resume_min",
+            "script.solar_miner_set_target",
+            "script.solar_miner_evaluate",
+            "lovelace dashboard solar-miner",
+        ):
+            self.assertIn(required, bypasses)
+        for item in data["ha_hard_bypasses"]:
+            self.assertTrue(item["hard_bypass"], item["path"])
+            self.assertFalse(item["lard_enable_writes_covers"], item["path"])
+            self.assertIn("not applied", item["disposition"].lower())
+        self.assertTrue(data["ha_runbook_not_applied"])
+        self.assertIn("do not apply", data["ha_runbook_not_applied"][0].lower())
+        gated = [item for item in data["writers"] if item["disposition"] == "gated"]
+        self.assertGreaterEqual(len(gated), 6)
+        for item in data["writers"]:
+            self.assertTrue(item["gate_before_network"], item["path"])
+            self.assertIn(item["status"], {"active", "retired"})
+        names = {item["path"] for item in data["writers"]}
+        for required in (
+            "Braiins.pause",
+            "Braiins.resume",
+            "Braiins.set_power",
+            "Braiins.patch_boards",
+            "Braiins.set_cooling_auto",
+            "Braiins.start",
+            "Controller.apply_mode",
+        ):
+            self.assertIn(required, names)
+        text = (Path(__file__).resolve().parent / "controller.py").read_text()
+        self.assertNotIn('controller_state = "MAINTENANCE_LOCKOUT"', text)
+        self.assertEqual(text.count("write_permission.permitted = True"), 1)
+        self.assertIn("MAINTENANCE_LOCKOUT", CONTROLLER_STATES)
+
+    def test_observability_under_failure_fixtures(self):
+        refused = {
+            "message": "BOSminer API connection error: Connection refused (os error 111)",
+        }
+        cases = (
+            ("bosminer_500", 500, refused, "BOSMINER_UNAVAILABLE", True, False),
+            (
+                "bosminer_412",
+                412,
+                {"message": "BOSminer is not running"},
+                "BOSMINER_UNAVAILABLE",
+                True,
+                False,
+            ),
+            (
+                "auth",
+                401,
+                {"message": "Missing or invalid authentication token password=s3cret"},
+                "AUTHENTICATION_FAILED",
+                True,
+                False,
+            ),
+            (
+                "generic_500",
+                500,
+                {"message": "timeout"},
+                "API_UNREACHABLE",
+                True,
+                False,
+            ),
+            (
+                "malformed",
+                500,
+                {"message": "hashboards malformed"},
+                "REQUIRED_TELEMETRY_MALFORMED",
+                True,
+                False,
+            ),
+        )
+        for name, code, body, klass, api_up, bosminer in cases:
+            miner = running_boards(["1"])
+            miner.boards_http = code
+            miner.boards_error_body = body
+            ctrl = make_controller(miner, "ONE_BOARD", enable_writes=False)
+            ctrl.tick()
+            self.assertEqual(ctrl.telemetry_class, klass, name)
+            self.assertEqual(ctrl._api_reachable, api_up, name)
+            self.assertEqual(ctrl._bosminer_available, bosminer, name)
+            self.assertFalse(ctrl._required_telemetry_fresh, name)
+            self.assertEqual(ctrl.ha._states["sensor.lard_controller_power_w"], "unknown", name)
+            self.assertEqual(ctrl.ha._states["sensor.lard_controller_boards"], "unverified", name)
+            power_attrs = ctrl.ha._attrs["sensor.lard_controller_power_w"]
+            self.assertFalse(power_attrs["fresh"], name)
+            self.assertEqual(power_attrs["unit_of_measurement"], "W", name)
+            self.assertIsNone(power_attrs["last_power_w"], name)
+            health = ctrl.ha._attrs["sensor.lard_controller_health"]
+            self.assertEqual(health["health_classification"], klass, name)
+            self.assertEqual(health["api_reachable"], api_up, name)
+            self.assertEqual(health["bosminer_available"], bosminer, name)
+            self.assertEqual(health["write_gate"], "DISARMED", name)
+            self.assertFalse(health["recovery_ready"], name)
+            self.assertEqual(health["observed_miner_mode"], "UNVERIFIED", name)
+            self.assertNotIn(
+                health["observed_miner_mode"],
+                {"WAITING_FOR_BRAIINS", "APPLYING", "FAULT_LATCHED", "UNKNOWN", "ERROR"},
+            )
+            self.assertFalse(health["endpoints"]["boards"]["fresh"], name)
+            summary = health["endpoints"]["boards"]["last_failure_summary"]
+            self.assertNotIn("s3cret", summary, name)
+            self.assertEqual(miner.write_names(), [], name)
+
+        transport = running_boards(["1"])
+
+        def _down():
+            raise OSError("timed out")
+
+        transport.enabled_ids = _down  # type: ignore[method-assign]
+        ctrl_down = make_controller(transport, "ONE_BOARD", enable_writes=False)
+        ctrl_down.tick()
+        self.assertEqual(ctrl_down.telemetry_class, "API_UNREACHABLE")
+        self.assertFalse(ctrl_down._api_reachable)
+        self.assertEqual(ctrl_down.ha._states["sensor.lard_controller_power_w"], "unknown")
+
+        empty = running_boards([])
+        empty.enabled = []
+        ctrl_empty = make_controller(empty, "THREE_BOARD", enable_writes=False)
+        ctrl_empty.tick()
+        self.assertEqual(ctrl_empty.actual_mode, "ERROR")
+        self.assertEqual(ctrl_empty.observed_miner_mode, "UNVERIFIED")
+        self.assertNotEqual(ctrl_empty.ha._states["sensor.lard_controller_boards"], "1,2,3")
+        self.assertEqual(empty.write_names(), [])
+
+        partial = running_boards(["1"])
+        ctrl_partial = make_controller(partial, "THREE_BOARD", enable_writes=False)
+        ctrl_partial.tick()
+        self.assertEqual(ctrl_partial.observed_miner_mode, "ONE_BOARD")
+        self.assertNotEqual(ctrl_partial.observed_miner_mode, "THREE_BOARD")
+        self.assertEqual(ctrl_partial.ha._states["sensor.lard_controller_boards"], "1")
+        self.assertTrue(ctrl_partial.ha._attrs["sensor.lard_controller_boards"]["fresh"])
+        self.assertEqual(ctrl_partial.telemetry_class, "RUNNING_HEALTHY")
+
+        healthy = running_boards(["1", "2", "3"])
+        ctrl_ok = make_controller(healthy, "THREE_BOARD", enable_writes=False)
+        ctrl_ok.tick()
+        self.assertEqual(ctrl_ok.telemetry_class, "RUNNING_HEALTHY")
+        self.assertEqual(ctrl_ok.observed_miner_mode, "THREE_BOARD")
+        self.assertEqual(ctrl_ok.controller_state, "RUNNING")
+        self.assertEqual(ctrl_ok.ha._states["sensor.lard_controller_power_w"], 400.0)
+        saved = ctrl_ok.power_w
+
+        def cooling_down():
+            return 500, {"message": "password=s3cret"}
+
+        healthy.get_cooling_state = cooling_down  # type: ignore[method-assign]
+        ctrl_ok.tick()
+        self.assertEqual(ctrl_ok.telemetry_class, "RUNNING_HEALTHY")
+        self.assertTrue(ctrl_ok._bosminer_available)
+        self.assertTrue(ctrl_ok._api_reachable)
+        self.assertFalse(ctrl_ok._endpoint_fresh("cooling"))
+        cooling = ctrl_ok._endpoints["cooling"]
+        self.assertEqual(cooling["last_failure_class"], "COOLING_UNAVAILABLE")
+        self.assertNotIn("s3cret", cooling["last_failure_summary"])
+        self.assertIn("REDACTED", cooling["last_failure_summary"])
+        self.assertEqual(ctrl_ok.ha._states["sensor.lard_controller_power_w"], saved)
+        self.assertEqual(healthy.write_names(), [])
+
+        stale = running_boards(["1"])
+        ctrl_stale = make_controller(stale, "ONE_BOARD", enable_writes=False)
+        ctrl_stale.tick()
+        self.assertEqual(ctrl_stale.ha._states["sensor.lard_controller_power_w"], 400.0)
+        stale.details_http = 500
+        ctrl_stale.tick()
+        self.assertEqual(ctrl_stale.ha._states["sensor.lard_controller_power_w"], "unknown")
+        self.assertEqual(ctrl_stale.ha._states["sensor.lard_controller_boards"], "unverified")
+        self.assertEqual(ctrl_stale.ha._attrs["sensor.lard_controller_power_w"]["last_power_w"], 400.0)
+        self.assertFalse(ctrl_stale.ha._attrs["sensor.lard_controller_power_w"]["fresh"])
+        self.assertEqual(ctrl_stale.ha._attrs["sensor.lard_controller_boards"]["last_boards"], "1")
+
+    def test_fault_drops_pending_and_gate_tracks_waiting(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        ctrl._pending_profile = CoolingProfile("EXPLICIT", 80, None, None)
+        ctrl._pending_explicit = True
+        ctrl.tick()
+        self.assertIsNone(ctrl._pending_profile)
+        self.assertEqual(b.write_names(), [])
+
+        b2 = running_boards(["1"])
+        b2.phase = "preheating"
+        b2.running = False
+        b2.power_w = 0.0
+        ctrl2 = make_controller(b2, "ONE_BOARD", enable_writes=False)
+        ctrl2.tick()
+        self.assertEqual(ctrl2.telemetry_class, "VALID_TRANSITION")
+        b2.boards_http = 500
+        b2.boards_error_body = {
+            "message": "BOSminer API connection error: Connection refused (os error 111)",
+        }
+        ctrl2._pending_profile = CoolingProfile("EXPLICIT", 80, None, None)
+        ctrl2.tick()
+        self.assertEqual(ctrl2.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(ctrl2.write_permission.controller_state, "WAITING_FOR_BRAIINS")
+        self.assertNotEqual(ctrl2.observed_miner_mode, "WAITING_FOR_BRAIINS")
+        ctrl2._clock.t = ctrl2._verification_ctx["evidence_deadline_mono"] + 1
+        ctrl2.tick()
+        self.assertEqual(ctrl2.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl2.write_permission.controller_state, "FAULT_LATCHED")
+        self.assertIsNone(ctrl2._pending_profile)
+        self.assertFalse(ctrl2.settings.enable_writes)
+        self.assertFalse(ctrl2.write_permission.permitted)
+        self.assertEqual(b2.write_names(), [])
+
+    def test_maintenance_lockout_is_never_entered(self):
+        b = running_boards(["1", "2", "3"])
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        ctrl.tick()
+        self.assertNotEqual(ctrl.controller_state, "MAINTENANCE_LOCKOUT")
+        self.assertNotEqual(ctrl.actual_mode, "MAINTENANCE_LOCKOUT")
+        self.assertNotEqual(ctrl.observed_miner_mode, "MAINTENANCE_LOCKOUT")
+        self.assertNotIn("MAINTENANCE_LOCKOUT", OBSERVED_MINER_MODES)
+
+    def test_overlapping_lard_controls_block_before_http(self):
+        """braiins_os_plus owns the live buttons. LARD's matching client methods stay gated."""
+        self.assertIn("number.lard_power_target", FORBIDDEN_HA_WRITES)
+        tmp = Path(tempfile.mkdtemp(prefix="lard-overlap-"))
+        settings = Settings(
+            braiins_password="x",
+            data_dir=tmp,
+            share_dir=tmp / "share",
+            enable_writes=False,
+        )
+        ha = HA(["http://127.0.0.1:9"], "token", Logger(settings))
+        posted = []
+        ha._req = lambda *args, **kwargs: posted.append(args)  # type: ignore[method-assign]
+        ha.set_state("number.lard_power_target", 1850)
+        self.assertEqual(posted, [])
+        client = Braiins(settings, Logger(settings))
+        with unittest.mock.patch("urllib.request.Request") as request, unittest.mock.patch(
+            "urllib.request.urlopen"
+        ) as urlopen:
+            for operation, result in (
+                ("pause", client.pause()),
+                ("resume", client.resume()),
+                ("set_power", client.set_power(1850)),
+            ):
+                self._blocked(result, operation)
+            with self.assertRaises(RuntimeError):
+                client.start()
+            with self.assertRaises(RuntimeError):
+                client.restart()
+            request.assert_not_called()
+            urlopen.assert_not_called()
+        text = (Path(__file__).resolve().parent / "controller.py").read_text()
+        self.assertNotIn("platform: braiins_os_plus", text)
+        self.assertNotIn("button.lard_mining_pause", text)
 
 
 if __name__ == "__main__":
