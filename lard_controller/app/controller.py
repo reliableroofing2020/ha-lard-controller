@@ -90,7 +90,29 @@ FORBIDDEN_HA_WRITES = frozenset(
 )
 
 MODES = ("PAUSED", "ONE_BOARD", "TWO_BOARD", "THREE_BOARD")
-ACTUAL_MODES = ("PAUSED", "APPLYING", "ONE_BOARD", "TWO_BOARD", "THREE_BOARD", "ERROR")
+# Verified physical miner modes only. Never a controller lifecycle label.
+OBSERVED_MINER_MODES = ("PAUSED", "ONE_BOARD", "TWO_BOARD", "THREE_BOARD")
+# Controller lifecycle. Not a claim about hashboards or pause state.
+CONTROLLER_STATES = (
+    "OBSERVING",
+    "DISARMED",
+    "APPLYING",
+    "WAITING_FOR_BRAIINS",
+    "RUNNING",
+    "FAULT_LATCHED",
+    "ERROR",
+)
+# Compatibility values historically published on sensor.lard_controller_actual_mode.
+# A value is a verified physical miner mode only when it is also in
+# OBSERVED_MINER_MODES. APPLYING, ERROR, WAITING_FOR_BRAIINS, and
+# FAULT_LATCHED are controller states kept here so existing dashboards
+# do not lose the latch. Read observed_miner_mode for the physical mode.
+ACTUAL_MODES = OBSERVED_MINER_MODES + (
+    "APPLYING",
+    "ERROR",
+    "WAITING_FOR_BRAIINS",
+    "FAULT_LATCHED",
+)
 BOARD_MAP = {
     "PAUSED": ["1"],
     "ONE_BOARD": ["1"],
@@ -249,12 +271,18 @@ HEALTH_CLASSES = (
 TERMINAL_HEALTH = frozenset({"DEGRADED_NEEDS_ATTENTION", "ERROR", "INTERRUPTED_MANUAL_REVIEW"})
 # In-flight cooling txn marker. Monotonic deadlines are NOT stored here.
 INFLIGHT_TXN_NAME = "cooling_txn_inflight.json"
-# 0 W / 0 TH/s extends the recovery window only for these exact tokens.
+# Independent miner-side lifecycle tokens for VALID_TRANSITION and for
+# extending a cooling recovery window. Source is GET /api/v1/miner/details
+# (status, detailed_status phase, pause reason), parsed by parse_mining_state.
+# Parser flags starting / preheating / ramping are equality checks on those
+# same miner fields. None of these are LARD desired_mode, requested mode,
+# actual_mode, or controller_state.
+# "applying" is intentionally absent. It is a controller request / interim
+# label, not a Braiins miner lifecycle, and must not qualify on its own.
 # Match whole tokens, never substrings: "init" does not match "reinitializing".
 # "running", "paused", unknown strings, and bare watts are not in this set.
 LEGITIMATE_LIFECYCLE_TOKENS = frozenset(
     {
-        "applying",
         "cooldown",
         "cooling_down",
         "preheating",
@@ -2506,6 +2534,19 @@ class Controller:
             self.b.write_permission = self.write_permission
         self.telemetry_class = "UNKNOWN"
         self.observed_state = "UNKNOWN"
+        self.controller_state = "DISARMED"
+        self.observed_miner_mode = "UNVERIFIED"
+        self._last_verified_miner_mode = ""
+        self._fault_latched = False
+        self._verification_ctx = {
+            "transaction_id": "",
+            "entered_mono": 0.0,
+            "expected_operation": "",
+            "evidence_deadline_mono": 0.0,
+            "last_valid_telemetry_mono": 0.0,
+            "reason": "",
+            "evidence": "",
+        }
         self.recovery_ready = False
         self._valid_poll_streak = 0
         self._auth_ok = False
@@ -3237,7 +3278,12 @@ class Controller:
         self._board_unverified = status != "verified"
         self.telemetry_class = "FAULT_LATCHED"
         self.observed_state = "FAULT_LATCHED"
-        self.last_error = f"board_wait_timeout expect={expect} readback={status}"
+        self._fault_latched = True
+        self.controller_state = "FAULT_LATCHED"
+        self.last_error = (
+            f"board_wait_timeout expect={expect} readback={status}"
+            "|board_verification_timeout_or_mismatch"
+        )
         self.log(
             f"board_readback faulted_unverified expect={expect} "
             f"readback={status} patch_http=200"
@@ -4158,23 +4204,49 @@ class Controller:
         return tokens
 
     def _positive_lifecycle(self, obs: MinerObservation) -> bool:
-        """Named transitional evidence only.
+        """Independent miner-side transitional evidence only.
 
-        Allowed: exact tokens (APPLYING, cooldown, preheat, startup, init,
-        tuner, ramping, and the other names in ``LEGITIMATE_LIFECYCLE_TOKENS``)
-        and the parser's exact phase flags ``starting`` / ``preheating`` /
-        ``ramping``. Those flags are equality checks in ``parse_mining_state``,
-        not substrings.
+        Allowed, and only from the current ``MinerObservation`` filled by
+        ``parse_mining_state`` on ``GET /api/v1/miner/details``:
 
-        Not positive: blanket ``running``, "not paused", unqualified watts,
-        unknown strings, ``miner_ready is False``, or ``init`` inside
-        ``reinitializing``. Hard fault wins over any token.
+        - parser flags ``starting``, ``preheating``, ``ramping`` (equality on
+          the miner ``detailed_status`` phase, not on a LARD label)
+        - exact tokens in ``LEGITIMATE_LIFECYCLE_TOKENS`` taken from miner
+          ``phase``, ``pause_reason``, or ``status`` (cooldown, cooling_down,
+          preheat/preheating, startup/starting, init/initializing, autotune/
+          tuning/tuner, ramping/ramp/quick_ramping, warming/warmup, booting)
+
+        Not positive: the word ``applying`` (controller request / cooling
+        interim), LARD ``desired_mode`` / ``actual_mode`` / ``controller_state``,
+        blanket ``running``, "not paused", unqualified watts or hashrate,
+        unknown strings, ``miner_ready is False``, a failed or stale read, or
+        ``init`` inside ``reinitializing``. Hard fault wins over any token.
         """
         if not obs.ok or self._hard_fault(obs):
             return False
         if obs.starting or obs.preheating or obs.ramping:
             return True
-        return bool(self._lifecycle_exact_tokens(obs) & LEGITIMATE_LIFECYCLE_TOKENS)
+        tokens = set(self._lifecycle_exact_tokens(obs))
+        tokens.discard("applying")
+        return bool(tokens & LEGITIMATE_LIFECYCLE_TOKENS)
+
+    def _controller_label_only(self, obs: MinerObservation) -> bool:
+        """True when the only lifecycle word is the controller label ``applying``.
+
+        A live ``running`` or paused miner is not this case, even at 0 W.
+        """
+        if not obs.ok or obs.running or obs.paused or obs.user_paused:
+            return False
+        if obs.starting or obs.preheating or obs.ramping:
+            return False
+        if self._paused_confirmed(obs):
+            return False
+        tokens = set(self._lifecycle_exact_tokens(obs))
+        tokens.discard("applying")
+        if tokens & LEGITIMATE_LIFECYCLE_TOKENS:
+            return False
+        blob = self._lifecycle_text(obs)
+        return "applying" in blob.split()
 
     def _expected_board_ids(self, mode: str) -> list[str]:
         """Configured topology. Never the length of a partial hashboards response."""
@@ -4780,6 +4852,17 @@ class Controller:
             "cooling_control_enabled": bool(self.settings.cooling_control_enabled),
             "telemetry_class": self.telemetry_class,
             "observed_state": self.observed_state,
+            "observed_miner_mode": self.observed_miner_mode,
+            "controller_state": self.controller_state,
+            "last_verified_miner_mode": self._last_verified_miner_mode,
+            "actual_mode_is_physical": self.actual_mode in OBSERVED_MINER_MODES,
+            "verification_transaction_id": self._verification_ctx.get("transaction_id") or "",
+            "verification_entered_mono": self._verification_ctx.get("entered_mono") or 0.0,
+            "verification_expected_operation": self._verification_ctx.get("expected_operation") or "",
+            "verification_evidence_deadline_mono": self._verification_ctx.get("evidence_deadline_mono") or 0.0,
+            "verification_last_valid_telemetry_mono": self._verification_ctx.get("last_valid_telemetry_mono") or 0.0,
+            "verification_reason": self._verification_ctx.get("reason") or "",
+            "verification_evidence": self._verification_ctx.get("evidence") or "",
             "requested_mode": self.desired_mode,
             "recovery_ready": bool(self.recovery_ready),
             "recovery_valid_polls": int(self._valid_poll_streak),
@@ -4796,7 +4879,10 @@ class Controller:
     def _sync_idle_health(self, obs: MinerObservation | None) -> None:
         if self._cooling_txn_active or self._cooling_transition_active:
             return
-        if self._health_class in {"DEGRADED_NEEDS_ATTENTION", "ERROR"}:
+        if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
+            self._health_class = "FAULT_LATCHED"
+            return
+        if self._health_class in {"DEGRADED_NEEDS_ATTENTION", "ERROR", "FAULT_LATCHED"}:
             return
         if self.actual_mode == "APPLYING":
             self._health_class = "APPLYING"
@@ -5424,15 +5510,170 @@ class Controller:
         obs.board_health_verified = verified
         obs.boards_healthy = bool(healthy and verified and not obs.safety_fault and not obs.board_stale)
 
+    def _evidence_window_s(self) -> float:
+        """Configured monotonic verification window. Not a larger fallback."""
+        return max(1.0, float(self.settings.expected_recovery_seconds or EXPECTED_RECOVERY_S))
+
     def _transition_evidence_fresh(self) -> bool:
-        """Coherent lifecycle evidence still inside the monotonic recovery window.
+        """Independent lifecycle evidence still inside the monotonic window.
 
         A previous APPLYING label is not evidence. Zero watts is not evidence.
+        The word "applying" is not evidence.
         """
         if not self._transition_evidence:
             return False
-        window = float(self.settings.expected_recovery_seconds or EXPECTED_RECOVERY_S)
-        return (self._now() - self._transition_evidence_mono) <= max(1.0, window)
+        return (self._now() - self._transition_evidence_mono) <= self._evidence_window_s()
+
+    def _verification_deadline_expired(self) -> bool:
+        """True when independent evidence is missing or past its deadline.
+
+        A recorded WAITING deadline is also honored and is never extended by
+        a later unavailable poll.
+        """
+        if not self._transition_evidence_fresh():
+            return True
+        deadline = float(self._verification_ctx.get("evidence_deadline_mono") or 0.0)
+        if deadline and self._now() > deadline:
+            return True
+        return False
+
+    def _in_verification_state(self) -> bool:
+        """APPLYING, WAITING_FOR_BRAIINS, or an active cooling transition."""
+        return (
+            self.actual_mode in {"APPLYING", "WAITING_FOR_BRAIINS"}
+            or self.controller_state in {"APPLYING", "WAITING_FOR_BRAIINS"}
+            or self._cooling_transition_active
+        )
+
+    def _verified_physical_mode(self, obs: MinerObservation | None) -> str:
+        """Physical mode from a current coherent miner read. Empty if unverified."""
+        if obs is None or not getattr(obs, "ok", False):
+            return ""
+        if self._hard_fault(obs):
+            return ""
+        if self._paused_confirmed(obs):
+            return "PAUSED"
+        if obs.running and not self._is_paused(obs):
+            boards = set(obs.enabled_ids)
+            if boards == {"1", "2", "3"}:
+                return "THREE_BOARD"
+            if boards == {"1", "2"}:
+                return "TWO_BOARD"
+            if boards == {"1"}:
+                return "ONE_BOARD"
+        return ""
+
+    def _sync_mode_contract(self, obs: MinerObservation | None = None) -> None:
+        """Publish physical mode and controller lifecycle as different fields.
+
+        ``actual_mode`` stays the compatibility sensor. It is a verified
+        physical mode only when the value is in ``OBSERVED_MINER_MODES``.
+        """
+        if obs is None:
+            obs = getattr(self, "_last_obs", None)
+        physical = self._verified_physical_mode(obs)
+        if physical:
+            self.observed_miner_mode = physical
+            self._last_verified_miner_mode = physical
+        elif (
+            self.actual_mode in OBSERVED_MINER_MODES
+            and self.telemetry_class in {"VALID_PAUSED", "RUNNING_HEALTHY"}
+            and not self._fault_latched
+        ):
+            self.observed_miner_mode = self.actual_mode
+            self._last_verified_miner_mode = self.actual_mode
+        else:
+            self.observed_miner_mode = "UNVERIFIED"
+
+        if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
+            self.controller_state = "FAULT_LATCHED"
+            return
+        if self.actual_mode == "WAITING_FOR_BRAIINS":
+            self.controller_state = "WAITING_FOR_BRAIINS"
+            return
+        if self.actual_mode == "APPLYING" or self._cooling_transition_active:
+            self.controller_state = "APPLYING"
+            return
+        if self.actual_mode == "ERROR":
+            self.controller_state = "ERROR"
+            return
+        if (
+            self.observed_miner_mode in {"ONE_BOARD", "TWO_BOARD", "THREE_BOARD"}
+            and self.telemetry_class == "RUNNING_HEALTHY"
+        ):
+            self.controller_state = "RUNNING"
+            return
+        if self.observed_miner_mode in OBSERVED_MINER_MODES:
+            self.controller_state = "OBSERVING"
+            return
+        self.controller_state = "DISARMED"
+
+    def _fault_reason_for_verification(self) -> str:
+        """Distinguish why verification ended in FAULT_LATCHED."""
+        cls = self.telemetry_class
+        err = (self.last_error or "").lower()
+        had_evidence = bool(self._transition_evidence_mono)
+        expired = not self._transition_evidence_fresh()
+        if (
+            self._board_unverified
+            or "faulted_unverified" in err
+            or "board_wait_timeout" in err
+        ):
+            reason = "board_verification_timeout_or_mismatch"
+        elif cls == "BOSMINER_UNAVAILABLE":
+            reason = "bosminer_unavailable_during_verification"
+        elif cls in {"REQUIRED_TELEMETRY_MALFORMED", "UNKNOWN"} or "malformed" in err:
+            reason = "required_telemetry_malformed"
+        elif cls == "FAULT_LATCHED" or self._critical_fault:
+            reason = "contradictory_telemetry"
+        elif cls in {"API_UNREACHABLE", "AUTHENTICATION_FAILED"}:
+            reason = "required_telemetry_unavailable"
+        elif expired and had_evidence:
+            reason = "valid_transition_evidence_expired"
+        else:
+            reason = "required_telemetry_unavailable"
+        if (
+            expired
+            and had_evidence
+            and "valid_transition_evidence_expired" not in reason
+        ):
+            reason = f"{reason}|valid_transition_evidence_expired"
+        return reason
+
+    def _enter_waiting_for_braiins(self) -> None:
+        """Bounded wait. Deadline is the existing evidence window, not a new one."""
+        now = self._now()
+        window = self._evidence_window_s()
+        deadline = float(self._transition_evidence_mono) + window
+        ctx = self._verification_ctx
+        if self.actual_mode != "WAITING_FOR_BRAIINS":
+            ctx["entered_mono"] = now
+            ctx["transaction_id"] = self._cooling_txn_id or ""
+            ctx["expected_operation"] = self.desired_mode or self.reason or ""
+            ctx["evidence_deadline_mono"] = deadline
+            ctx["last_valid_telemetry_mono"] = float(self._telemetry_last_success_mono or 0.0)
+            ctx["reason"] = self.telemetry_class or "telemetry_unavailable"
+            ctx["evidence"] = self._lifecycle_reason or "prior_independent_lifecycle"
+        elif not ctx.get("evidence_deadline_mono"):
+            ctx["evidence_deadline_mono"] = deadline
+        self.telemetry_class = "WAITING_FOR_BRAIINS"
+        self.observed_state = "WAITING_FOR_BRAIINS"
+        self.actual_mode = "WAITING_FOR_BRAIINS"
+        self.controller_state = "WAITING_FOR_BRAIINS"
+        self._cooling_transition_active = False
+
+    def _enter_fault_latched(self, reason: str) -> None:
+        """Latch a verification fault. Does not arm writes or issue a command."""
+        self._fault_latched = True
+        if reason and reason not in (self.last_error or ""):
+            self.last_error = f"{self.last_error}|{reason}" if self.last_error else reason
+        self.telemetry_class = "FAULT_LATCHED"
+        self.observed_state = "FAULT_LATCHED"
+        self.actual_mode = "FAULT_LATCHED"
+        self.controller_state = "FAULT_LATCHED"
+        self._health_class = "FAULT_LATCHED"
+        self._cooling_transition_active = False
+        self._transition_evidence = False
 
     def _recovery_sample_ok(self, obs: MinerObservation) -> bool:
         """One poll toward recovery readiness. Does not arm writes."""
@@ -5449,41 +5690,73 @@ class Controller:
         return True
 
     def _settle_unavailable_applying(self, obs: MinerObservation) -> None:
-        """APPLYING cannot stick when the API or bosminer is unavailable.
+        """Bound every verification state, including WAITING_FOR_BRAIINS.
 
-        In-flight apply/cooling transactions keep their own phase. With no
-        fresh lifecycle evidence the published mode leaves APPLYING for
-        FAULT_LATCHED. WAITING_FOR_BRAIINS requires that evidence.
+        APPLYING may enter WAITING_FOR_BRAIINS only while independent miner
+        lifecycle evidence is still inside the configured monotonic window.
+        WAITING_FOR_BRAIINS, APPLYING, and an active cooling transition all
+        re-check that window on every poll. Deadline expiry, malformed or
+        contradictory telemetry, or a read that cannot establish a miner
+        lifecycle leaves FAULT_LATCHED. The latch does not arm writes.
+
+        An in-flight apply or cooling transaction keeps its own loop across a
+        transient miss. It still faults once a recorded evidence deadline has
+        passed and the miner read is still unavailable.
         """
-        if self._cooling_txn_active or self._apply_depth:
+        if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
             return
-        applying = self.actual_mode == "APPLYING" or self._cooling_transition_active
-        if not applying:
+        if self._health_class in TERMINAL_HEALTH:
             return
+        if not self._in_verification_state():
+            return
+        # An ok hard fault already has the cooling ERROR path. Do not relabel it.
+        if obs.ok and self._hard_fault(obs):
+            return
+        in_flight = bool(self._cooling_txn_active or self._apply_depth)
+        if in_flight:
+            waiting = (
+                self.actual_mode == "WAITING_FOR_BRAIINS"
+                or self.controller_state == "WAITING_FOR_BRAIINS"
+            )
+            recorded = float(self._verification_ctx.get("evidence_deadline_mono") or 0.0)
+            recorded_elapsed = bool(recorded and self._now() > recorded)
+            evidence_elapsed = bool(
+                self._transition_evidence and not self._transition_evidence_fresh()
+            )
+            if not (waiting or recorded_elapsed or evidence_elapsed):
+                return
+        # A live running or paused report is miner state, including 0 W.
+        if obs.ok and (
+            obs.running
+            or self._paused_confirmed(obs)
+            or self.telemetry_class in {"VALID_PAUSED", "VALID_TRANSITION", "RUNNING_HEALTHY"}
+        ):
+            if (
+                self.actual_mode == "WAITING_FOR_BRAIINS"
+                and self.telemetry_class == "VALID_TRANSITION"
+            ):
+                self.actual_mode = "APPLYING"
+                self.controller_state = "APPLYING"
+            return
+        applying_only = self._controller_label_only(obs)
+        unexplained = obs.ok and self.telemetry_class == "UNKNOWN"
         unavailable = (not obs.ok) or self.telemetry_class in {
             "API_UNREACHABLE",
             "AUTHENTICATION_FAILED",
             "BOSMINER_UNAVAILABLE",
             "REQUIRED_TELEMETRY_MALFORMED",
         }
-        if not unavailable:
+        if not unavailable and not applying_only and not unexplained:
             return
-        prior = self.telemetry_class
-        if self._transition_evidence_fresh():
-            self.telemetry_class = "WAITING_FOR_BRAIINS"
-            self.observed_state = "WAITING_FOR_BRAIINS"
-            self.actual_mode = "WAITING_FOR_BRAIINS"
-            self._cooling_transition_active = False
+        malformed = (
+            applying_only
+            or unexplained
+            or self.telemetry_class == "REQUIRED_TELEMETRY_MALFORMED"
+        )
+        if malformed or self._verification_deadline_expired():
+            self._enter_fault_latched(self._fault_reason_for_verification())
             return
-        if prior == "BOSMINER_UNAVAILABLE" and "bosminer_unavailable" not in (self.last_error or ""):
-            self.last_error = f"{self.last_error}|bosminer_unavailable"
-        self.telemetry_class = "FAULT_LATCHED"
-        self.observed_state = "FAULT_LATCHED"
-        self.actual_mode = "FAULT_LATCHED"
-        self._health_class = "FAULT_LATCHED"
-        self._cooling_transition_active = False
-        if not self.last_error:
-            self.last_error = "applying_without_miner"
+        self._enter_waiting_for_braiins()
 
     def _finish_observation(self, obs: MinerObservation) -> None:
         """Classify the read, update recovery readiness, settle stuck APPLYING.
@@ -5523,8 +5796,17 @@ class Controller:
         if positive:
             self._transition_evidence = True
             self._transition_evidence_mono = self._now()
+            if self._verification_ctx.get("evidence_deadline_mono"):
+                self._verification_ctx["evidence_deadline_mono"] = (
+                    self._transition_evidence_mono + self._evidence_window_s()
+                )
+            self._verification_ctx["last_valid_telemetry_mono"] = self._now()
         elif obs.ok:
             self._transition_evidence = False
+        elif obs.ok is False and self._telemetry_last_success_mono:
+            self._verification_ctx["last_valid_telemetry_mono"] = float(
+                self._telemetry_last_success_mono
+            )
         if self._recovery_sample_ok(obs):
             self._valid_poll_streak += 1
         else:
@@ -5533,8 +5815,11 @@ class Controller:
         self._settle_unavailable_applying(obs)
         if self.actual_mode in {"FAULT_LATCHED", "WAITING_FOR_BRAIINS"}:
             self.observed_state = self.actual_mode
+        elif self._fault_latched:
+            self.observed_state = "FAULT_LATCHED"
         else:
             self.observed_state = self.telemetry_class
+        self._sync_mode_contract(obs)
 
     def observe_miner(self) -> MinerObservation:
         """Read boards + pause/mining state. Topology alone never confirms a live mode."""
@@ -5979,6 +6264,8 @@ class Controller:
             "desired_mode": self.desired_mode,
             "requested_mode": self.desired_mode,
             "actual_mode": self.actual_mode,
+            "observed_miner_mode": self.observed_miner_mode,
+            "controller_state": self.controller_state,
             "observed_state": self.observed_state,
             "telemetry_class": self.telemetry_class,
             "recovery_ready": bool(self.recovery_ready),
@@ -6034,6 +6321,7 @@ class Controller:
                 continue
 
     def publish(self, solar_avg: float, enable_on: bool):
+        self._sync_mode_contract(getattr(self, "_last_obs", None))
         if self._telemetry_freshness == "FRESH" and not self._telemetry_fault:
             self._sync_idle_health(getattr(self, "_last_obs", None))
         status = self._status_dict(solar_avg, enable_on)
@@ -6098,6 +6386,11 @@ class Controller:
                 "health_class": cool["health_class"],
                 "cooling_phase": cool["cooling_phase"],
                 "cooling_txn_id": cool["cooling_txn_id"],
+                "observed_miner_mode": self.observed_miner_mode,
+                "controller_state": self.controller_state,
+                "telemetry_class": self.telemetry_class,
+                "actual_mode_is_physical": self.actual_mode in OBSERVED_MINER_MODES,
+                "requested_mode": self.desired_mode,
             },
         )
         self.ha.set_state(
@@ -6185,17 +6478,28 @@ class Controller:
         )
 
     def read_actual_from_miner(self):
-        """Observe miner. Hashboard set {1} while user-paused is PAUSED, not ONE_BOARD."""
+        """Observe miner. Hashboard set {1} while user-paused is PAUSED, not ONE_BOARD.
+
+        FAULT_LATCHED stays latched across later good reads (recovery readiness
+        is advisory and does not clear it). WAITING_FOR_BRAIINS is not frozen:
+        ``_finish_observation`` already applied the evidence deadline.
+        """
         obs = self.observe_miner()
-        if self.actual_mode in {"FAULT_LATCHED", "WAITING_FOR_BRAIINS"}:
+        if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
+            self._sync_mode_contract(obs)
             return obs
         if self._cooling_transition_active:
             self.actual_mode = "APPLYING"
+            self._sync_mode_contract(obs)
+            return obs
+        if self.actual_mode == "WAITING_FOR_BRAIINS" and not obs.ok:
+            self._sync_mode_contract(obs)
             return obs
         mode = self.infer_actual_mode(obs)
         self.actual_mode = mode
         if mode in RANK:
             self.confirmed_operational = mode
+        self._sync_mode_contract(obs)
         return obs
 
     def tick(self):

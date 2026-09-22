@@ -1,6 +1,8 @@
 # Phase 1 observe-only (0.1.12)
 
-Addon version **0.1.12**. Writes stay disarmed. Operator note, bosminer-vs-telemetry troubleshooting, cooling-helper migration, the observe-only checklist, rollback, and the Home Assistant writer fence are in [docs/phase1-observe-only.md](docs/phase1-observe-only.md). Do not deploy this from the repo task. Do not set `enable_writes`. Do not merge until review.
+Addon version **0.1.12**. Writes stay disarmed. Operator note, bosminer-vs-telemetry troubleshooting, the bounded `WAITING_FOR_BRAIINS` rule, which miner fields count as `VALID_TRANSITION`, the `actual_mode` migration, cooling-helper migration, the observe-only checklist, rollback, and the Home Assistant writer fence are in [docs/phase1-observe-only.md](docs/phase1-observe-only.md). Do not deploy this from the repo task. Do not set `enable_writes`. Do not merge until an independent re-review.
+
+Safety correction on the same version: `WAITING_FOR_BRAIINS` expires to `FAULT_LATCHED` on the monotonic evidence deadline even when the controller is no longer in `APPLYING`. The word `applying` is not miner lifecycle evidence. `observed_miner_mode` is the physical mode; `controller_state` is the lifecycle; `actual_mode` remains the compatibility sensor.
 
 # Braiins owns cooling (0.1.11)
 
@@ -93,7 +95,7 @@ Tests: `test_device_reboot_start_and_restart_denied_before_http` patches `urllib
 
 ## H3
 
-`_positive_lifecycle` is an exact-token match against `LEGITIMATE_LIFECYCLE_TOKENS` (applying, cooldown, cooling_down, preheat/preheating, startup, starting, init, initializing, autotune/tuning/tuner, ramping/ramp/quick_ramping, warming/warmup, booting) plus adjacent bigrams (`cooling down` → `cooling_down`). Parser flags `starting`, `preheating`, and `ramping` are equality checks. Hard fault is checked first and is not positive. Blanket `running`, not-paused, unqualified watts, unknown strings, and `miner_ready is False` do not extend the window. `init` does not match `reinitializing`.
+`_positive_lifecycle` is an exact-token match against `LEGITIMATE_LIFECYCLE_TOKENS` (cooldown, cooling_down, preheat/preheating, startup, starting, init, initializing, autotune/tuning/tuner, ramping/ramp/quick_ramping, warming/warmup, booting) plus adjacent bigrams (`cooling down` → `cooling_down`). Parser flags `starting`, `preheating`, and `ramping` are equality checks on `GET /api/v1/miner/details`. Hard fault is checked first and is not positive. Blanket `running`, not-paused, unqualified watts, unknown strings, `miner_ready is False`, and the controller word `applying` do not extend the window and do not count as `VALID_TRANSITION`. `init` does not match `reinitializing`. (0.1.12 removed `applying` from this set. A cooling recovery log line `interim=applying` is still a controller phase name, not miner evidence.)
 
 The primary deadline is still stamped at start + maximum (default 600s). The recovery loop, including the `_active_confirmed` branch, returns exhausted once elapsed reaches the expected window (default 240s) unless the observation is a named positive lifecycle. A non-positive path is then one resume retry and the 180s post-retry window (about 420s). A named token still runs to the 600s maximum plus 180s (about 780s).
 

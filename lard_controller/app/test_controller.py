@@ -13,8 +13,12 @@ from collections import deque
 from pathlib import Path
 
 from controller import (
+    ACTUAL_MODES,
     ADDON_VERSION,
     API_5XX_BACKOFF_S,
+    CONTROLLER_STATES,
+    LEGITIMATE_LIFECYCLE_TOKENS,
+    OBSERVED_MINER_MODES,
     CHIP_ABORT_F,
     COOLING_DANGEROUS_C,
     COOLING_DANGEROUS_F,
@@ -2608,7 +2612,8 @@ class WriteEnableHardeningTests(unittest.TestCase):
         self.assertTrue(ctrl._positive_lifecycle(obs(phase="init")))
         self.assertTrue(ctrl._positive_lifecycle(obs(phase="cooldown")))
         self.assertTrue(ctrl._positive_lifecycle(obs(phase="preheat", preheating=True)))
-        self.assertTrue(ctrl._positive_lifecycle(obs(phase="applying")))
+        # "applying" is a controller label, not miner-side lifecycle evidence.
+        self.assertFalse(ctrl._positive_lifecycle(obs(phase="applying", power_w=0.0, hashrate=0.0)))
         self.assertTrue(ctrl._positive_lifecycle(obs(phase="ramping", ramping=True)))
         self.assertFalse(
             ctrl._positive_lifecycle(obs(phase="preheat", pause_reason="overheat", preheating=True))
@@ -3868,9 +3873,11 @@ class Phase1ObserveGateTests(unittest.TestCase):
         self.assertEqual(b2.write_names(), [])
 
         ctrl2._transition_evidence_mono = ctrl2._now() - 10_000
-        ctrl2.actual_mode = "APPLYING"
         ctrl2.tick()
         self.assertEqual(ctrl2.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl2.controller_state, "FAULT_LATCHED")
+        self.assertNotEqual(ctrl2.observed_miner_mode, "WAITING_FOR_BRAIINS")
+        self.assertNotEqual(ctrl2.observed_miner_mode, "APPLYING")
         self.assertEqual(b2.write_names(), [])
 
     def test_recovery_ready_does_not_rearm_writes(self):
@@ -3897,6 +3904,263 @@ class Phase1ObserveGateTests(unittest.TestCase):
             ctrl_b.tick()
         self.assertFalse(ctrl_b.recovery_ready)
         self.assertEqual(blocked.write_names(), [])
+
+
+_BOSMINER_REFUSED = {
+    "error": "Internal error",
+    "message": "BOSminer API connection error: Connection refused (os error 111)",
+}
+_BOSMINER_NOT_RUNNING = {
+    "error": "Precondition Failed",
+    "message": "BOSminer is not running",
+}
+
+
+class VerificationSafetyTests(unittest.TestCase):
+    """Adversarial checks for the three observe-only blockers.
+
+    Fake monotonic clock only. These fail on the previous PR #12 implementation:
+    settlement ran only in APPLYING, and the token "applying" was positive evidence.
+    """
+
+    def _refused(self, braiins, body=None):
+        braiins.boards_http = 500
+        braiins.boards_error_body = body or _BOSMINER_REFUSED
+
+    def test_applying_waiting_then_fault_on_bosminer_loss(self):
+        b = running_boards(["1"])
+        b.phase = "preheating"
+        b.running = False
+        b.paused = False
+        b.user_paused = False
+        b.power_w = 0.0
+        b.hashrate = 0.0
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        ctrl.actual_mode = "APPLYING"
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertTrue(ctrl._transition_evidence)
+        self._refused(b)
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(ctrl.controller_state, "WAITING_FOR_BRAIINS")
+        ctx = ctrl._verification_ctx
+        self.assertIn("transaction_id", ctx)
+        self.assertGreater(ctx["entered_mono"], 0)
+        self.assertEqual(ctx["expected_operation"], ctrl.desired_mode)
+        self.assertGreater(ctx["evidence_deadline_mono"], ctrl._now())
+        self.assertEqual(ctx["reason"], "BOSMINER_UNAVAILABLE")
+        self.assertNotEqual(ctrl.observed_miner_mode, "WAITING_FOR_BRAIINS")
+        self.assertNotEqual(ctrl.observed_miner_mode, "APPLYING")
+        deadline = ctx["evidence_deadline_mono"]
+        ctrl._clock.t = deadline + 1
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertNotEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertIn("bosminer_unavailable_during_verification", ctrl.last_error)
+        self.assertIn("valid_transition_evidence_expired", ctrl.last_error)
+        self.assertEqual(b.write_names(), [])
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.desired_mode, "ONE_BOARD")
+
+    def test_waiting_expires_without_being_applying(self):
+        b = paused_one_board()
+        self._refused(b, _BOSMINER_NOT_RUNNING)
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        now = ctrl._now()
+        ctrl.actual_mode = "WAITING_FOR_BRAIINS"
+        ctrl.controller_state = "WAITING_FOR_BRAIINS"
+        ctrl._transition_evidence = True
+        ctrl._transition_evidence_mono = now
+        window = float(ctrl.settings.expected_recovery_seconds)
+        ctrl._verification_ctx = {
+            "transaction_id": "txn-observe",
+            "entered_mono": now,
+            "expected_operation": "THREE_BOARD",
+            "evidence_deadline_mono": now + window,
+            "last_valid_telemetry_mono": now,
+            "reason": "BOSMINER_UNAVAILABLE",
+            "evidence": "preheating",
+        }
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertNotEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        ctrl._clock.t = now + window + 1
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertIn("bosminer_unavailable_during_verification", ctrl.last_error)
+        self.assertEqual(b.write_names(), [])
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.desired_mode, "THREE_BOARD")
+
+    def test_applying_token_at_zero_power_is_not_a_transition(self):
+        self.assertNotIn("applying", LEGITIMATE_LIFECYCLE_TOKENS)
+        b = FakeBraiins(
+            enabled=["1"],
+            paused=False,
+            running=False,
+            user_paused=False,
+            phase="applying",
+            status="applying",
+            power_w=0.0,
+            hashrate=0.0,
+        )
+        b.pause_reason = ""
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        ctrl.actual_mode = "APPLYING"
+        obs = MinerObservation(
+            ok=True,
+            phase="applying",
+            power_w=0.0,
+            hashrate=0.0,
+            enabled_ids=["1"],
+        )
+        self.assertFalse(ctrl._positive_lifecycle(obs))
+        self.assertNotEqual(
+            classify_miner_telemetry(
+                ok=True,
+                positive_lifecycle=ctrl._positive_lifecycle(obs),
+                power_w=0.0,
+                running=False,
+                paused=False,
+            ),
+            "VALID_TRANSITION",
+        )
+        ctrl.tick()
+        self.assertNotEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertNotEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertIn("required_telemetry_malformed", ctrl.last_error)
+        self.assertEqual(ctrl.observed_miner_mode, "UNVERIFIED")
+        self.assertEqual(b.write_names(), [])
+        self.assertFalse(ctrl.settings.enable_writes)
+
+    def test_independent_preheat_is_valid_and_removal_fails_closed(self):
+        b = running_boards(["1"])
+        b.phase = "preheating"
+        b.running = False
+        b.paused = False
+        b.user_paused = False
+        b.power_w = 0.0
+        b.hashrate = 0.0
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertTrue(ctrl._positive_lifecycle(ctrl._last_obs))
+        self.assertEqual(ctrl.actual_mode, "APPLYING")
+        self.assertEqual(b.write_names(), [])
+        b.phase = "applying"
+        b.status = "applying"
+        b.pause_reason = ""
+        b.power_w = 0.0
+        b.hashrate = 0.0
+        ctrl.tick()
+        self.assertNotEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertFalse(ctrl._transition_evidence)
+        self.assertEqual(b.write_names(), [])
+
+    def test_valid_paused_zero_power_is_not_a_fault(self):
+        b = paused_one_board()
+        ctrl = make_controller(b, "PAUSED", enable_writes=False)
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "VALID_PAUSED")
+        self.assertEqual(ctrl.actual_mode, "PAUSED")
+        self.assertEqual(ctrl.observed_miner_mode, "PAUSED")
+        self.assertEqual(ctrl.controller_state, "OBSERVING")
+        self.assertNotEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertNotEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertEqual(b.power_w, 0.0)
+        self.assertEqual(b.hashrate, 0.0)
+        self.assertEqual(b.write_names(), [])
+
+    def test_actual_modes_split_physical_from_controller(self):
+        for physical in ("PAUSED", "ONE_BOARD", "TWO_BOARD", "THREE_BOARD"):
+            self.assertIn(physical, OBSERVED_MINER_MODES)
+            self.assertIn(physical, ACTUAL_MODES)
+        for controller_only in ("APPLYING", "WAITING_FOR_BRAIINS", "FAULT_LATCHED", "ERROR"):
+            self.assertIn(controller_only, ACTUAL_MODES)
+            self.assertNotIn(controller_only, OBSERVED_MINER_MODES)
+            self.assertIn(controller_only, CONTROLLER_STATES)
+        self.assertIn("OBSERVING", CONTROLLER_STATES)
+        self.assertIn("DISARMED", CONTROLLER_STATES)
+        self.assertIn("RUNNING", CONTROLLER_STATES)
+        b = running_boards(["1", "2", "3"])
+        ctrl = make_controller(b, "THREE_BOARD", enable_writes=False)
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "THREE_BOARD")
+        self.assertEqual(ctrl.observed_miner_mode, "THREE_BOARD")
+        self.assertTrue(ctrl.actual_mode in OBSERVED_MINER_MODES)
+        self.assertEqual(ctrl.controller_state, "RUNNING")
+        self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_actual_mode"], "THREE_BOARD")
+        self.assertEqual(ctrl.ha._states["sensor.lard_miner_mode_desired"], "THREE_BOARD")
+
+    def test_poll_loop_fault_then_recovery_ready_without_rearm(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=False)
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self.assertEqual(ctrl.observed_miner_mode, "ONE_BOARD")
+        self.assertEqual(ctrl.controller_state, "RUNNING")
+        self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
+
+        b.phase = "preheating"
+        b.running = False
+        b.paused = False
+        b.user_paused = False
+        b.power_w = 0.0
+        b.hashrate = 0.0
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertEqual(ctrl.actual_mode, "APPLYING")
+        self.assertEqual(ctrl.controller_state, "APPLYING")
+
+        self._refused(b)
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(ctrl.controller_state, "WAITING_FOR_BRAIINS")
+        self.assertNotEqual(ctrl.observed_miner_mode, "WAITING_FOR_BRAIINS")
+        self.assertEqual(b.write_names(), [])
+
+        ctrl._clock.t = ctrl._verification_ctx["evidence_deadline_mono"] + 1
+        ctrl.tick()
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertNotEqual(ctrl.actual_mode, "WAITING_FOR_BRAIINS")
+        self.assertIn("bosminer_unavailable_during_verification", ctrl.last_error)
+        self.assertEqual(b.write_names(), [])
+
+        b.boards_http = 200
+        b.phase = "running"
+        b.status = "normal"
+        b.running = True
+        b.paused = False
+        b.user_paused = False
+        b.power_w = 400.0
+        b.hashrate = 20.0
+        b.enabled = ["1"]
+        for _ in range(5):
+            ctrl.tick()
+            self.assertEqual(b.write_names(), [])
+            self.assertFalse(ctrl.settings.enable_writes)
+            self.assertFalse(ctrl.write_permission.permitted)
+        self.assertTrue(ctrl.recovery_ready)
+        self.assertGreaterEqual(ctrl._valid_poll_streak, 5)
+        self.assertEqual(ctrl.controller_state, "FAULT_LATCHED")
+        self.assertEqual(ctrl.actual_mode, "FAULT_LATCHED")
+        self.assertEqual(ctrl.observed_miner_mode, "ONE_BOARD")
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertNotIn("pause", b.write_names())
+        self.assertNotIn("resume", b.write_names())
+        self.assertNotIn("patch_boards", b.write_names())
+        self.assertNotIn("set_power", b.write_names())
 
 
 if __name__ == "__main__":
