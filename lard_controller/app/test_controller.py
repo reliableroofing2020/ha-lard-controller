@@ -13,9 +13,18 @@ from collections import deque
 from pathlib import Path
 
 from controller import (
+    ADDON_VERSION,
     API_5XX_BACKOFF_S,
     CHIP_ABORT_F,
+    COOLING_DANGEROUS_C,
+    COOLING_HOT_C,
     COOLING_IDLE_POWER_W,
+    COOLING_POLICY_LEGACY,
+    COOLING_POLICY_NATIVE,
+    COOLING_TARGET_C,
+    ENT_COOLING_DANGEROUS_C,
+    ENT_COOLING_HOT_C,
+    ENT_COOLING_TARGET_C,
     ENT_ENABLE,
     ENT_FAN_MAX,
     ENT_FAULT,
@@ -37,6 +46,7 @@ from controller import (
     metric_trend_rising,
     norm_board_id,
     parse_board_health_payload,
+    parse_configured_cooling,
     parse_cooling_telemetry,
     parse_mining_state,
 )
@@ -559,6 +569,9 @@ def make_controller(braiins: FakeBraiins, mode_req: str, enable_writes: bool = T
         cooling_paused_max_fan_pct=100,
         # Production default is false. These tests opt into the gated path.
         auto_fan_ceiling_enabled=True,
+        # Production default is native_auto_target. Legacy tests keep the
+        # fan-ceiling owner so existing pause→PUT→resume cases stay intact.
+        cooling_policy="legacy_fan_ceiling",
         cooling_settle_seconds=0,
         cooling_writes_only_when_paused=True,
     )
@@ -2896,6 +2909,274 @@ class WriteEnableHardeningTests(unittest.TestCase):
         self.assertEqual(b.write_names(), [])
         self.assertEqual(b.cooling_puts(), [])
         self.assertNotIn((ENT_OLD_AUTO, "on"), ctrl.ha.writes)
+
+
+class TemperatureTargetPolicyTests(unittest.TestCase):
+    """0.1.9: Braiins Automatic target owns PWM. Fan-ceiling chasing stays legacy."""
+
+    def _native(self, braiins, mode="ONE_BOARD", enable_writes=True):
+        ctrl = make_controller(braiins, mode, enable_writes=enable_writes)
+        ctrl.settings.cooling_policy = COOLING_POLICY_NATIVE
+        # Even if the legacy flag is on, native mode must not chase fan max.
+        ctrl.settings.auto_fan_ceiling_enabled = True
+        return ctrl
+
+    def test_defaults_keep_native_policy_and_writes_off(self):
+        fresh = Settings()
+        self.assertEqual(fresh.cooling_policy, COOLING_POLICY_NATIVE)
+        self.assertFalse(fresh.enable_writes)
+        self.assertFalse(fresh.auto_fan_ceiling_enabled)
+        self.assertTrue(fresh.cooling_writes_only_when_paused)
+        self.assertEqual(fresh.cooling_target_temperature_c, COOLING_TARGET_C)
+        self.assertEqual(fresh.cooling_hot_temperature_c, COOLING_HOT_C)
+        self.assertEqual(fresh.cooling_dangerous_temperature_c, COOLING_DANGEROUS_C)
+        self.assertEqual(fresh.cooling_envelope_min_fan_pct, 0)
+        self.assertEqual(fresh.cooling_envelope_max_fan_pct, 100)
+        self.assertEqual(ADDON_VERSION, "0.1.9")
+        self.assertEqual((COOLING_TARGET_C, COOLING_HOT_C, COOLING_DANGEROUS_C), (70, 85, 95))
+
+    def test_policy_prefers_target_temperature_across_board_modes(self):
+        b = paused_one_board()
+        ctrl = self._native(b)
+        one = ctrl.desired_cooling_profile("ONE_BOARD")
+        three = ctrl.desired_cooling_profile("THREE_BOARD")
+        self.assertEqual(one, three)
+        self.assertEqual(one.target_temperature_c, 70)
+        self.assertEqual(one.hot_temperature_c, 85)
+        self.assertEqual(one.dangerous_temperature_c, 95)
+        self.assertEqual(one.max_fan_speed, 100)
+        body = {"auto": {"max_fan_speed": one.max_fan_speed, **one.extra_auto()}}
+        self.assertEqual(body["auto"]["target_temperature"], {"degree_c": 70})
+        self.assertEqual(body["auto"]["hot_temperature"], {"degree_c": 85})
+        self.assertEqual(body["auto"]["dangerous_temperature"], {"degree_c": 95})
+        self.assertNotIn("manual", body)
+        self.assertNotIn("fan_speed_ratio", body["auto"])
+        # Per-board fan profiles are not the knob in this mode.
+        ctrl.settings.cooling_one_board_max_fan_pct = 40
+        ctrl.settings.cooling_three_board_max_fan_pct = 90
+        again = ctrl.desired_cooling_profile("THREE_BOARD")
+        self.assertEqual(again.max_fan_speed, 100)
+        self.assertEqual(again.target_temperature_c, 70)
+
+    def test_high_frequency_max_fan_updates_are_not_scheduled(self):
+        b = running_boards(["1"])
+        ctrl = self._native(b)
+        ctrl.settings.cooling_one_board_max_fan_pct = 70
+        ctrl.settings.cooling_two_board_max_fan_pct = 85
+        ctrl.tick()
+        ctrl.ha._states[ENT_FAN_MAX] = "40"
+        ctrl.tick()
+        ctrl.ha._states[ENT_FAN_MAX] = "55"
+        ctrl.tick()
+        ctrl.ha._states[ENT_MODE_REQ] = "TWO_BOARD"
+        ctrl.tick()
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertNotIn("set_cooling_auto", b.write_names())
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+
+    def test_legacy_ceiling_path_stays_gated(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+        self.assertEqual(ctrl.settings.cooling_policy, COOLING_POLICY_LEGACY)
+        ctrl.settings.auto_fan_ceiling_enabled = False
+        ctrl._cooling_applied = _applied(100)
+        ctrl._fan_max_seen = 100
+        ctrl.tick()
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        ctrl.tick()
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        ctrl.settings.auto_fan_ceiling_enabled = True
+        ctrl.tick()
+        self.assertTrue(b.cooling_puts())
+        self.assertEqual(b.cooling_puts()[-1][1], 60)
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        auto = (b.last_cooling_body or {}).get("auto") or {}
+        self.assertNotIn("target_temperature", auto)
+
+    def test_operator_target_change_writes_auto_once_then_noops(self):
+        b = running_boards(["1"])
+        ctrl = self._native(b)
+        ctrl.settings.auto_fan_ceiling_enabled = False
+        ctrl.tick()
+        self.assertEqual(b.cooling_puts(), [])
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "65"
+        ctrl.tick()
+        self.assertEqual(len(b.cooling_puts()), 1)
+        auto = (b.last_cooling_body or {}).get("auto") or {}
+        self.assertEqual(auto.get("target_temperature"), {"degree_c": 65})
+        self.assertEqual(auto.get("hot_temperature"), {"degree_c": 85})
+        self.assertEqual(auto.get("dangerous_temperature"), {"degree_c": 95})
+        self.assertEqual(auto.get("max_fan_speed"), 100)
+        self.assertNotIn("manual", b.last_cooling_body or {})
+        names = b.write_names()
+        self.assertLess(names.index("pause"), names.index("set_cooling_auto"))
+        self.assertLess(names.index("set_cooling_auto"), names.index("resume"))
+        self.assertNotIn("start", names)
+        self.assertNotIn("restart", names)
+        puts_after = len(b.cooling_puts())
+        ctrl.tick()
+        self.assertEqual(len(b.cooling_puts()), puts_after)
+
+    def test_disarmed_change_is_not_replayed_when_writes_arm(self):
+        b = running_boards(["1"])
+        ctrl = self._native(b, enable_writes=False)
+        ctrl.tick()
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "65"
+        ctrl.tick()
+        self.assertEqual(b.write_names(), [])
+        ctrl.settings.enable_writes = True
+        ctrl.tick()
+        self.assertEqual(b.cooling_puts(), [])
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "66"
+        ctrl.tick()
+        self.assertEqual(len(b.cooling_puts()), 1)
+        auto = (b.last_cooling_body or {}).get("auto") or {}
+        self.assertEqual(auto.get("target_temperature"), {"degree_c": 66})
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+
+    def test_invalid_temperature_order_does_not_put(self):
+        b = running_boards(["1"])
+        ctrl = self._native(b)
+        ctrl.tick()
+        ctrl.ha._states[ENT_COOLING_TARGET_C] = "80"
+        ctrl.ha._states[ENT_COOLING_HOT_C] = "70"
+        ctrl.tick()
+        self.assertFalse(ctrl.request_temperature_policy())
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+
+    def test_native_refuses_explicit_fan_ceiling(self):
+        b = paused_one_board()
+        ctrl = self._native(b)
+        self.assertFalse(ctrl.request_cooling_ceiling(60))
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertIn(
+            "lard_cooling_deferred",
+            [name for name, _payload in ctrl.ha.events],
+        )
+
+    def test_request_temperature_policy_refuses_when_writes_disarmed(self):
+        b = paused_one_board()
+        ctrl = self._native(b, enable_writes=False)
+        self.assertFalse(ctrl.request_temperature_policy())
+        self.assertEqual(b.write_names(), [])
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+
+    def test_thermal_abort_keeps_target_temperature(self):
+        b = running_boards(["1"])
+        b.cooling_state = {
+            "fans": [{"position": 0, "rpm": 4200, "target_speed_ratio": 0.4}],
+            "highest_temperature": {"location": 1, "temperature": {"degree_c": 85}},
+            "max_fan_speed": 40,
+        }
+        ctrl = self._native(b)
+        ctrl.settings.cooling_envelope_max_fan_pct = 40
+        applied = ctrl.desired_temperature_policy()
+        self.assertIsNotNone(applied)
+        self.assertEqual(applied.max_fan_speed, 40)
+        ctrl._cooling_applied = applied
+        ctrl.tick()
+        self.assertTrue(b.cooling_puts())
+        auto = (b.last_cooling_body or {}).get("auto") or {}
+        self.assertEqual(auto.get("max_fan_speed"), 100)
+        self.assertEqual(auto.get("target_temperature"), {"degree_c": 70})
+        self.assertEqual(auto.get("hot_temperature"), {"degree_c": 85})
+        self.assertEqual(auto.get("dangerous_temperature"), {"degree_c": 95})
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+
+    def test_parse_configured_cooling_and_client_put_shape(self):
+        parsed = parse_configured_cooling(
+            {
+                "pool_groups": [],
+                "temperature": {
+                    "mode": {
+                        "auto": {
+                            "target_temperature": {"degree_c": 70},
+                            "hot_temperature": {"degree_c": 85},
+                            "dangerous_temperature": {"degree_c": 95},
+                            "min_fan_speed": None,
+                            "max_fan_speed": 100,
+                            "minimum_required_fans": 2,
+                        }
+                    }
+                },
+            }
+        )
+        self.assertEqual(parsed["mode"], "auto")
+        self.assertEqual(parsed["target_temperature_c"], 70)
+        self.assertEqual(parsed["max_fan_speed"], 100)
+        self.assertIsNone(parse_configured_cooling({"temperature": {}})["mode"])
+        tel = parse_cooling_telemetry(
+            {
+                "fans": [{"position": 0, "rpm": 1000, "target_speed_ratio": 0.4}],
+                "highest_temperature": {"temperature": {"degree_c": 60}},
+            }
+        )
+        self.assertIsNone(tel["max_fan_speed"])
+        self.assertEqual(tel["fan_pct"], 40.0)
+
+        tmp = Path(tempfile.mkdtemp(prefix="lard-cooling-put-"))
+        settings = Settings(braiins_password="x", data_dir=tmp, share_dir=tmp / "share")
+        client = Braiins(settings, Logger(settings))
+        captured = {}
+
+        def _call(method, path, body=None, timeout=30):
+            captured["method"] = method
+            captured["path"] = path
+            captured["body"] = body
+            return 200, body
+
+        client._call = _call  # type: ignore[method-assign]
+        profile = CoolingProfile("TEMPERATURE_TARGET", 100, None, 2, 70, 85, 95)
+        client.set_cooling_auto(profile.max_fan_speed, profile.extra_auto())
+        self.assertEqual(captured["method"], "PUT")
+        self.assertEqual(captured["path"], "/api/v1/cooling/mode")
+        self.assertEqual(captured["body"]["auto"]["target_temperature"], {"degree_c": 70})
+        self.assertNotIn("manual", captured["body"])
+
+    def test_unknown_policy_and_absent_options_stay_disarmed(self):
+        old_opt = os.environ.get("LARD_OPTIONS")
+        old_sec = os.environ.get("LARD_SECRETS")
+        try:
+            for options in (
+                {},
+                {"cooling_policy": None},
+                {"cooling_policy": "chase_pwm"},
+                {"cooling_policy": {"bad": True}, "enable_writes": None},
+                {"cooling_policy": "legacy_fan_ceiling", "auto_fan_ceiling_enabled": False},
+            ):
+                folder = Path(tempfile.mkdtemp(prefix="lard-policy-"))
+                (folder / "options.json").write_text(json.dumps(options))
+                (folder / "secrets.json").write_text("{}")
+                os.environ["LARD_OPTIONS"] = str(folder / "options.json")
+                os.environ["LARD_SECRETS"] = str(folder / "secrets.json")
+                loaded = load_settings()
+                self.assertFalse(loaded.enable_writes, options)
+                self.assertFalse(loaded.auto_fan_ceiling_enabled, options)
+                self.assertTrue(loaded.cooling_writes_only_when_paused, options)
+                if options.get("cooling_policy") == "legacy_fan_ceiling":
+                    self.assertEqual(loaded.cooling_policy, COOLING_POLICY_LEGACY)
+                else:
+                    self.assertEqual(loaded.cooling_policy, COOLING_POLICY_NATIVE, options)
+        finally:
+            if old_opt is None:
+                os.environ.pop("LARD_OPTIONS", None)
+            else:
+                os.environ["LARD_OPTIONS"] = old_opt
+            if old_sec is None:
+                os.environ.pop("LARD_SECRETS", None)
+            else:
+                os.environ["LARD_SECRETS"] = old_sec
 
 
 if __name__ == "__main__":

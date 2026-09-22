@@ -43,11 +43,18 @@ ENT_STALE = "binary_sensor.solar_miner_critical_stale"
 ENT_HB = "binary_sensor.lard_api_heartbeat"
 ENT_OLD_AUTO = "switch.solar_miner_auto_enable"
 ENT_FAN_MAX = "input_number.lard_fan_max_pct"
-# Optional per-mode envelope helpers. Missing → add-on options (TBD/measured).
+# Optional per-mode envelope helpers. Legacy fan-ceiling policy only.
+# Missing → add-on options (TBD/measured). Not the native temperature-target knob.
 ENT_COOLING_ONE_MAX = "input_number.lard_cooling_one_board_max_pct"
 ENT_COOLING_TWO_MAX = "input_number.lard_cooling_two_board_max_pct"
 ENT_COOLING_THREE_MAX = "input_number.lard_cooling_three_board_max_pct"
 ENT_COOLING_PAUSED_MAX = "input_number.lard_cooling_paused_max_pct"
+# Native Automatic cooling setpoints (°C). Missing → add-on options.
+ENT_COOLING_TARGET_C = "input_number.lard_cooling_target_c"
+ENT_COOLING_HOT_C = "input_number.lard_cooling_hot_c"
+ENT_COOLING_DANGEROUS_C = "input_number.lard_cooling_dangerous_c"
+ENT_COOLING_ENVELOPE_MIN = "input_number.lard_cooling_envelope_min_pct"
+ENT_COOLING_ENVELOPE_MAX = "input_number.lard_cooling_envelope_max_pct"
 
 # Heartbeat / health entities published every loop (not /local JSON)
 ENT_CTRL_ONLINE = "binary_sensor.lard_controller_online"
@@ -131,7 +138,27 @@ COOLING_STABILIZE_S = 5
 COOLING_RESUME_SETTLE_S = 20
 # Kept so 0.1.6 imports stay valid. 0.1.7 does not loop ResumeMining on 500.
 COOLING_RESUME_BACKOFF_S = (5, 10, 20)
-ADDON_VERSION = "0.1.8"
+ADDON_VERSION = "0.1.9"
+# Cooling policy. Native Automatic target is the control plane.
+# legacy_fan_ceiling keeps the 0.1.5–0.1.8 per-board max_fan_speed path,
+# still gated by auto_fan_ceiling_enabled (default false).
+COOLING_POLICY_NATIVE = "native_auto_target"
+COOLING_POLICY_LEGACY = "legacy_fan_ceiling"
+COOLING_POLICIES = frozenset({COOLING_POLICY_NATIVE, COOLING_POLICY_LEGACY})
+# OpenAPI CoolingAutoMode: target/hot/dangerous are Temperature.degree_c,
+# allowed range 0–200 °C. These LARD operator defaults follow published
+# Braiins Toolbox examples (target 70, hot 85, dangerous 95) for BOS ≥ 25.01.
+# They are not a claimed 26.09 firmware default. Model min/max/default live
+# on GET /api/v1/configuration/constraints and are observed, not invented.
+TEMP_C_MIN = 0
+TEMP_C_MAX = 200
+COOLING_TARGET_C = 70
+COOLING_HOT_C = 85
+COOLING_DANGEROUS_C = 95
+# Wide safety envelope. Braiins modulates PWM inside this band.
+# 0 min is omitted from the PUT (same as the legacy optional-min rule).
+COOLING_ENVELOPE_MIN_PCT = 0
+COOLING_ENVELOPE_MAX_PCT = 100
 # Post-write settle and bounded recovery. 0 W during these windows is not ERROR.
 COOLING_SETTLE_S = 45
 TRANSITION_POLL_S = 10
@@ -277,8 +304,15 @@ class Settings:
     cooling_three_board_min_fan_pct: int = 0
     cooling_paused_min_fan_pct: int = 0
     # 0.1.7 recovery. auto_fan_ceiling_enabled stays false until a proof run.
+    # 0.1.9: native_auto_target is the default policy. It does not arm writes.
     cooling_writes_only_when_paused: bool = True
     auto_fan_ceiling_enabled: bool = False
+    cooling_policy: str = COOLING_POLICY_NATIVE
+    cooling_target_temperature_c: int = COOLING_TARGET_C
+    cooling_hot_temperature_c: int = COOLING_HOT_C
+    cooling_dangerous_temperature_c: int = COOLING_DANGEROUS_C
+    cooling_envelope_min_fan_pct: int = COOLING_ENVELOPE_MIN_PCT
+    cooling_envelope_max_fan_pct: int = COOLING_ENVELOPE_MAX_PCT
     cooling_settle_seconds: int = COOLING_SETTLE_S
     transition_poll_interval_seconds: int = TRANSITION_POLL_S
     expected_recovery_seconds: int = EXPECTED_RECOVERY_S
@@ -441,6 +475,37 @@ def load_settings() -> Settings:
             "LARD_AUTO_FAN_CEILING_ENABLED",
             default=s.auto_fan_ceiling_enabled,
         )
+    )
+    policy_raw = str(
+        pick("cooling_policy", "LARD_COOLING_POLICY", default=s.cooling_policy)
+    ).strip().lower()
+    # Unknown / malformed policy fails closed to native target ownership.
+    # That mode does not schedule fan-ceiling chasing and does not arm writes.
+    s.cooling_policy = policy_raw if policy_raw in COOLING_POLICIES else COOLING_POLICY_NATIVE
+
+    def _temp_opt(*names, default=COOLING_TARGET_C):
+        return _int_opt(*names, default=default, lo=TEMP_C_MIN, hi=TEMP_C_MAX)
+
+    s.cooling_target_temperature_c = _temp_opt(
+        "cooling_target_temperature_c",
+        "LARD_COOLING_TARGET_TEMPERATURE_C",
+        default=s.cooling_target_temperature_c,
+    )
+    s.cooling_hot_temperature_c = _temp_opt(
+        "cooling_hot_temperature_c",
+        "LARD_COOLING_HOT_TEMPERATURE_C",
+        default=s.cooling_hot_temperature_c,
+    )
+    s.cooling_dangerous_temperature_c = _temp_opt(
+        "cooling_dangerous_temperature_c",
+        "LARD_COOLING_DANGEROUS_TEMPERATURE_C",
+        default=s.cooling_dangerous_temperature_c,
+    )
+    s.cooling_envelope_min_fan_pct = _pct_opt(
+        "cooling_envelope_min_fan_pct", default=s.cooling_envelope_min_fan_pct
+    )
+    s.cooling_envelope_max_fan_pct = _pct_opt(
+        "cooling_envelope_max_fan_pct", default=s.cooling_envelope_max_fan_pct
     )
     s.cooling_settle_seconds = _int_opt(
         "cooling_settle_seconds",
@@ -653,18 +718,36 @@ def ha_token(settings: Settings) -> str:
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class CoolingProfile:
-    """Measured-safe auto envelope. Values are configurable placeholders, not finals."""
+    """Cooling-mode body for one gated PUT.
+
+    Legacy fan-ceiling profiles set only min/max fan percent.
+    Native temperature-target profiles also set CoolingAutoMode
+    target/hot/dangerous temperatures. Fan percent on that path is a wide
+    safety envelope, not a PWM actuator.
+    """
 
     name: str
     max_fan_speed: int
     min_fan_speed: int | None = None
     minimum_required_fans: int | None = None
+    target_temperature_c: int | None = None
+    hot_temperature_c: int | None = None
+    dangerous_temperature_c: int | None = None
 
     def matches(self, other: CoolingProfile | None) -> bool:
         if other is None:
             return False
-        return self.max_fan_speed == other.max_fan_speed and (self.min_fan_speed or 0) == (
-            other.min_fan_speed or 0
+        if self.max_fan_speed != other.max_fan_speed:
+            return False
+        if (self.min_fan_speed or 0) != (other.min_fan_speed or 0):
+            return False
+        # Fan-only profiles (both sides omit target) keep the 0.1.5 compare.
+        if self.target_temperature_c is None and other.target_temperature_c is None:
+            return True
+        return (
+            self.target_temperature_c == other.target_temperature_c
+            and self.hot_temperature_c == other.hot_temperature_c
+            and self.dangerous_temperature_c == other.dangerous_temperature_c
         )
 
     def extra_auto(self) -> dict[str, Any]:
@@ -675,6 +758,15 @@ class CoolingProfile:
             extra["minimum_required_fans"] = int(self.minimum_required_fans)
         elif self.max_fan_speed >= FAN_MAX_DEFAULT:
             extra["minimum_required_fans"] = MIN_REQUIRED_FANS
+        for key, value in (
+            ("target_temperature", self.target_temperature_c),
+            ("hot_temperature", self.hot_temperature_c),
+            ("dangerous_temperature", self.dangerous_temperature_c),
+        ):
+            if value is None:
+                continue
+            # OpenAPI Temperature is {"degree_c": number}, range 0–200.
+            extra[key] = {"degree_c": int(value)}
         return extra
 
 
@@ -1223,7 +1315,12 @@ class Braiins:
         return None
 
     def set_cooling_auto(self, max_fan_speed: int, extra_auto: dict | None = None):
-        """PUT /api/v1/cooling/mode tagged union. Integer percent 0–100, not a 0.6 ratio."""
+        """PUT /api/v1/cooling/mode tagged union. The only cooling mutate path.
+
+        Integer max_fan_speed is percent 0–100, not a 0.6 ratio.
+        Temperature fields, when present, travel in extra_auto as
+        {"target_temperature": {"degree_c": N}, ...} on the auto object.
+        """
         n = clamp_fan_max_pct(max_fan_speed)
         auto: dict[str, Any] = dict(extra_auto or {})
         auto["max_fan_speed"] = n
@@ -1234,6 +1331,10 @@ class Braiins:
     def get_cooling_state(self):
         """GET /api/v1/cooling/state — fans rpm/target_speed_ratio + highest temp. Not /mode (405)."""
         return self._call("GET", "/api/v1/cooling/state")
+
+    def get_miner_configuration(self):
+        """GET /api/v1/configuration/miner — cooling mode/target readback. Not a write."""
+        return self._call("GET", "/api/v1/configuration/miner")
 
     def miner_details(self):
         """GET /api/v1/miner/details — already used for live watts; also carries status."""
@@ -1275,6 +1376,86 @@ def clamp_fan_max_pct(val) -> int:
     except (TypeError, ValueError):
         return FAN_MAX_DEFAULT
     return max(FAN_MAX_MIN, min(FAN_MAX_MAX, n))
+
+
+def clamp_temp_c(val, default: int = COOLING_TARGET_C) -> int:
+    """Integer °C inside the OpenAPI CoolingAutoMode range 0–200."""
+    try:
+        n = int(round(float(val)))
+    except (TypeError, ValueError):
+        n = int(default)
+    return max(TEMP_C_MIN, min(TEMP_C_MAX, n))
+
+
+def _degree_c(node) -> float | None:
+    """Read Temperature.degree_c. Does not invent a value when the field is absent."""
+    if not isinstance(node, dict):
+        return None
+    raw = node.get("degree_c")
+    if raw is None and isinstance(node.get("temperature"), dict):
+        raw = node["temperature"].get("degree_c")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def parse_configured_cooling(body) -> dict[str, Any]:
+    """Cooling readback from GET /api/v1/configuration/miner.
+
+    Schema: temperature.mode.auto|manual|immersion|hydro → Cooling*Mode.
+    GET /cooling/state is telemetry and is not parsed here.
+    """
+    out: dict[str, Any] = {
+        "mode": None,
+        "target_temperature_c": None,
+        "hot_temperature_c": None,
+        "dangerous_temperature_c": None,
+        "min_fan_speed": None,
+        "max_fan_speed": None,
+        "minimum_required_fans": None,
+    }
+    if not isinstance(body, dict):
+        return out
+    temperature = body.get("temperature")
+    if not isinstance(temperature, dict):
+        return out
+    mode = temperature.get("mode")
+    if not isinstance(mode, dict):
+        return out
+    for name in ("auto", "manual", "immersion", "hydro", "disabled"):
+        block = mode.get(name)
+        if not isinstance(block, dict):
+            continue
+        out["mode"] = name
+        for src, dest in (
+            ("target_temperature", "target_temperature_c"),
+            ("hot_temperature", "hot_temperature_c"),
+            ("dangerous_temperature", "dangerous_temperature_c"),
+        ):
+            deg = _degree_c(block.get(src))
+            if deg is not None:
+                out[dest] = deg
+        for src, dest in (
+            ("min_fan_speed", "min_fan_speed"),
+            ("max_fan_speed", "max_fan_speed"),
+        ):
+            if block.get(src) is None:
+                continue
+            try:
+                out[dest] = clamp_fan_max_pct(block.get(src))
+            except (TypeError, ValueError):
+                pass
+        fans = block.get("minimum_required_fans")
+        if fans is not None:
+            try:
+                out["minimum_required_fans"] = int(fans)
+            except (TypeError, ValueError):
+                pass
+        break
+    return out
 
 
 def celsius_to_fahrenheit(c) -> float:
@@ -2032,6 +2213,10 @@ class Controller:
         self._cooling_desired: CoolingProfile | None = None
         self._cooling_last_change_ts = 0.0
         self._fan_max_seen: int | None = None
+        self._temp_policy_seen: tuple | None = None
+        self._temperature_policy_valid = True
+        self._temperature_policy_invalid_logged = False
+        self._configured_cooling: dict[str, Any] = {}
         self._miner_prev_ok = False
         self._fan_max_missing_logged = False
         self._chip_temp_f = None
@@ -2771,12 +2956,81 @@ class Controller:
             self.log(f"fan_max helper ensure failed: {e}")
         self._install_fan_max_package()
 
+    def ensure_cooling_target_helpers(self) -> None:
+        """State stubs for native °C setpoints. REST cannot create a real input_number.
+
+        This writes Home Assistant state only. It does not call the miner.
+        """
+        specs = (
+            (
+                ENT_COOLING_TARGET_C,
+                self.settings.cooling_target_temperature_c,
+                "LARD Cooling Target °C",
+                "mdi:thermometer",
+            ),
+            (
+                ENT_COOLING_HOT_C,
+                self.settings.cooling_hot_temperature_c,
+                "LARD Cooling Hot °C",
+                "mdi:thermometer-high",
+            ),
+            (
+                ENT_COOLING_DANGEROUS_C,
+                self.settings.cooling_dangerous_temperature_c,
+                "LARD Cooling Dangerous °C",
+                "mdi:thermometer-alert",
+            ),
+            (
+                ENT_COOLING_ENVELOPE_MIN,
+                self.settings.cooling_envelope_min_fan_pct,
+                "LARD Cooling Envelope Min %",
+                "mdi:fan",
+            ),
+            (
+                ENT_COOLING_ENVELOPE_MAX,
+                self.settings.cooling_envelope_max_fan_pct,
+                "LARD Cooling Envelope Max %",
+                "mdi:fan",
+            ),
+        )
+        for entity_id, initial, name, icon in specs:
+            try:
+                raw = self.ha.state(entity_id)
+                if raw not in (None, "unknown", "unavailable", ""):
+                    continue
+                unit = "°C" if entity_id.endswith("_c") else "%"
+                hi = TEMP_C_MAX if unit == "°C" else FAN_MAX_MAX
+                self.ha.set_state(
+                    entity_id,
+                    int(initial),
+                    {
+                        "friendly_name": name,
+                        "min": 0,
+                        "max": hi,
+                        "step": 1,
+                        "mode": "box",
+                        "unit_of_measurement": unit,
+                        "icon": icon,
+                        "source": "lard_controller",
+                    },
+                )
+                self.log(
+                    f"ensured {entity_id}={initial} via HA state API "
+                    "(install ha_packages/lard_cooling_target.yaml for real helpers)"
+                )
+            except Exception as e:
+                self.log(f"cooling target helper ensure failed {entity_id}: {e}")
+
     def _install_fan_max_package(self) -> None:
         """Copy shipped YAML packages into /config/packages when that dir already exists."""
         dest_dir = Path("/config/packages")
         if not dest_dir.is_dir():
             return
-        for name in ("lard_fan_max.yaml", "lard_cooling_profiles.yaml"):
+        for name in (
+            "lard_fan_max.yaml",
+            "lard_cooling_profiles.yaml",
+            "lard_cooling_target.yaml",
+        ):
             dest = dest_dir / name
             candidates = [
                 Path(__file__).resolve().parent / "ha_packages" / name,
@@ -2810,6 +3064,22 @@ class Controller:
         self._fan_pct = tel.get("fan_pct")
         self._live_max_fan_speed = tel.get("max_fan_speed")
         self._live_min_fan_speed = tel.get("min_fan_speed")
+        self._refresh_configured_cooling()
+
+    def _refresh_configured_cooling(self) -> None:
+        """Observe configured mode and setpoints. Never writes."""
+        fn = getattr(self.b, "get_miner_configuration", None)
+        if not callable(fn):
+            return
+        try:
+            code, body = fn()
+        except Exception as e:
+            self.log(f"configuration/miner skip: {e}")
+            return
+        if code != 200 or not isinstance(body, dict):
+            self.log(f"configuration/miner http={code}")
+            return
+        self._configured_cooling = parse_configured_cooling(body)
 
     def _thermal_abort_needed(self) -> bool:
         if thermal_fault_name(self.ha.state(ENT_FAULT)):
@@ -2819,6 +3089,23 @@ class Controller:
         return False
 
     def _unconstrained_cooling(self, name: str = "ABORT") -> CoolingProfile:
+        """Open the fan envelope to 100%. Keep native setpoints on that path.
+
+        A partial auto PUT that omits target_temperature clears it on this
+        firmware. Thermal abort must not drop the temperature target.
+        """
+        if self._native_temperature_policy():
+            policy = self.desired_temperature_policy()
+            if policy is not None:
+                return CoolingProfile(
+                    name=name,
+                    max_fan_speed=FAN_MAX_DEFAULT,
+                    min_fan_speed=policy.min_fan_speed,
+                    minimum_required_fans=MIN_REQUIRED_FANS,
+                    target_temperature_c=policy.target_temperature_c,
+                    hot_temperature_c=policy.hot_temperature_c,
+                    dangerous_temperature_c=policy.dangerous_temperature_c,
+                )
         return CoolingProfile(
             name=name,
             max_fan_speed=FAN_MAX_DEFAULT,
@@ -2832,12 +3119,133 @@ class Controller:
             return clamp_fan_max_pct(default)
         return clamp_fan_max_pct(raw)
 
+    def _legacy_auto_cool_armed(self) -> bool:
+        """Fan-ceiling attach on apply_mode. Native policy does not use this.
+
+        Thermal abort still opens the envelope through the gated sequence.
+        Board-count changes under native_auto_target do not PUT cooling.
+        """
+        if self._thermal_abort_active:
+            return True
+        if self._native_temperature_policy():
+            return False
+        return bool(self.settings.auto_fan_ceiling_enabled)
+
+    def _native_temperature_policy(self) -> bool:
+        """True unless the operator explicitly selected the legacy fan-ceiling policy."""
+        return str(self.settings.cooling_policy).strip().lower() != COOLING_POLICY_LEGACY
+
+    def _read_temp_entity(self, entity_id: str, default: int) -> int:
+        raw = self.ha.state(entity_id)
+        if raw in (None, "unknown", "unavailable", ""):
+            return clamp_temp_c(default, default)
+        return clamp_temp_c(raw, default)
+
+    def temperature_setpoints(self) -> tuple[int, int, int] | None:
+        """target < hot < dangerous, each inside OpenAPI 0–200 °C. Else refuse."""
+        target = self._read_temp_entity(
+            ENT_COOLING_TARGET_C, self.settings.cooling_target_temperature_c
+        )
+        hot = self._read_temp_entity(ENT_COOLING_HOT_C, self.settings.cooling_hot_temperature_c)
+        danger = self._read_temp_entity(
+            ENT_COOLING_DANGEROUS_C, self.settings.cooling_dangerous_temperature_c
+        )
+        if not (TEMP_C_MIN <= target < hot < danger <= TEMP_C_MAX):
+            return None
+        return target, hot, danger
+
+    def desired_temperature_policy(self) -> CoolingProfile | None:
+        """Automatic cooling setpoint plus a wide fan envelope. Not per-board fan max."""
+        temps = self.temperature_setpoints()
+        if temps is None:
+            self._temperature_policy_valid = False
+            return None
+        target, hot, danger = temps
+        min_n = self._read_pct_entity(
+            ENT_COOLING_ENVELOPE_MIN, self.settings.cooling_envelope_min_fan_pct
+        )
+        max_n = self._read_pct_entity(
+            ENT_COOLING_ENVELOPE_MAX, self.settings.cooling_envelope_max_fan_pct
+        )
+        # OpenAPI: max_fan_speed must be greater than min_fan_speed.
+        if max_n <= min_n:
+            self._temperature_policy_valid = False
+            return None
+        self._temperature_policy_valid = True
+        min_opt = None if min_n <= 0 else min_n
+        fans = MIN_REQUIRED_FANS if max_n >= FAN_MAX_DEFAULT else None
+        return CoolingProfile(
+            "TEMPERATURE_TARGET",
+            max_n,
+            min_opt,
+            fans,
+            target_temperature_c=target,
+            hot_temperature_c=hot,
+            dangerous_temperature_c=danger,
+        )
+
+    def _temperature_policy_signature(self) -> tuple | None:
+        profile = self.desired_temperature_policy()
+        if profile is None:
+            return None
+        return (
+            profile.target_temperature_c,
+            profile.hot_temperature_c,
+            profile.dangerous_temperature_c,
+            profile.min_fan_speed or 0,
+            profile.max_fan_speed,
+        )
+
+    def _note_temperature_policy(self) -> bool:
+        """True when the operator setpoint/envelope changed after the seed sample.
+
+        The first sample is a seed. It does not schedule a cooling PUT.
+        While writes are disarmed, tick absorbs the signature so arming writes
+        does not replay an observe-only change.
+        """
+        sig = self._temperature_policy_signature()
+        if sig is None:
+            if not self._temperature_policy_invalid_logged:
+                self.log(
+                    "temperature policy invalid "
+                    "(need 0 ≤ target < hot < dangerous ≤ 200 and max_fan > min_fan) "
+                    "— no cooling PUT"
+                )
+                self._temperature_policy_invalid_logged = True
+            return False
+        self._temperature_policy_invalid_logged = False
+        if self._temp_policy_seen is None:
+            self._temp_policy_seen = sig
+            return False
+        return sig != self._temp_policy_seen
+
+    def _mark_temperature_policy_seen(self) -> None:
+        sig = self._temperature_policy_signature()
+        if sig is not None:
+            self._temp_policy_seen = sig
+
+    def _absorb_temperature_policy_while_disarmed(self) -> None:
+        sig = self._temperature_policy_signature()
+        if sig is not None:
+            self._temp_policy_seen = sig
+
     def desired_cooling_profile(self, mode: str, *, abort: bool = False) -> CoolingProfile:
-        """Resolve one cooling envelope for the major board-count / pause state."""
+        """Resolve the cooling body for this tick.
+
+        Native policy ignores board count. Legacy policy still builds one
+        fan-ceiling envelope per board-count state.
+        """
         if abort:
             self._thermal_abort_active = True
             return self._unconstrained_cooling("ABORT")
         self._thermal_abort_active = False
+        if self._native_temperature_policy():
+            policy = self.desired_temperature_policy()
+            if policy is not None:
+                return policy
+            if self._cooling_applied is not None:
+                return self._cooling_applied
+            return CoolingProfile("INVALID", FAN_MAX_DEFAULT, None, MIN_REQUIRED_FANS)
         key = mode if mode in RANK else "PAUSED"
         max_defaults = {
             "ONE_BOARD": self.settings.cooling_one_board_max_fan_pct,
@@ -2869,6 +3277,23 @@ class Controller:
         return CoolingProfile(key, max_n, min_n_opt, fans)
 
     def _live_cooling_profile(self) -> CoolingProfile | None:
+        if self._native_temperature_policy():
+            cfg = self._configured_cooling or {}
+            if cfg.get("mode") == "auto" and cfg.get("target_temperature_c") is not None:
+                max_n = cfg.get("max_fan_speed")
+                min_n = cfg.get("min_fan_speed") or None
+                hot = cfg.get("hot_temperature_c")
+                danger = cfg.get("dangerous_temperature_c")
+                return CoolingProfile(
+                    "CONFIGURED",
+                    FAN_MAX_DEFAULT if max_n is None else int(max_n),
+                    None if not min_n else int(min_n),
+                    cfg.get("minimum_required_fans"),
+                    target_temperature_c=int(round(float(cfg["target_temperature_c"]))),
+                    hot_temperature_c=None if hot is None else int(round(float(hot))),
+                    dangerous_temperature_c=None if danger is None else int(round(float(danger))),
+                )
+            return None
         if self._live_max_fan_speed is None:
             return None
         min_n = self._live_min_fan_speed if self._live_min_fan_speed else None
@@ -2911,8 +3336,25 @@ class Controller:
         *,
         abort: bool = False,
         helper_changed: bool = False,
+        policy_changed: bool = False,
     ) -> bool:
-        """Cooling-only transition while the operating mode is already confirmed."""
+        """Cooling-only transition while the operating mode is already confirmed.
+
+        Native policy schedules a write only for an operator setpoint/envelope
+        change (or thermal abort). Board-count and lard_fan_max_pct changes
+        do not. Legacy policy keeps the fan-ceiling compare, still gated later
+        by auto_fan_ceiling_enabled.
+        """
+        if self._native_temperature_policy() and not abort:
+            if not self._temperature_policy_valid:
+                return False
+            if profile.matches(self._cooling_applied):
+                return False
+            if self._cooling_dwell_blocks():
+                return False
+            if not policy_changed:
+                return False
+            return True
         if profile.matches(self._cooling_applied):
             return False
         if abort:
@@ -3038,6 +3480,56 @@ class Controller:
             self.log(
                 "cooling confirm: state has no max_fan_speed field; PUT 200 + GET 200 accepted"
             )
+        if not self._confirm_temperature_fields(profile, state if isinstance(state, dict) else {}):
+            return False
+        return True
+
+    def _confirm_temperature_fields(self, profile: CoolingProfile, state: dict) -> bool:
+        """Confirm target temps when a readback actually carries them.
+
+        GET /cooling/state has no setpoint. A missing field is not a mismatch.
+        GET /configuration/miner is the setpoint readback when the client has it.
+        """
+        if profile.target_temperature_c is None:
+            return True
+        self._refresh_configured_cooling()
+        sources: list[dict] = []
+        auto = state.get("auto") if isinstance(state.get("auto"), dict) else None
+        if auto:
+            sources.append(auto)
+        cfg = self._configured_cooling
+        if cfg.get("mode"):
+            sources.append(
+                {
+                    "target_temperature": {"degree_c": cfg.get("target_temperature_c")},
+                    "hot_temperature": {"degree_c": cfg.get("hot_temperature_c")},
+                    "dangerous_temperature": {"degree_c": cfg.get("dangerous_temperature_c")},
+                }
+            )
+        if not sources:
+            self.log(
+                "cooling confirm: no temperature readback "
+                "(cooling/state has no setpoint; configuration/miner unread); "
+                "PUT 200 + GET 200 accepted"
+            )
+            return True
+        expected = {
+            "target_temperature": profile.target_temperature_c,
+            "hot_temperature": profile.hot_temperature_c,
+            "dangerous_temperature": profile.dangerous_temperature_c,
+        }
+        for src in sources:
+            for key, want in expected.items():
+                if want is None:
+                    continue
+                got = _degree_c(src.get(key))
+                if got is None:
+                    continue
+                if int(round(got)) != int(want):
+                    self.last_error = (
+                        f"cooling_confirm_temp_mismatch field={key} requested={want} live={got}"
+                    )
+                    return False
         return True
 
     def _log_txn(self, msg: str) -> None:
@@ -3809,6 +4301,12 @@ class Controller:
             "telemetry_last_success_ts": self._telemetry_last_success_ts,
             "auto_fan_ceiling_enabled": bool(self.settings.auto_fan_ceiling_enabled),
             "cooling_writes_only_when_paused": bool(self.settings.cooling_writes_only_when_paused),
+            "cooling_policy": self.settings.cooling_policy,
+            "desired_target_c": None
+            if self._cooling_desired is None
+            else self._cooling_desired.target_temperature_c,
+            "configured_cooling_mode": self._configured_cooling.get("mode"),
+            "configured_target_c": self._configured_cooling.get("target_temperature_c"),
         }
 
     def _sync_idle_health(self, obs: MinerObservation | None) -> None:
@@ -3836,7 +4334,19 @@ class Controller:
         self._health_class = "UNKNOWN"
 
     def request_cooling_ceiling(self, pct: int, *, resume_mode: str | None = None) -> bool:
-        """Intentionally run one gated cooling transaction. Never a live mid-hash PUT."""
+        """Legacy explicit fan-ceiling transaction. Never a live mid-hash PUT.
+
+        Refused while cooling_policy is native_auto_target. A fan-only auto PUT
+        can clear target_temperature on this firmware. Use the temperature
+        policy (or the wide envelope helpers) instead.
+        """
+        if self._native_temperature_policy():
+            self._log_txn(
+                "request_cooling_ceiling refused — native policy; "
+                "fan ceiling is legacy and a fan-only PUT can clear target_temperature"
+            )
+            self._emit("lard_cooling_deferred", reason="native_policy_fan_ceiling_legacy")
+            return False
         n = clamp_fan_max_pct(pct)
         fans = MIN_REQUIRED_FANS if n >= FAN_MAX_DEFAULT else None
         profile = CoolingProfile("EXPLICIT", n, None, fans)
@@ -3861,6 +4371,41 @@ class Controller:
         )
         if mode not in RANK:
             mode = "ONE_BOARD"
+        return self._gated_cooling_transition(profile, mode)
+
+    def request_temperature_policy(self, *, resume_mode: str | None = None) -> bool:
+        """One gated Automatic-cooling policy write. Not a fan-ceiling chase.
+
+        Refuses when setpoints are unordered or writes are disarmed. Does not
+        Start, Restart, or reboot. Still pause-confirms before PUT.
+        """
+        profile = self.desired_temperature_policy()
+        if profile is None:
+            self._log_txn("temperature policy invalid — refuse cooling PUT")
+            self._emit("lard_cooling_deferred", reason="invalid_temperature_policy")
+            return False
+        self._cooling_desired = profile
+        with self._txn_lock:
+            if self._cooling_txn_active:
+                self._defer_profile(profile, "txn_active", queue=True, explicit=True)
+                return False
+            policy = self._policy_denial()
+            if policy or self._health_class in TERMINAL_HEALTH:
+                self._log_txn(
+                    f"write_denied action=request_temperature_policy reason={policy or 'terminal'}"
+                )
+                self._emit(
+                    "lard_write_denied",
+                    action="request_temperature_policy",
+                    reason=policy or "terminal",
+                )
+                return False
+        mode = resume_mode or (
+            self.desired_mode if self.desired_mode in RANK else self._settled_mode()
+        )
+        if mode not in RANK:
+            mode = "ONE_BOARD"
+        self._mark_temperature_policy_seen()
         return self._gated_cooling_transition(profile, mode)
 
     def run_plain_pause_resume(self, mode: str) -> bool:
@@ -3981,7 +4526,9 @@ class Controller:
             return False
         self._log_txn(
             f"cooling PUT profile={profile.name} max={profile.max_fan_speed} "
-            f"min={profile.min_fan_speed} http={code} body={_summarize_http_body(body)} "
+            f"min={profile.min_fan_speed} target_c={profile.target_temperature_c} "
+            f"hot_c={profile.hot_temperature_c} dangerous_c={profile.dangerous_temperature_c} "
+            f"http={code} body={_summarize_http_body(body)} "
             f"chip_temp_f={self._chip_temp_f} power_w={self.power_w}"
         )
         self._last_cooling_result = f"http_{code}"
@@ -4641,9 +5188,7 @@ class Controller:
                     self._mark_error(self.last_error or "pause_wait_timeout")
                     return False
             paused_cooling = self._cooling_needed(cooling_profile, already_paused=True)
-            auto_cool = bool(self.settings.auto_fan_ceiling_enabled) or bool(
-                self._thermal_abort_active
-            )
+            auto_cool = self._legacy_auto_cool_armed()
             if paused_cooling and not auto_cool:
                 self._defer_profile(cooling_profile, "auto_fan_ceiling_disabled", queue=False)
             elif paused_cooling:
@@ -4667,7 +5212,7 @@ class Controller:
 
         already_paused = self._paused_confirmed(obs) or self._is_paused(obs) or obs.user_paused
         cooling_needed = self._cooling_needed(cooling_profile, already_paused=already_paused)
-        auto_cool = bool(self.settings.auto_fan_ceiling_enabled) or bool(self._thermal_abort_active)
+        auto_cool = self._legacy_auto_cool_armed()
         if cooling_needed and not auto_cool:
             self._defer_profile(cooling_profile, "auto_fan_ceiling_disabled", queue=False)
             cooling_needed = False
@@ -5006,14 +5551,18 @@ class Controller:
             self.log("WARNING competing writer: switch.solar_miner_auto_enable is ON — will not turn it on; writes refused")
 
         self._refresh_cooling_telemetry()
+        # Fan-max helper is legacy. Track it, but native policy does not schedule on it.
         helper_changed = self._note_fan_max_helper()
         abort = self._thermal_abort_needed()
         cooling_mode = desired if desired in RANK else self._settled_mode()
         desired_cooling = self.desired_cooling_profile(cooling_mode, abort=abort)
         self._cooling_desired = desired_cooling
+        native = self._native_temperature_policy()
 
         if not self.writes_allowed(enable_on):
             self.acting = False
+            if native:
+                self._absorb_temperature_policy_while_disarmed()
             if self.settings.enable_writes and not enable_on:
                 self.reason = f"{reason}|master_gate_off"
             elif not self.settings.enable_writes:
@@ -5028,6 +5577,8 @@ class Controller:
         if old_auto == "on":
             self.acting = False
             self.last_error = "refusing_writes_old_auto_enable_is_on"
+            if native:
+                self._absorb_temperature_policy_while_disarmed()
             self.publish(solar_avg, enable_on)
             return
 
@@ -5109,6 +5660,22 @@ class Controller:
                     self.publish(solar_avg, True)
                     return
 
+        policy_changed = self._note_temperature_policy() if native else False
+        if (
+            native
+            and policy_changed
+            and not abort
+            and self._needs_reconcile(desired, obs)
+        ):
+            # Mining-mode pause stays a mode transition. Queue the setpoint
+            # for the next converged tick instead of attaching it to every
+            # board-count change.
+            self._defer_profile(
+                desired_cooling, "mode_reconcile_before_policy", queue=True, explicit=True
+            )
+            self._mark_temperature_policy_seen()
+            policy_changed = False
+
         if not self._needs_reconcile(desired, obs):
             if desired == "PAUSED" and self._paused_confirmed(obs):
                 self.actual_mode = "PAUSED"
@@ -5117,14 +5684,24 @@ class Controller:
                 self.actual_mode = desired
                 self.confirmed_operational = desired
             if self._cooling_should_transition(
-                desired_cooling, abort=abort, helper_changed=helper_changed
+                desired_cooling,
+                abort=abort,
+                helper_changed=False if native else helper_changed,
+                policy_changed=policy_changed,
             ):
-                if not self.settings.auto_fan_ceiling_enabled and not abort:
+                # Legacy ceiling chasing stays behind auto_fan_ceiling_enabled.
+                # Native target writes are operator changes, not that flag.
+                legacy_blocked = (not native) and (
+                    not self.settings.auto_fan_ceiling_enabled
+                ) and (not abort)
+                if legacy_blocked:
                     self._defer_profile(
                         desired_cooling, "auto_fan_ceiling_disabled", queue=False
                     )
                     self.publish(solar_avg, True)
                     return
+                if native and policy_changed:
+                    self._mark_temperature_policy_seen()
                 self.actual_mode = "APPLYING"
                 self.reason = f"{reason}|cooling_applying"
                 self.publish(solar_avg, True)
@@ -5175,12 +5752,18 @@ def main() -> int:
         f"cooling_settle={settings.cooling_settle_seconds}s "
         f"cooling_resume_settle={settings.cooling_resume_settle_seconds}s "
         f"auto_fan_ceiling={settings.auto_fan_ceiling_enabled} "
+        f"cooling_policy={settings.cooling_policy} "
+        f"target_c={settings.cooling_target_temperature_c}/"
+        f"hot_c={settings.cooling_hot_temperature_c}/"
+        f"dangerous_c={settings.cooling_dangerous_temperature_c} "
+        f"envelope={settings.cooling_envelope_min_fan_pct}-"
+        f"{settings.cooling_envelope_max_fan_pct} "
         f"expected_recovery={settings.expected_recovery_seconds}s "
         f"max_recovery={settings.maximum_recovery_seconds}s "
-        f"cooling_profiles=ONE:{settings.cooling_one_board_max_fan_pct}/"
+        f"legacy_fan_profiles=ONE:{settings.cooling_one_board_max_fan_pct}/"
         f"TWO:{settings.cooling_two_board_max_fan_pct}/"
         f"THREE:{settings.cooling_three_board_max_fan_pct}/"
-        f"PAUSED:{settings.cooling_paused_max_fan_pct} (TBD/measured)"
+        f"PAUSED:{settings.cooling_paused_max_fan_pct} (legacy, TBD/measured)"
     )
     if settings.enable_writes:
         log("WRITES ARMED — still requires input_boolean.lard_board_priority_enable=on")
@@ -5207,6 +5790,10 @@ def main() -> int:
         ctrl.ensure_fan_max_helper()
     except Exception as e:
         log(f"fan_max helper ensure skip: {e}")
+    try:
+        ctrl.ensure_cooling_target_helpers()
+    except Exception as e:
+        log(f"cooling target helper ensure skip: {e}")
 
     try:
         ctrl.read_actual_from_miner()

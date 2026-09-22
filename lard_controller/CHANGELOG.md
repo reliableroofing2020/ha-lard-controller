@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.9
+
+- Cooling ownership moves to Braiins Automatic mode. The control plane is `target_temperature` (°C) on the only cooling mutate path, `PUT /api/v1/cooling/mode` (`CoolingAutoMode`). Home Assistant sets that target rarely. Braiins modulates fan PWM. HA does not chase `max_fan_speed` on a timer or on every board-mode change.
+- Default `cooling_policy` is `native_auto_target`. Operator defaults are target 70 °C, hot 85 °C, dangerous 95 °C (Braiins Toolbox examples, OpenAPI range 0–200). They are not a claimed 26.09 firmware default. The wide fan envelope defaults to min 0 / max 100 and is a safety band, not an actuator.
+- `auto_fan_ceiling_enabled` stays **false**. Per-board fan-max helpers are legacy and apply only when `cooling_policy` is `legacy_fan_ceiling` and that flag is on. `enable_writes` still defaults false. `cooling_writes_only_when_paused` stays true. Arming writes does not itself pause the miner or push a target.
+- A temperature-policy write still uses the 0.1.7/0.1.8 gated transaction: auth re-check, pause confirmed by two polls, one PUT, settle, one resume plus at most one retry, monotonic deadlines, cancel → `INTERRUPTED_MANUAL_REVIEW`. No Start, Restart, or reboot. Same-value policy is a no-op. Unordered temperatures are refused.
+- New helpers: `input_number.lard_cooling_target_c`, `lard_cooling_hot_c`, `lard_cooling_dangerous_c`, plus optional envelope min/max. Package: `ha_packages/lard_cooling_target.yaml`. Configured mode/target is observed from `GET /api/v1/configuration/miner`. `GET /cooling/state` stays telemetry (RPM/PWM) and has no ceiling.
+
 ## 0.1.8
 
 - Write-enable hardening only. Does not turn on `enable_writes`, `auto_fan_ceiling_enabled`, or `switch.solar_miner_auto_enable`. The default posture stays observe-only.

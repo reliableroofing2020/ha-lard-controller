@@ -44,7 +44,7 @@ Braiins pause / resume / hashboard PATCH / power-target are issued only when:
 1. Add-on option `enable_writes` is **true**, and
 2. `input_boolean.lard_board_priority_enable` is **on**
 
-Cooling / fan-profile writes (`PUT /api/v1/cooling/mode` with tagged `{"auto":{"max_fan_speed": N, ...}}`) use the **same dual write gates** as pause/resume/boards. They are never issued live while hashing. A live cooling PUT on this site's BOS+ (~26.09 / Antminer) stalls mining (PAUSED/0W then APPLYING/0W / `read_boards_http_500`).
+Cooling writes (`PUT /api/v1/cooling/mode`, the only cooling mutate on this API) use the **same dual write gates** as pause/resume/boards. 0.1.9 default policy sends Automatic `target_temperature` (°C), not a per-board fan ceiling. They are never issued live while hashing. A live cooling PUT on this site's BOS+ (~26.09 / Antminer) stalls mining (PAUSED/0W then APPLYING/0W / `read_boards_http_500`). See [docs/cooling-temperature-target.md](docs/cooling-temperature-target.md).
 
 Default `enable_writes` is **false**. First boot cannot write the miner.
 
@@ -79,22 +79,27 @@ Board-priority / anti-flap / async PATCH semantics are unchanged:
 
 Power target stays **944 W** until someone measures a higher floor.
 
-## Cooling owner (maintenance-gated — never live while hashing)
+## Cooling owner (0.1.9 — Braiins PWM, HA policy)
 
 The add-on is the **only** Braiins cooling writer. Not Adv SSH. Not a separate HA fan automation. Keep `automation.solar_miner_fan_watchdog` **off**.
 
-Hypothesis verified in code: a live `PUT /api/v1/cooling/mode` while hashing is unsafe on this BOS+ build. Cooling changes are a pause-first maintenance transition.
+Default `cooling_policy` is `native_auto_target`. Braiins Automatic cooling holds `target_temperature`. HA does not chase `max_fan_speed`. Full contract: [docs/cooling-temperature-target.md](docs/cooling-temperature-target.md).
+
+A live `PUT /api/v1/cooling/mode` while hashing is unsafe on this BOS+ build. Any cooling change, including a rare target update, is still a pause-first maintenance transition.
 
 | | |
 | --- | --- |
-| Write | `PUT /api/v1/cooling/mode` body `{"auto":{"max_fan_speed": N, ...}}` (`N` integer u32 percent, **not** a 0.6 float) |
-| Restore 100 | `{"auto":{"max_fan_speed": 100, "minimum_required_fans": 2}}` |
-| Read | `GET /api/v1/cooling/state` (fans rpm / `target_speed_ratio` / optional max). `GET /api/v1/cooling/mode` is **405** |
+| Write | `PUT /api/v1/cooling/mode` — the only cooling mutate. Native body `{"auto":{"target_temperature":{"degree_c":N},"hot_temperature":{"degree_c":H},"dangerous_temperature":{"degree_c":D},"max_fan_speed":100,...}}` |
+| Legacy write | Same path, `{"auto":{"max_fan_speed": N}}`, only when `cooling_policy` is `legacy_fan_ceiling` and `auto_fan_ceiling_enabled` is true |
+| Read telemetry | `GET /api/v1/cooling/state` (RPM / `target_speed_ratio`). No ceiling. `GET /cooling/mode` is **405** |
+| Read setpoints | `GET /api/v1/configuration/miner` → `temperature.mode` |
 | Auth | `Authorization: <raw token>` (no Bearer) |
-| Envelope cap | `input_number.lard_fan_max_pct` — caps desired max; **never** a live mid-hash PUT |
-| Profiles | One envelope per `ONE_BOARD` / `TWO_BOARD` / `THREE_BOARD` / `PAUSED` (add-on options or optional HA helpers) |
+| Policy helpers | `input_number.lard_cooling_target_c` / `_hot_c` / `_dangerous_c` (°C). Envelope min/max default 0–100 |
+| Legacy helpers | `lard_fan_max_pct` and per-board profiles. Not scheduled under the native policy |
 
-Profile placeholders (TBD/measured — do not treat as final site values):
+Operator defaults are target 70 °C, hot 85 °C, dangerous 95 °C (Braiins Toolbox examples inside the OpenAPI 0–200 range). They are not a claimed 26.09 firmware default.
+
+Legacy per-board placeholders (TBD/measured — unused unless the legacy policy is selected and auto fan ceiling is on):
 
 | State | Default max % | Intent |
 | --- | --- | --- |
@@ -103,7 +108,7 @@ Profile placeholders (TBD/measured — do not treat as final site values):
 | `THREE_BOARD` | 100 | Full / normal |
 | `PAUSED` | 100 | Unconstrained / known-good restore |
 
-Optional mins default to 0 (omitted from the PUT). Override via add-on options `cooling_*_max_fan_pct` / `cooling_*_min_fan_pct`, or helpers in `ha_packages/lard_cooling_profiles.yaml`. Effective max is `min(mode_profile, lard_fan_max_pct)`.
+Optional legacy mins default to 0 (omitted from the PUT). Override via add-on options `cooling_*_max_fan_pct` / `cooling_*_min_fan_pct`, or helpers in `ha_packages/lard_cooling_profiles.yaml`. Effective legacy max is `min(mode_profile, lard_fan_max_pct)`.
 
 When **desired profile ≠ applied profile** (and dwell has elapsed, unless thermal abort):
 
@@ -125,15 +130,15 @@ Rules:
 
 - The intentional paused period is **not** `ERROR`. Published `actual_mode` stays `APPLYING` for the whole cooling transition. Finer phase and health (`HASHING`, `PAUSED`, `APPLYING`, `RECOVERING`, `UNKNOWN`, `DEGRADED_NEEDS_ATTENTION`, `ERROR`) are on `sensor.lard_controller_health` and actual-mode attributes.
 - Desired == applied → skip pause and cooling PUT (idempotent no-op).
-- A new ceiling requested during a transaction is coalesced to the newest value and applied only after `HASHING` or a terminal degraded/error. No live cooling PUT while hashing. `auto_fan_ceiling_enabled` defaults false, so ordinary ticks do not start a cooling transaction.
-- `cooling_dwell_seconds` (default 600) blocks rapid cooling-only re-transitions so short solar/SOC/slider flaps do not thrash profiles. A committed board-count `apply_mode` still applies that mode's profile while paused when auto fan ceiling is enabled.
+- A new cooling request during a transaction is coalesced to the newest value and applied only after `HASHING`. `DEGRADED` / `ERROR` hold it. No live cooling PUT while hashing. `auto_fan_ceiling_enabled` defaults false. Native policy does not schedule fan-ceiling updates at all.
+- `cooling_dwell_seconds` (default 600) blocks rapid cooling-only re-transitions. A board-count `apply_mode` does **not** attach a native temperature PUT. Legacy mode still applies that mode's fan profile only when auto fan ceiling is enabled.
 - Cooling PUT failure or a non-5xx resume rejection: restore the last known-good profile if possible → pause the miner safely → `ERROR`. Resume HTTP 500, or 0 W during cooldown/preheat, is **not** that path. Do **not** hand off to legacy writers.
 - Hard fault (overheat, hardware/board/ASIC/PSU/fan failure, unrecoverable): `ERROR` immediately. No resume retry and no extra cooling PUT.
 - A missed telemetry read is `UNKNOWN` or `STALE` until `telemetry_failures_before_error` (default 3) consecutive failures. It does not drive pause/resume/cooling. During a transaction it does not cancel that transaction.
 - `CHIP_ABORT_F=180`: unconstrained 100 still applies, through the same gated sequence (dwell bypassed). Existing SOC / heartbeat / stale / fault **mining-pause** policy is unchanged.
 - Startup / reconnect no longer force a cooling PUT.
 
-The helper `input_number.lard_fan_max_pct` must exist if you want an extra envelope cap. REST cannot create a real `input_number`; on startup the add-on POSTs a state stub if the entity is missing and copies the packages into `/config/packages/` only when that directory already exists.
+Install `ha_packages/lard_cooling_target.yaml` for the °C helpers. `input_number.lard_fan_max_pct` is only a legacy envelope cap. REST cannot create a real `input_number`; on startup the add-on POSTs a state stub if an entity is missing and copies the packages into `/config/packages/` only when that directory already exists.
 
 ## Mode reconciliation contract
 
