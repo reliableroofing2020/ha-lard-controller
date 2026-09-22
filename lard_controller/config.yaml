@@ -1,5 +1,5 @@
 name: LARD Controller
-version: "0.1.6"
+version: "0.1.7"
 slug: lard_controller
 description: >
   Supervises the LARD board-priority Braiins actuator. Observe-and-publish
@@ -67,6 +67,18 @@ options:
   cooling_two_board_min_fan_pct: 0
   cooling_three_board_min_fan_pct: 0
   cooling_paused_min_fan_pct: 0
+  cooling_writes_only_when_paused: true
+  auto_fan_ceiling_enabled: false
+  cooling_settle_seconds: 45
+  transition_poll_interval_seconds: 10
+  expected_recovery_seconds: 240
+  maximum_recovery_seconds: 600
+  post_retry_recovery_seconds: 180
+  stable_hash_poll_count: 3
+  telemetry_failures_before_error: 3
+  resume_retry_enabled: true
+  max_resume_retries_per_transaction: 1
+  coalesce_pending_cooling_requests: true
 schema:
   miner_url: str
   poll_seconds: int(5,300)
@@ -93,5 +105,17 @@ schema:
   cooling_two_board_min_fan_pct: int(0,100)
   cooling_three_board_min_fan_pct: int(0,100)
   cooling_paused_min_fan_pct: int(0,100)
+  cooling_writes_only_when_paused: bool
+  auto_fan_ceiling_enabled: bool
+  cooling_settle_seconds: int(0,3600)
+  transition_poll_interval_seconds: int(1,120)
+  expected_recovery_seconds: int(0,7200)
+  maximum_recovery_seconds: int(0,7200)
+  post_retry_recovery_seconds: int(0,7200)
+  stable_hash_poll_count: int(1,20)
+  telemetry_failures_before_error: int(1,20)
+  resume_retry_enabled: bool
+  max_resume_retries_per_transaction: int(0,1)
+  coalesce_pending_cooling_requests: bool
 environment:
   LARD_HEALTH_PORT: "8099"
