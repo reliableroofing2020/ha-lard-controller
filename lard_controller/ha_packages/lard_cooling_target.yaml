@@ -1,4 +1,8 @@
-# LARD Controller — native Automatic cooling setpoints (0.1.10)
+# LARD Controller — native Automatic cooling setpoints (0.1.11)
+#
+# 0.1.11: cooling_control_enabled defaults false. Braiins owns cooling.
+# These helpers are not deleted, and LARD does not PUT them unless that
+# option is explicitly true. Hashboard switching does not use this file.
 #
 # Operator unit is Fahrenheit, matching chip temperature sensors in °F.
 # Braiins REST still requires Temperature.degree_c. LARD converts only when

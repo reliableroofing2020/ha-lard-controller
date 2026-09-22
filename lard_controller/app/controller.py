@@ -144,8 +144,10 @@ COOLING_STABILIZE_S = 5
 COOLING_RESUME_SETTLE_S = 20
 # Kept so 0.1.6 imports stay valid. 0.1.7 does not loop ResumeMining on 500.
 COOLING_RESUME_BACKOFF_S = (5, 10, 20)
-ADDON_VERSION = "0.1.10"
-# Cooling policy. Native Automatic target is the control plane.
+ADDON_VERSION = "0.1.11"
+# Cooling policy. These names only matter when cooling_control_enabled is
+# explicitly true. Default is false: Braiins OS owns cooling, and neither
+# policy schedules a cooling transaction.
 # legacy_fan_ceiling keeps the 0.1.5–0.1.8 per-board max_fan_speed path,
 # still gated by auto_fan_ceiling_enabled (default false).
 COOLING_POLICY_NATIVE = "native_auto_target"
@@ -328,8 +330,12 @@ class Settings:
     # 0.1.7 recovery. auto_fan_ceiling_enabled stays false until a proof run.
     # 0.1.9: native_auto_target is the default policy. It does not arm writes.
     # 0.1.10: these three options stay internal °C. HA helpers are °F.
+    # 0.1.11: Braiins owns cooling. This flag defaults false so neither
+    # native_auto_target nor legacy_fan_ceiling schedules a cooling PUT,
+    # a pause-for-cooling, or a thermal-abort fan write.
     cooling_writes_only_when_paused: bool = True
     auto_fan_ceiling_enabled: bool = False
+    cooling_control_enabled: bool = False
     cooling_policy: str = COOLING_POLICY_NATIVE
     cooling_target_temperature_c: int = COOLING_TARGET_C
     cooling_hot_temperature_c: int = COOLING_HOT_C
@@ -497,6 +503,15 @@ def load_settings() -> Settings:
             "auto_fan_ceiling_enabled",
             "LARD_AUTO_FAN_CEILING_ENABLED",
             default=s.auto_fan_ceiling_enabled,
+        )
+    )
+    # Absent, null, empty, or malformed stays false. Only an explicit true
+    # arms cooling writes. native_auto_target / legacy_fan_ceiling stay inert.
+    s.cooling_control_enabled = _truthy(
+        pick(
+            "cooling_control_enabled",
+            "LARD_COOLING_CONTROL_ENABLED",
+            default=False,
         )
     )
     policy_raw = str(
@@ -1343,7 +1358,15 @@ class Braiins:
         Integer max_fan_speed is percent 0–100, not a 0.6 ratio.
         Temperature fields, when present, travel in extra_auto as
         {"target_temperature": {"degree_c": N}, ...} on the auto object.
+
+        Refused before HTTP unless cooling_control_enabled is explicitly true.
+        Braiins OS owns cooling in the default posture.
         """
+        if not bool(self.settings.cooling_control_enabled):
+            raise RuntimeError(
+                "refused Braiins path /api/v1/cooling/mode "
+                "(cooling_control_disabled before HTTP)"
+            )
         n = clamp_fan_max_pct(max_fan_speed)
         auto: dict[str, Any] = dict(extra_auto or {})
         auto["max_fan_speed"] = n
@@ -2557,6 +2580,11 @@ class Controller:
             "failsafe_pause",
             "failsafe_restore",
         }
+        # Mining pause/resume use mode_pause / mode_resume and are not in this set.
+        # Cooling pause, cooling PUT, and thermal-abort restore stay denied
+        # while Braiins owns cooling.
+        if cooling and not self._cooling_control_enabled():
+            return "cooling_control_disabled"
         if self._health_class in TERMINAL_HEALTH or (
             not self._cooling_txn_active and self._cooling_terminal_kind in {"degraded", "error"}
         ):
@@ -3209,12 +3237,25 @@ class Controller:
             return clamp_fan_max_pct(default)
         return clamp_fan_max_pct(raw)
 
+    def _cooling_control_enabled(self) -> bool:
+        """True only when the operator explicitly re-armed LARD cooling writes.
+
+        Default false. Braiins OS owns fan PWM, temperature target, and
+        thermal fan response. Hashboard / pause / resume / power-target
+        mining control does not consult this flag.
+        """
+        return bool(self.settings.cooling_control_enabled)
+
     def _legacy_auto_cool_armed(self) -> bool:
         """Fan-ceiling attach on apply_mode. Native policy does not use this.
 
-        Thermal abort still opens the envelope through the gated sequence.
-        Board-count changes under native_auto_target do not PUT cooling.
+        Thermal abort still opens the envelope through the gated sequence
+        only when cooling control is explicitly enabled. While Braiins owns
+        cooling, board-count changes do not PUT cooling and do not pause
+        for a fan write.
         """
+        if not self._cooling_control_enabled():
+            return False
         if self._thermal_abort_active:
             return True
         if self._native_temperature_policy():
@@ -3464,8 +3505,11 @@ class Controller:
         Native policy schedules a write only for an operator setpoint/envelope
         change (or thermal abort). Board-count and lard_fan_max_pct changes
         do not. Legacy policy keeps the fan-ceiling compare, still gated later
-        by auto_fan_ceiling_enabled.
+        by auto_fan_ceiling_enabled. Neither policy schedules anything while
+        cooling control is disabled.
         """
+        if not self._cooling_control_enabled():
+            return False
         if self._native_temperature_policy() and not abort:
             if not self._temperature_policy_valid:
                 return False
@@ -4423,6 +4467,7 @@ class Controller:
             "auto_fan_ceiling_enabled": bool(self.settings.auto_fan_ceiling_enabled),
             "cooling_writes_only_when_paused": bool(self.settings.cooling_writes_only_when_paused),
             "cooling_policy": self.settings.cooling_policy,
+            "cooling_control_enabled": bool(self.settings.cooling_control_enabled),
             "desired_target_c": None
             if self._cooling_desired is None
             else self._cooling_desired.target_temperature_c,
@@ -4457,10 +4502,18 @@ class Controller:
     def request_cooling_ceiling(self, pct: int, *, resume_mode: str | None = None) -> bool:
         """Legacy explicit fan-ceiling transaction. Never a live mid-hash PUT.
 
-        Refused while cooling_policy is native_auto_target. A fan-only auto PUT
-        can clear target_temperature on this firmware. Use the temperature
-        policy (or the wide envelope helpers) instead.
+        Refused while cooling control is disabled, and while cooling_policy is
+        native_auto_target. A fan-only auto PUT can clear target_temperature
+        on this firmware. Use the temperature policy (or the wide envelope
+        helpers) instead, and only after cooling_control_enabled is explicit.
         """
+        if not self._cooling_control_enabled():
+            self._log_txn(
+                "request_cooling_ceiling refused — cooling_control_disabled; "
+                "Braiins owns cooling (no pause, no PUT)"
+            )
+            self._emit("lard_cooling_deferred", reason="cooling_control_disabled")
+            return False
         if self._native_temperature_policy():
             self._log_txn(
                 "request_cooling_ceiling refused — native policy; "
@@ -4497,9 +4550,17 @@ class Controller:
     def request_temperature_policy(self, *, resume_mode: str | None = None) -> bool:
         """One gated Automatic-cooling policy write. Not a fan-ceiling chase.
 
-        Refuses when setpoints are unordered or writes are disarmed. Does not
-        Start, Restart, or reboot. Still pause-confirms before PUT.
+        Refuses when cooling control is disabled, setpoints are unordered, or
+        writes are disarmed. Does not Start, Restart, or reboot. Still
+        pause-confirms before PUT when cooling control is explicitly enabled.
         """
+        if not self._cooling_control_enabled():
+            self._log_txn(
+                "request_temperature_policy refused — cooling_control_disabled; "
+                "Braiins owns cooling (no pause, no PUT)"
+            )
+            self._emit("lard_cooling_deferred", reason="cooling_control_disabled")
+            return False
         profile = self.desired_temperature_policy()
         if profile is None:
             self._log_txn("temperature policy invalid — refuse cooling PUT")
@@ -4618,6 +4679,11 @@ class Controller:
 
     def _apply_cooling_while_paused(self, profile: CoolingProfile) -> bool:
         """PUT tagged auto envelope, confirm it stuck. Never while hashing."""
+        if not self._cooling_control_enabled():
+            self._log_txn("refuse cooling PUT reason=cooling_control_disabled")
+            self._last_cooling_result = "refused_cooling_control_disabled"
+            self._emit("lard_cooling_deferred", reason="cooling_control_disabled")
+            return False
         self._set_cooling_phase("COOLING_APPLYING", health="APPLYING")
         obs = self.observe_miner()
         paused_idle = self._cooling_paused_idle(obs)
@@ -4940,8 +5006,15 @@ class Controller:
 
         Recursive coalesced apply runs only after successful HASHING.
         A callback whose generation or terminal no longer matches issues no
-        device command.
+        device command. Cooling control disabled returns before any pause
+        or PUT: Braiins owns cooling.
         """
+        if not self._cooling_control_enabled():
+            self._log_txn(
+                "cooling_control_disabled — no pause-for-cooling, no cooling PUT"
+            )
+            self._emit("lard_cooling_deferred", reason="cooling_control_disabled")
+            return _txn_result("refused")
         with self._braiins_mutex:
             if _depth > 0:
                 if _apply_gen is not None and _apply_gen != self._cooling_terminal_gen:
@@ -5308,8 +5381,15 @@ class Controller:
                 if not self._wait_until(self._paused_confirmed, "pause_wait_timeout"):
                     self._mark_error(self.last_error or "pause_wait_timeout")
                     return False
-            paused_cooling = self._cooling_needed(cooling_profile, already_paused=True)
-            auto_cool = self._legacy_auto_cool_armed()
+            # Mining pause above is the mode state machine. Cooling attach
+            # (pause-for-cooling is already paused here, then PUT) stays off
+            # unless cooling control is explicitly enabled.
+            if not self._cooling_control_enabled():
+                paused_cooling = False
+                auto_cool = False
+            else:
+                paused_cooling = self._cooling_needed(cooling_profile, already_paused=True)
+                auto_cool = self._legacy_auto_cool_armed()
             if paused_cooling and not auto_cool:
                 self._defer_profile(cooling_profile, "auto_fan_ceiling_disabled", queue=False)
             elif paused_cooling:
@@ -5332,8 +5412,14 @@ class Controller:
             return False
 
         already_paused = self._paused_confirmed(obs) or self._is_paused(obs) or obs.user_paused
-        cooling_needed = self._cooling_needed(cooling_profile, already_paused=already_paused)
-        auto_cool = self._legacy_auto_cool_armed()
+        # Board-count / power-target / resume below are the mining state
+        # machine. Do not pause for a cooling PUT while Braiins owns cooling.
+        if not self._cooling_control_enabled():
+            cooling_needed = False
+            auto_cool = False
+        else:
+            cooling_needed = self._cooling_needed(cooling_profile, already_paused=already_paused)
+            auto_cool = self._legacy_auto_cool_armed()
         if cooling_needed and not auto_cool:
             self._defer_profile(cooling_profile, "auto_fan_ceiling_disabled", queue=False)
             cooling_needed = False
@@ -5479,6 +5565,7 @@ class Controller:
             "fan_rpm": self._fan_rpm,
             "fan_pct": self._fan_pct,
             "thermal_abort": self._thermal_abort_active,
+            "cooling_control_enabled": bool(self.settings.cooling_control_enabled),
             **self._cooling_obs_fields(),
         }
 
@@ -5673,7 +5760,11 @@ class Controller:
 
         self._refresh_cooling_telemetry()
         # Fan-max helper is legacy. Track it, but native policy does not schedule on it.
+        # While Braiins owns cooling, helper bumps are ignored (not queued).
         helper_changed = self._note_fan_max_helper()
+        if not self._cooling_control_enabled():
+            helper_changed = False
+            self._fan_max_seen = self.read_fan_max_pct()
         abort = self._thermal_abort_needed()
         cooling_mode = desired if desired in RANK else self._settled_mode()
         desired_cooling = self.desired_cooling_profile(cooling_mode, abort=abort)
@@ -5752,7 +5843,8 @@ class Controller:
             return
 
         if (
-            self._pending_explicit
+            self._cooling_control_enabled()
+            and self._pending_explicit
             and self._pending_profile is not None
             and not self._cooling_txn_active
             and self._cooling_refuse_reason(obs) is None
@@ -5781,9 +5873,18 @@ class Controller:
                     self.publish(solar_avg, True)
                     return
 
-        policy_changed = self._note_temperature_policy() if native else False
+        if native and not self._cooling_control_enabled():
+            # Ignore target/hot/dangerous helper edits. Absorb so turning
+            # cooling control on later does not replay an ignored bump.
+            self._absorb_temperature_policy_while_disarmed()
+        policy_changed = (
+            self._note_temperature_policy()
+            if native and self._cooling_control_enabled()
+            else False
+        )
         if (
-            native
+            self._cooling_control_enabled()
+            and native
             and policy_changed
             and not abort
             and self._needs_reconcile(desired, obs)
@@ -5873,6 +5974,7 @@ def main() -> int:
         f"cooling_settle={settings.cooling_settle_seconds}s "
         f"cooling_resume_settle={settings.cooling_resume_settle_seconds}s "
         f"auto_fan_ceiling={settings.auto_fan_ceiling_enabled} "
+        f"cooling_control={settings.cooling_control_enabled} "
         f"cooling_policy={settings.cooling_policy} "
         f"helper_unit=F option_unit=C "
         f"target_c={settings.cooling_target_temperature_c}/"
@@ -5891,6 +5993,17 @@ def main() -> int:
         log("WRITES ARMED — still requires input_boolean.lard_board_priority_enable=on")
     else:
         log("WRITES DISARMED — observe-only until add-on option enable_writes is true")
+    if settings.cooling_control_enabled:
+        log(
+            "COOLING CONTROL ARMED — explicit opt-in; still pause-first and "
+            "still requires enable_writes plus the HA master gate"
+        )
+    else:
+        log(
+            "COOLING CONTROL OFF — Braiins owns cooling; "
+            "no PUT /api/v1/cooling/mode, no pause-for-cooling, "
+            "no thermal-abort fan write. Hashboard pause/resume stays."
+        )
 
     health = HealthState(settings)
     try:

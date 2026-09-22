@@ -1,6 +1,6 @@
-# Cooling temperature target (0.1.10)
+# Cooling temperature target (0.1.11)
 
-Braiins OS owns continuous fan PWM. Home Assistant writes cooling policy rarely. This note is the ownership contract for LARD Controller 0.1.10. It does not arm writes, AUTO, or any live miner command.
+**0.1.11:** `cooling_control_enabled` defaults **false**. This note's PUT contract is inert. Braiins OS owns cooling entirely. LARD does not schedule cooling transactions unless that option is explicitly true. Hashboard switching stays. The text below is the opt-in contract from 0.1.10 and does not arm writes, AUTO, or any live miner command.
 
 Operator setpoints are Fahrenheit, the same unit as the chip temperature sensors. Braiins REST still requires `{"degree_c": number}`. LARD converts only when it builds the cooling-mode PUT.
 

@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.1.11
+
+- Braiins OS owns cooling. New option `cooling_control_enabled` defaults **false**. While it is false, LARD schedules zero cooling transactions: no `PUT /api/v1/cooling/mode`, no pause-for-cooling, no thermal-abort open-fan write. Helper changes for target, hot, dangerous, and fan max are ignored. `native_auto_target` and `legacy_fan_ceiling` stay inert until the option is explicitly true.
+- Hashboard switching, pause, resume, power target, and board priority are unchanged. Chip temperature and cooling telemetry stay read-only. `enable_writes` still defaults false. `switch.solar_miner_auto_enable` is still never turned on, and an ON switch still refuses miner writes. Home Assistant helper entities are not deleted.
+
 ## 0.1.10
 
 - Operator cooling helpers are Fahrenheit, matching chip temperature sensors in °F. Braiins REST still requires `degree_c`. Conversion happens only when the `PUT /api/v1/cooling/mode` body is built: `c = round((f - 32) * 5 / 9)`.

@@ -1,3 +1,9 @@
+# Braiins owns cooling (0.1.11)
+
+Addon version **0.1.11**. `cooling_control_enabled` defaults **false**. Braiins OS owns cooling: LARD does not `PUT /api/v1/cooling/mode`, does not pause for a fan or temperature write, ignores target/hot/dangerous/fan-max helper changes, and does not open the fan envelope on thermal abort. Hashboard pause, resume, power target, and board-priority switching stay. Chip temps and health stay read-only. `enable_writes` stays false. Do not turn on `switch.solar_miner_auto_enable`. Do not delete HA helpers from this change; that cleanup is separate. `native_auto_target` and `legacy_fan_ceiling` do nothing unless `cooling_control_enabled` is explicitly set true later.
+
+---
+
 # Operator Fahrenheit helpers (0.1.10)
 
 Addon version **0.1.10**. Base is `main` at 0.1.9 (PR #9). Operator cooling helpers are Fahrenheit. Braiins `PUT /api/v1/cooling/mode` bodies stay `degree_c`, converted with `round((f - 32) * 5 / 9)` only at that boundary. This does not enable writes, AUTO, or any live control. Do not merge from this note, do not deploy, do not set `enable_writes`, and do not turn on `switch.solar_miner_auto_enable`. The miner stays PAUSED.
