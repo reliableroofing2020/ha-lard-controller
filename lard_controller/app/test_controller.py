@@ -49,6 +49,8 @@ from controller import (
     RESUME_WAIT_S,
     Braiins,
     Controller,
+    FORBIDDEN_HA_WRITES,
+    HA,
     WRITER_INVENTORY,
     WritePermission,
     board_patch_readback,
@@ -4280,7 +4282,34 @@ class FoundationFinishTests(unittest.TestCase):
         path = Path(__file__).resolve().parents[1] / "docs" / "phase1-writer-inventory.json"
         data = json.loads(path.read_text())
         self.assertEqual(data["writers"], [dict(item) for item in WRITER_INVENTORY])
-        self.assertTrue(data["ha_paths_template"])
+        self.assertTrue(data["observe_only_deploy_blocked"])
+        self.assertFalse(data["ha_inventory"]["applied_live"])
+        bypasses = {item["path"] for item in data["ha_hard_bypasses"]}
+        for required in (
+            "button.lard_mining_pause",
+            "button.lard_mining_resume",
+            "button.lard_bosminer_start",
+            "button.lard_bosminer_stop",
+            "button.lard_bosminer_restart",
+            "button.lard_device_reboot",
+            "button.lard_tuner_increase_power_target",
+            "number.lard_power_target",
+            "number.lard_hashrate_target",
+            "select.lard_performance_mode",
+            "switch.lard_device_locate_led_blinking",
+            "script.solar_miner_pause",
+            "script.solar_miner_resume_min",
+            "script.solar_miner_set_target",
+            "script.solar_miner_evaluate",
+            "lovelace dashboard solar-miner",
+        ):
+            self.assertIn(required, bypasses)
+        for item in data["ha_hard_bypasses"]:
+            self.assertTrue(item["hard_bypass"], item["path"])
+            self.assertFalse(item["lard_enable_writes_covers"], item["path"])
+            self.assertIn("not applied", item["disposition"].lower())
+        self.assertTrue(data["ha_runbook_not_applied"])
+        self.assertIn("do not apply", data["ha_runbook_not_applied"][0].lower())
         gated = [item for item in data["writers"] if item["disposition"] == "gated"]
         self.assertGreaterEqual(len(gated), 6)
         for item in data["writers"]:
@@ -4482,6 +4511,41 @@ class FoundationFinishTests(unittest.TestCase):
         self.assertNotEqual(ctrl.actual_mode, "MAINTENANCE_LOCKOUT")
         self.assertNotEqual(ctrl.observed_miner_mode, "MAINTENANCE_LOCKOUT")
         self.assertNotIn("MAINTENANCE_LOCKOUT", OBSERVED_MINER_MODES)
+
+    def test_overlapping_lard_controls_block_before_http(self):
+        """braiins_os_plus owns the live buttons. LARD's matching client methods stay gated."""
+        self.assertIn("number.lard_power_target", FORBIDDEN_HA_WRITES)
+        tmp = Path(tempfile.mkdtemp(prefix="lard-overlap-"))
+        settings = Settings(
+            braiins_password="x",
+            data_dir=tmp,
+            share_dir=tmp / "share",
+            enable_writes=False,
+        )
+        ha = HA(["http://127.0.0.1:9"], "token", Logger(settings))
+        posted = []
+        ha._req = lambda *args, **kwargs: posted.append(args)  # type: ignore[method-assign]
+        ha.set_state("number.lard_power_target", 1850)
+        self.assertEqual(posted, [])
+        client = Braiins(settings, Logger(settings))
+        with unittest.mock.patch("urllib.request.Request") as request, unittest.mock.patch(
+            "urllib.request.urlopen"
+        ) as urlopen:
+            for operation, result in (
+                ("pause", client.pause()),
+                ("resume", client.resume()),
+                ("set_power", client.set_power(1850)),
+            ):
+                self._blocked(result, operation)
+            with self.assertRaises(RuntimeError):
+                client.start()
+            with self.assertRaises(RuntimeError):
+                client.restart()
+            request.assert_not_called()
+            urlopen.assert_not_called()
+        text = (Path(__file__).resolve().parent / "controller.py").read_text()
+        self.assertNotIn("platform: braiins_os_plus", text)
+        self.assertNotIn("button.lard_mining_pause", text)
 
 
 if __name__ == "__main__":

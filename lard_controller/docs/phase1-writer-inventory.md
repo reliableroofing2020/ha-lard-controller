@@ -1,6 +1,6 @@
 # Phase 1 writer inventory (0.1.12)
 
-In-repo miner write paths only. This file does not claim Home Assistant automations are fenced. `enable_writes` defaults **false**. A blocked call returns before any Braiins request body or socket.
+In-repo miner write paths are fenced. Live Home Assistant `braiins_os_plus` entities are not. `enable_writes` defaults **false** and does not cover those entities. A blocked LARD call returns before any Braiins request body or socket. Observe-only deployment stays blocked while the hard HA bypasses below can still reach the miner.
 
 Machine-readable copy: [phase1-writer-inventory.json](phase1-writer-inventory.json). The test `test_writer_inventory_matches_code_and_gates_network_paths` requires the JSON `writers` array to equal `WRITER_INVENTORY` in `app/controller.py`.
 
@@ -46,19 +46,52 @@ Start, restart, reboot, and factory reset do not return this record. They raise 
 | `Controller.request_temperature_policy` | app/controller.py | indirect | explicit call only; refused while cooling control is off | _cooling_control_enabled, _policy_denial, then _call_device | gated | active |
 | `health HTTP server` | app/controller.py start_health_server | indirect | read-only | no POST/PUT/PATCH handler | read_only | active |
 
-## HA paths (to be filled by live inventory)
+## Hard HA bypasses (observe-only deploy blockers)
 
-This VM does not have a complete Home Assistant inventory. The rows below are the expected disposition only. They are not a claim that the live system is fenced.
+Read-only Home Assistant inventory, 2026-09-22 ~16:55 CT. This repository did not call HA services, did not edit HA config, and did not contact the miner. `enable_writes=false` on the LARD add-on does **not** cover these paths. They talk to miner `192.168.1.113` through the `braiins_os_plus` integration. The `lard_` entity-id prefix is historical naming, not a LARD gate.
 
-| Path | Expected disposition | Status |
-| --- | --- | --- |
-| `automation.solar_miner_upstairs_ac` | logbook only; must not write input_select.lard_miner_mode_request | to_be_filled_by_live_inventory |
-| `switch.solar_miner_auto_enable` | remain off; LARD never turns it on; ON refuses add-on writes | to_be_filled_by_live_inventory |
-| `button.lard_mining_pause / button.lard_mining_resume` | not pressed by an agent loop; still callable from HA until live fence | to_be_filled_by_live_inventory |
-| `script.solar_miner_pause / resume / set-target` | not scheduled; still a bypass until live fence | to_be_filled_by_live_inventory |
-| `automation.solar_miner_power_governor and other pause/verify automations` | stay off | to_be_filled_by_live_inventory |
-| `binary_sensor.lard_competing_writer` | ON denies arming; missing entity is not a writer | to_be_filled_by_live_inventory |
-| `direct hashboard PATCH or restore scripts outside this add-on` | do not run; no in-repo maintenance bypass | to_be_filled_by_live_inventory |
+Observe-only deployment stays blocked until these are disabled, hidden, or wrapped so the only miner commands go through LARD.
 
-While any of those writers can still reach the miner, leave `enable_writes` false. If `binary_sensor.lard_competing_writer` is ON, LARD also refuses to arm. A missing competing-writer sensor is not itself a writer.
+| Path | Where | Write | Gate before network | Disposition (not applied) | Live status |
+| --- | --- | --- | --- | --- | --- |
+| `button.lard_mining_pause` / `resume` | braiins_os_plus | direct miner | none | disable or hide | pressed ~15:48 and ~15:51 CT |
+| `button.lard_bosminer_start` / `stop` / `restart` | braiins_os_plus | direct miner | none | disable or hide | start ~15:41 CT, restart ~15:31 CT; stop unknown |
+| `button.lard_device_reboot` | braiins_os_plus | direct miner | none | disable or hide | pressed ~15:32 CT |
+| `button.lard_tuner_increase_*` / `decrease_*` | braiins_os_plus | direct miner | none | disable or hide | mixed unknown/unavailable |
+| `number.lard_power_target` / `power_adjustment_step` | braiins_os_plus | direct miner | none | disable or hide | 1850 W / step 250 |
+| `number.lard_hashrate_target` / `hashrate_adjustment_step` | braiins_os_plus | direct miner | none | disable or hide | target unavailable / step 10 |
+| `select.lard_performance_mode` | braiins_os_plus | direct miner | none | disable or hide | Power Target |
+| `switch.lard_device_locate_led_blinking` | braiins_os_plus | direct miner | none | disable or hide | off |
+| `script.solar_miner_pause` / `resume_min` / `set_target` / `evaluate` | scripts | call those entities | no `enable_writes` check | disable, or rewrite to a no-op | callable, state off |
+| Lovelace `solar-miner` | dashboard | exposes `number.lard_power_target` | none | remove that card or make it read-only | card present |
+| `braiins_os_plus` config entry | integration | owns the entities above | none from LARD | disable or hide its write entities | loaded, Antminer S19j Pro |
+| HA REST/WS | API | can press the same entities | auth only | goes away when the entities are disabled | reachable; no service call from this repo |
+
+The LARD add-on does not create these buttons, numbers, or the performance select. Its own pause, resume, and power-target client methods return `WRITE_BLOCKED` before HTTP when `enable_writes` is false. `HA.set_state` refuses `number.lard_power_target` before any Home Assistant POST. That refusal does not stop the integration entity.
+
+## Latent automations (currently off)
+
+These call the solar_miner scripts if someone turns them on. Keep them off. Off is not a substitute for disabling the buttons.
+
+`automation.solar_miner_command_verify`, `fan_watchdog`, `night_budget`, `power_governor`, `soc_hard_pause`, `thermal_protect`.
+
+## Already OK on that inventory
+
+- `automation.solar_miner_upstairs_ac` is on and writes `climate.loft` plus logbook only.
+- `switch.solar_miner_auto_enable` is off. Off does not block a manual button, script, or API call.
+- Deployed add-on `762409a4_lard_controller` is 0.1.11 with `enable_writes` false, cooling control false, and auto fan ceiling false.
+- No `rest_command` or `shell_command` service is registered.
+
+## Recommended HA disposition (runbook only — do not apply)
+
+Do not run these steps from this repository, a cloud agent, or an API token. They change live Home Assistant.
+
+1. Disable or hide every `braiins_os_plus` write entity in the table above. Read-only miner sensors can stay if they do not command the miner.
+2. Disable `script.solar_miner_pause`, `script.solar_miner_resume_min`, `script.solar_miner_set_target`, and `script.solar_miner_evaluate`, or rewrite them so they do not press or set `braiins_os_plus` entities.
+3. Keep `switch.solar_miner_auto_enable` off.
+4. Remove `number.lard_power_target` from the Lovelace `solar-miner` dashboard, or replace that card with a read-only sensor.
+5. Leave the latent solar automations off.
+6. Leave upstairs AC as HVAC plus logbook only.
+
+`binary_sensor.lard_competing_writer`, when ON, only stops the LARD add-on from arming. It does not stop `braiins_os_plus`. A missing competing-writer sensor is not itself a writer.
 

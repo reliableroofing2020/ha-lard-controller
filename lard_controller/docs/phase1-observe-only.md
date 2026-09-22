@@ -141,18 +141,21 @@ No Home Assistant entity is deleted by this version.
 
 ## Home Assistant writer fence
 
-This repository fences every in-repo write path. It does not change Home Assistant automations, and it does not claim those automations are fenced. Fill in [phase1-writer-inventory.md](phase1-writer-inventory.md) section “HA paths (to be filled by live inventory)” on the live system. Expected state before anyone re-arms LARD:
+This repository fences every in-repo write path. A read-only inventory on 2026-09-22 ~16:55 CT found paths that never enter that fence. `button.lard_*`, `number.lard_power_target`, `number.lard_hashrate_target`, `select.lard_performance_mode`, and `switch.lard_device_locate_led_blinking` are `braiins_os_plus` entities aimed at miner `192.168.1.113`. `script.solar_miner_pause`, `resume_min`, `set_target`, and `evaluate` call those entities. The Lovelace `solar-miner` dashboard exposes `number.lard_power_target`. Several of those buttons were pressed about 15:31–15:51 CT the same day. LARD `enable_writes=false` does not stop them.
 
-- Add-on `enable_writes` remains **false**
-- `switch.solar_miner_auto_enable` remains **off** (LARD never turns it on)
-- `automation.solar_miner_upstairs_ac` must not write `input_select.lard_miner_mode_request` (mode step-down). Point that branch at a non-actuator, or turn the automation off for the miner path
-- `script.solar_miner_pause`, resume, and set-target are not on a schedule
-- `button.lard_mining_pause` / `button.lard_mining_resume` are not pressed by an agent loop
-- `automation.solar_miner_power_governor` and the other pause/verify automations stay off
-- Do not run direct hashboard PATCH or restore scripts against the miner
-- While any of those writers are still live, set `binary_sensor.lard_competing_writer` to **on**. LARD treats that as an arming denial and will not command the miner. A missing sensor is not a writer and is not polled on a hot loop (same miss cache as optional helpers)
+That is an observe-only **deploy blocker**. The recommended disposition is a runbook in [phase1-writer-inventory.md](phase1-writer-inventory.md). Do not apply it from this repository.
 
-`input_boolean.lard_board_priority_enable` can stay on. With `enable_writes` false it does not authorize writes.
+Already confirmed on that inventory, and left unchanged:
+
+- `automation.solar_miner_upstairs_ac` writes `climate.loft` and logbook only
+- `switch.solar_miner_auto_enable` is off (that does not block a manual button or script)
+- latent solar automations that call the scripts are off
+- deployed add-on 0.1.11 has `enable_writes` false
+- no `rest_command` or `shell_command` is registered
+
+`binary_sensor.lard_competing_writer` ON only denies LARD arming. It does not stop `braiins_os_plus`. A missing sensor is not a writer.
+
+`input_boolean.lard_board_priority_enable` can stay on. With `enable_writes` false it does not authorize LARD writes.
 
 ## Observe-only checklist
 

@@ -1,8 +1,8 @@
 {
   "version": "0.1.12",
-  "scope": "in-repo LARD add-on only",
+  "scope": "in-repo LARD writers, plus the 2026-09-22 read-only Home Assistant inventory",
   "enable_writes_default": false,
-  "note": "Home Assistant automations are not claimed fenced. See ha_paths_template.",
+  "note": "In-repo writers are fenced by enable_writes. Live braiins_os_plus entities and solar_miner scripts are hard observe-only deploy blockers. This file does not apply HA changes.",
   "writers": [
     {
       "path": "Braiins.pause",
@@ -145,41 +145,407 @@
       "status": "active"
     }
   ],
-  "ha_paths_template": [
+  "ha_paths_template": {
+    "status": "filled_by_live_inventory_2026-09-22",
+    "see": [
+      "ha_hard_bypasses",
+      "ha_latent_writers",
+      "ha_confirmed_ok",
+      "ha_runbook_not_applied"
+    ]
+  },
+  "observe_only_deploy_blocked": true,
+  "ha_inventory": {
+    "generated_local": "2026-09-22 ~16:55 CT (America/Chicago)",
+    "method": "read-only HA GET/WS; no call_service; no config edit; miner not contacted",
+    "applied_live": false
+  },
+  "observe_only_deploy_blockers": [
+    "braiins_os_plus direct write entities",
+    "solar_miner pause/resume/set_target/evaluate scripts",
+    "lovelace power_target"
+  ],
+  "ha_hard_bypasses": [
+    {
+      "path": "button.lard_bosminer_restart",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "pressed 2026-09-22T20:31:04Z (~15:31 CT)",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "button.lard_bosminer_start",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "pressed 2026-09-22T20:41:04Z (~15:41 CT)",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "button.lard_bosminer_stop",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=unknown",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "button.lard_device_reboot",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "pressed 2026-09-22T20:32:57Z (~15:32 CT)",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "button.lard_mining_pause",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "pressed 2026-09-22T20:48:05Z (~15:48 CT)",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "button.lard_mining_resume",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "pressed 2026-09-22T20:51:14Z (~15:51 CT)",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "button.lard_tuner_decrease_hashrate_target",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=unavailable",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "button.lard_tuner_decrease_power_target",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=unknown",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "button.lard_tuner_increase_hashrate_target",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=unavailable",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "button.lard_tuner_increase_power_target",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=unknown",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "number.lard_hashrate_adjustment_step",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=10",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "number.lard_hashrate_target",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=unavailable",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "number.lard_power_adjustment_step",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=250",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "number.lard_power_target",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=1850",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "select.lard_performance_mode",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=Power Target",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "switch.lard_device_locate_led_blinking",
+      "location": "entity / braiins_os_plus @ 192.168.1.113",
+      "write": "Direct Braiins (braiins_os_plus integration API to miner 192.168.1.113)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE via LARD enable_writes \u2014 braiins_os_plus bypasses LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide this write entity; do not rely on LARD enable_writes",
+      "status": "state=off",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "script.solar_miner_evaluate",
+      "location": "script",
+      "write": "Direct Braiins via braiins_os_plus entity actions",
+      "user_reachable": "yes (UI/API/script.turn_on)",
+      "gate_before_network": "No LARD enable_writes check; set_target only checks heartbeat/mode/stale",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable the script or rewrite it to a no-op that does not call braiins_os_plus",
+      "status": "callable; state=off",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "script.solar_miner_pause",
+      "location": "script",
+      "write": "Direct Braiins via braiins_os_plus entity actions",
+      "user_reachable": "yes (UI/API/script.turn_on)",
+      "gate_before_network": "No LARD enable_writes check; set_target only checks heartbeat/mode/stale",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable the script or rewrite it to a no-op that does not call braiins_os_plus",
+      "status": "callable; state=off",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "script.solar_miner_resume_min",
+      "location": "script",
+      "write": "Direct Braiins via braiins_os_plus entity actions",
+      "user_reachable": "yes (UI/API/script.turn_on)",
+      "gate_before_network": "No LARD enable_writes check; set_target only checks heartbeat/mode/stale",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable the script or rewrite it to a no-op that does not call braiins_os_plus",
+      "status": "callable; state=off",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "script.solar_miner_set_target",
+      "location": "script",
+      "write": "Direct Braiins via braiins_os_plus entity actions",
+      "user_reachable": "yes (UI/API/script.turn_on)",
+      "gate_before_network": "No LARD enable_writes check; set_target only checks heartbeat/mode/stale",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable the script or rewrite it to a no-op that does not call braiins_os_plus",
+      "status": "callable; state=off",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "config_entry braiins_os_plus (192.168.1.113)",
+      "location": "integration; device Antminer S19j Pro",
+      "write": "Direct Braiins \u2014 owns button/number/select/switch.lard_* writers",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE from LARD",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disable or hide the integration write entities",
+      "status": "loaded",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "lovelace dashboard solar-miner",
+      "location": "storage url_path=solar-miner",
+      "write": "UI exposes number.lard_power_target (Direct Braiins)",
+      "user_reachable": "yes",
+      "gate_before_network": "NONE",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: remove or replace the power_target card with a read-only sensor",
+      "status": "entities card includes number.lard_power_target",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    },
+    {
+      "path": "HA REST/WS API",
+      "location": "Home Assistant API",
+      "write": "Can invoke button/number/script and thereby reach Braiins",
+      "user_reachable": "yes when an authorized client calls services",
+      "gate_before_network": "Auth only \u2014 no enable_writes check",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: disabling the write entities removes this path; do not rotate tokens from this repo",
+      "status": "GET /api/ reachable on the 2026-09-22 read-only inventory; no service calls made",
+      "hard_bypass": true,
+      "observe_only_deploy_blocker": true
+    }
+  ],
+  "ha_latent_writers": [
+    {
+      "path": "automation.solar_miner_command_verify",
+      "location": "automation",
+      "write": "Indirect to direct: calls solar_miner scripts which call braiins_os_plus",
+      "user_reachable": "yes if turned on",
+      "gate_before_network": "state=off; solar_miner_auto_enable conditioned=yes",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: keep OFF",
+      "status": "state=off",
+      "hard_bypass": false,
+      "latent_writer": true
+    },
+    {
+      "path": "automation.solar_miner_fan_watchdog",
+      "location": "automation",
+      "write": "Indirect to direct: calls solar_miner scripts which call braiins_os_plus",
+      "user_reachable": "yes if turned on",
+      "gate_before_network": "state=off; solar_miner_auto_enable conditioned=yes",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: keep OFF",
+      "status": "state=off",
+      "hard_bypass": false,
+      "latent_writer": true
+    },
+    {
+      "path": "automation.solar_miner_night_budget",
+      "location": "automation",
+      "write": "Indirect to direct: calls solar_miner scripts which call braiins_os_plus",
+      "user_reachable": "yes if turned on",
+      "gate_before_network": "state=off; solar_miner_auto_enable conditioned=yes",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: keep OFF",
+      "status": "state=off",
+      "hard_bypass": false,
+      "latent_writer": true
+    },
+    {
+      "path": "automation.solar_miner_power_governor",
+      "location": "automation",
+      "write": "Indirect to direct: calls solar_miner scripts which call braiins_os_plus",
+      "user_reachable": "yes if turned on",
+      "gate_before_network": "state=off; solar_miner_auto_enable conditioned=yes",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: keep OFF",
+      "status": "state=off",
+      "hard_bypass": false,
+      "latent_writer": true
+    },
+    {
+      "path": "automation.solar_miner_soc_hard_pause",
+      "location": "automation",
+      "write": "Indirect to direct: calls solar_miner scripts which call braiins_os_plus",
+      "user_reachable": "yes if turned on",
+      "gate_before_network": "state=off; solar_miner_auto_enable conditioned=no/partial",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: keep OFF",
+      "status": "state=off",
+      "hard_bypass": false,
+      "latent_writer": true
+    },
+    {
+      "path": "automation.solar_miner_thermal_protect",
+      "location": "automation",
+      "write": "Indirect to direct: calls solar_miner scripts which call braiins_os_plus",
+      "user_reachable": "yes if turned on",
+      "gate_before_network": "state=off; solar_miner_auto_enable conditioned=yes",
+      "lard_enable_writes_covers": false,
+      "disposition": "RUNBOOK ONLY, not applied: keep OFF",
+      "status": "state=off",
+      "hard_bypass": false,
+      "latent_writer": true
+    }
+  ],
+  "ha_confirmed_ok": [
     {
       "path": "automation.solar_miner_upstairs_ac",
-      "expected_disposition": "logbook only; must not write input_select.lard_miner_mode_request",
-      "status": "to_be_filled_by_live_inventory"
+      "status": "on",
+      "finding": "HVAC climate.loft plus logbook.log only. Miner mode/pause strings are description or log text, not service actions."
     },
     {
       "path": "switch.solar_miner_auto_enable",
-      "expected_disposition": "remain off; LARD never turns it on; ON refuses add-on writes",
-      "status": "to_be_filled_by_live_inventory"
+      "status": "off",
+      "finding": "Off soft-gates automations that check it. It does not block manual buttons, scripts, or the API."
     },
     {
-      "path": "button.lard_mining_pause / button.lard_mining_resume",
-      "expected_disposition": "not pressed by an agent loop; still callable from HA until live fence",
-      "status": "to_be_filled_by_live_inventory"
+      "path": "addon 762409a4_lard_controller",
+      "status": "started v0.1.11; enable_writes false; cooling_control_enabled false; auto_fan_ceiling_enabled false",
+      "finding": "LARD gate does not cover braiins_os_plus."
     },
     {
-      "path": "script.solar_miner_pause / resume / set-target",
-      "expected_disposition": "not scheduled; still a bypass until live fence",
-      "status": "to_be_filled_by_live_inventory"
-    },
-    {
-      "path": "automation.solar_miner_power_governor and other pause/verify automations",
-      "expected_disposition": "stay off",
-      "status": "to_be_filled_by_live_inventory"
-    },
-    {
-      "path": "binary_sensor.lard_competing_writer",
-      "expected_disposition": "ON denies arming; missing entity is not a writer",
-      "status": "to_be_filled_by_live_inventory"
-    },
-    {
-      "path": "direct hashboard PATCH or restore scripts outside this add-on",
-      "expected_disposition": "do not run; no in-repo maintenance bypass",
-      "status": "to_be_filled_by_live_inventory"
+      "path": "rest_command / shell_command",
+      "status": "none registered",
+      "finding": "No rest_command or shell_command service domain was registered."
     }
+  ],
+  "ha_runbook_not_applied": [
+    "Do not apply this runbook from the repository, a cloud agent, or an API token.",
+    "Disable or hide every braiins_os_plus write entity (pause, resume, bosminer start/stop/restart, device reboot, tuner buttons, power and hashrate targets and steps, performance mode, locate LED). The lard_ entity-id prefix is not a LARD gate.",
+    "Disable script.solar_miner_pause, script.solar_miner_resume_min, script.solar_miner_set_target, and script.solar_miner_evaluate, or rewrite them to a no-op that does not press or set braiins_os_plus entities.",
+    "Keep switch.solar_miner_auto_enable OFF.",
+    "Remove number.lard_power_target from the Lovelace solar-miner dashboard or replace that card with a read-only sensor.",
+    "Leave latent solar_miner automations OFF.",
+    "Leave automation.solar_miner_upstairs_ac as HVAC plus logbook only."
   ]
 }
