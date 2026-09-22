@@ -79,10 +79,13 @@ configuration:
     description: When true (default), a cooling PUT is refused unless the miner is paused and idle. Never a live mid-hash PUT.
   auto_fan_ceiling_enabled:
     name: Auto fan ceiling (legacy)
-    description: Leave false. This is not the path to efficient mining. It only arms legacy per-board max_fan_speed chasing when cooling_policy is legacy_fan_ceiling. Native policy ignores it.
+    description: Leave false. This is not the path to efficient mining. It only arms legacy per-board max_fan_speed chasing when cooling_policy is legacy_fan_ceiling and cooling_control_enabled is explicitly true. Native policy ignores it. Default cooling control is off, so this flag alone does not PUT cooling.
+  cooling_control_enabled:
+    name: Cooling control enabled
+    description: Leave false. Braiins OS owns cooling (temperature target, fan PWM, and thermal fan response). While false, LARD never PUTs /api/v1/cooling/mode, does not pause for cooling, ignores target/hot/dangerous/fan-max helper changes, and does not write an open-fan thermal abort. Hashboard pause, resume, power target, and board priority are unchanged. native_auto_target and legacy_fan_ceiling stay inert until this is explicitly true. Does not arm enable_writes.
   cooling_policy:
     name: Cooling policy
-    description: native_auto_target (default) lets Braiins Automatic cooling hold chip temperature. legacy_fan_ceiling keeps the old per-board fan-max profiles and still requires auto_fan_ceiling_enabled. Neither value arms enable_writes.
+    description: Used only when cooling_control_enabled is explicitly true. native_auto_target lets Braiins Automatic cooling hold chip temperature. legacy_fan_ceiling keeps the old per-board fan-max profiles and still requires auto_fan_ceiling_enabled. Default cooling control is off, so neither value schedules a cooling PUT. Neither value arms enable_writes.
   cooling_target_temperature_c:
     name: Target chip temperature (°C, internal)
     description: Internal Celsius fallback for CoolingAutoMode target_temperature.degree_c when no HA helper state exists. Not the operator slider. HA helpers are Fahrenheit and are converted only for the PUT. OpenAPI range 0–200. Default 70 is a Braiins Toolbox example, not a claimed firmware default. Must be below hot.

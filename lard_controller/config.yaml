@@ -1,11 +1,14 @@
 name: LARD Controller
-version: "0.1.10"
+version: "0.1.11"
 slug: lard_controller
 description: >
   Supervises the LARD board-priority Braiins actuator. Observe-and-publish
   always; miner writes stay off until enable_writes and the HA master gate
-  are both on. Never reboots the miner. Never touches SRNE, BMS, or grid.
-  Never turns on switch.solar_miner_auto_enable.
+  are both on. Braiins OS owns cooling: cooling_control_enabled defaults
+  false, so this add-on does not PUT /api/v1/cooling/mode. Hashboard pause,
+  resume, power target, and board priority stay. Never reboots the miner.
+  Never touches SRNE, BMS, or grid. Never turns on
+  switch.solar_miner_auto_enable.
 url: https://github.com/reliableroofing2020/ha-lard-controller
 arch:
   - amd64
@@ -69,6 +72,10 @@ options:
   cooling_paused_min_fan_pct: 0
   cooling_writes_only_when_paused: true
   auto_fan_ceiling_enabled: false
+  # Braiins OS owns cooling. Leave false. native_auto_target and
+  # legacy_fan_ceiling do not PUT, pause-for-cooling, or open the fan
+  # envelope on thermal abort unless this is explicitly true.
+  cooling_control_enabled: false
   cooling_policy: native_auto_target
   # Internal Celsius fallbacks when no HA helper state exists.
   # Operator helpers are Fahrenheit. Do not store °F in these keys.
@@ -116,6 +123,7 @@ schema:
   cooling_paused_min_fan_pct: int(0,100)
   cooling_writes_only_when_paused: bool
   auto_fan_ceiling_enabled: bool
+  cooling_control_enabled: bool
   cooling_policy: list(native_auto_target|legacy_fan_ceiling)
   cooling_target_temperature_c: int(0,200)
   cooling_hot_temperature_c: int(0,200)

@@ -79,9 +79,9 @@ Board-priority / anti-flap / async PATCH semantics are unchanged:
 
 Power target stays **944 W** until someone measures a higher floor.
 
-## Cooling owner (0.1.10 — Braiins PWM, operator °F)
+## Cooling owner (0.1.11 — Braiins owns cooling)
 
-The add-on is the **only** Braiins cooling writer. Not Adv SSH. Not a separate HA fan automation. Keep `automation.solar_miner_fan_watchdog` **off**.
+`cooling_control_enabled` defaults **false**. Braiins OS owns temperature target, fan PWM, and thermal fan response. This add-on does not `PUT /api/v1/cooling/mode`, does not pause for cooling, ignores cooling helper changes, and does not write an open-fan thermal abort. Hashboard pause, resume, power target, and board priority stay. Chip temps and health stay read-only. The write contract below applies only if `cooling_control_enabled` is explicitly set true later. Keep `automation.solar_miner_fan_watchdog` **off**. Do not delete HA helpers from this add-on change.
 
 Default `cooling_policy` is `native_auto_target`. Braiins Automatic cooling holds `target_temperature`. HA does not chase `max_fan_speed`. Full contract: [docs/cooling-temperature-target.md](docs/cooling-temperature-target.md).
 

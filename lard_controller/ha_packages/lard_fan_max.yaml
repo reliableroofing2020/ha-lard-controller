@@ -1,5 +1,8 @@
 # LARD Controller — legacy fan-ceiling cap (not a live fan writer)
 #
+# 0.1.11: cooling_control_enabled defaults false. This helper is ignored.
+# It is not deleted. LARD does not PUT cooling unless that option is true.
+#
 # 0.1.9 default policy is native_auto_target. This helper is NOT the
 # control knob in that mode and does not schedule cooling PUTs.
 # It only caps per-board max_fan_speed when cooling_policy is

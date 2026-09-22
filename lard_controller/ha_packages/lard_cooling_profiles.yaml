@@ -1,5 +1,8 @@
 # LARD Controller — legacy per-mode fan ceilings (TBD/measured placeholders)
 #
+# 0.1.11: cooling_control_enabled defaults false. These helpers are ignored.
+# They are not deleted. LARD does not PUT cooling unless that option is true.
+#
 # 0.1.9 default policy is native_auto_target. These per-board max-fan
 # helpers are not consulted in that mode and do not schedule PUTs.
 # They apply only when cooling_policy is legacy_fan_ceiling and

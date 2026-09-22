@@ -9,7 +9,7 @@ Supervisor owns start / stop / restart. This is not an Advanced SSH `nohup` job 
 | | |
 | --- | --- |
 | Slug | `lard_controller` |
-| Version | `0.1.10` |
+| Version | `0.1.11` |
 | Miner | Braiins OS+ REST @ `http://192.168.1.113` (API ~1.8.0) |
 | Network | `host_network: true` |
 | Health | `http://<ha-host>:8099/health` (Supervisor watchdog) |
@@ -85,11 +85,15 @@ HVAC-only automations (`solar_miner_lower_ac`, `solar_miner_upstairs_ac`, presen
 
 Drop [`../package/lard_controller_watchdog.yaml`](../package/lard_controller_watchdog.yaml) into `config/packages/` (watchdog) and [`ha_packages/lard_cooling_target.yaml`](ha_packages/lard_cooling_target.yaml) (target / hot / dangerous in °F). [`ha_packages/lard_fan_max.yaml`](ha_packages/lard_fan_max.yaml) and [`ha_packages/lard_cooling_profiles.yaml`](ha_packages/lard_cooling_profiles.yaml) are legacy fan-ceiling helpers only.
 
-## Cooling (0.1.10 — operator °F, Braiins °C)
+## Cooling (0.1.11 — Braiins owns cooling)
 
-Design: [docs/cooling-temperature-target.md](docs/cooling-temperature-target.md).
+Design note for the inert opt-in path: [docs/cooling-temperature-target.md](docs/cooling-temperature-target.md).
 
-The only cooling write on this Braiins OS+ build is `PUT /api/v1/cooling/mode`. Default policy `native_auto_target` puts **target chip °C** on `CoolingAutoMode.target_temperature`. The operator sets that target in **°F**. LARD converts with `round((f - 32) * 5 / 9)` only when it builds the PUT body. Braiins modulates PWM. HA observes temps and fan RPM/PWM and rewrites the setpoint only when the operator changes it. Board-count fan-max profiles are not the control knob. `auto_fan_ceiling_enabled` stays **false** and is not how the miner runs efficiently.
+**Braiins OS owns cooling.** `cooling_control_enabled` defaults **false**. LARD does not `PUT /api/v1/cooling/mode` (no temperature target, no fan ceiling, no thermal-abort fan write), does not pause for cooling, and ignores target / hot / dangerous / fan-max helper changes. Hashboard pause, resume, power target, and board priority still run when writes are armed. Chip temperature and fan RPM/PWM stay observe-only. HA helper entities are left in place; removing them is a separate Home Assistant cleanup.
+
+`native_auto_target` and `legacy_fan_ceiling` schedule nothing unless `cooling_control_enabled` is explicitly true. `enable_writes` still defaults **false**. Arming writes does not push a cooling setpoint.
+
+The only cooling write on this Braiins OS+ build, and only on that explicit opt-in, is `PUT /api/v1/cooling/mode`. `native_auto_target` would put **target chip °C** on `CoolingAutoMode.target_temperature`. The operator sets that target in **°F**. LARD converts with `round((f - 32) * 5 / 9)` only when it builds the PUT body. Braiins modulates PWM. Board-count fan-max profiles are not the control knob. `auto_fan_ceiling_enabled` stays **false**.
 
 A live cooling PUT while hashing still stalls this site's miner, so any setpoint write remains a pause-first maintenance transition. After two confirming pause polls, the PUT, and the settle window, ResumeMining runs **once**, then bounded recovery. Start, BOSminer Restart, and device reboot are not used. `enable_writes` still defaults **false**. Arming it does not itself push a target.
 
@@ -106,12 +110,13 @@ Legacy `cooling_policy: legacy_fan_ceiling` keeps one placeholder envelope per b
 | Maximum recovery | `maximum_recovery_seconds` (default 600). Then at most one resume retry (`max_resume_retries_per_transaction` 1) and `post_retry_recovery_seconds` (default 180) |
 | Stable hash | `stable_hash_poll_count` (default 3) before health is `HASHING` |
 | Telemetry | `telemetry_failures_before_error` (default 3). First misses are UNKNOWN/STALE, not ERROR |
-| Cooling policy | `cooling_policy` (default `native_auto_target`) |
+| Cooling control | `cooling_control_enabled` (default **false**). Braiins owns cooling. Leave off |
+| Cooling policy | `cooling_policy` (default `native_auto_target`). Inert unless cooling control is explicitly enabled |
 | Target / hot / dangerous | Helpers °F on `lard_cooling_target_c` / `_hot_c` / `_dangerous_c` (awkward historical IDs). Optional `_f` IDs win when present. Options stay 70 / 85 / 95 °C internal. PUT body is `degree_c`. |
 | Fan envelope | min 0, max 100 (safety band, not PWM) |
 | Auto fan ceiling | `auto_fan_ceiling_enabled` (default **false**). Legacy only. Leave off |
 | Cooling only while paused | `cooling_writes_only_when_paused` (default true) |
-| Thermal abort | `CHIP_ABORT_F=180` opens the envelope to 100 through the same gated sequence and keeps the native target in the body |
+| Thermal abort | `CHIP_ABORT_F=180` is observed only. It does not PUT cooling or pause for fans while `cooling_control_enabled` is false |
 
 The add-on does **not** create real HA helpers (REST cannot). On startup it POSTs state stubs for the compatibility `_c` target helpers (values in °F, not a Celsius number) and `lard_fan_max_pct` if missing and, if `config/packages/` already exists, copies the YAML once. It does not stub the preferred `_f` entities, so a phantom `_f` state cannot hide a real `_c` helper. Prefer installing the packages and restarting Core:
 
