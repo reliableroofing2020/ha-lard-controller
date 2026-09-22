@@ -2,7 +2,10 @@
 """Unit tests for LARD mode reconciliation (desired vs confirmed operational)."""
 from __future__ import annotations
 
+import json
+import os
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -27,7 +30,9 @@ from controller import (
     CoolingProfile,
     HealthState,
     Logger,
+    MinerObservation,
     Settings,
+    load_settings,
     clamp_fan_max_pct,
     metric_trend_rising,
     norm_board_id,
@@ -1534,36 +1539,28 @@ class FanCeilingTests(unittest.TestCase):
         self.assertIn("changed=", log)
         self.assertEqual(ctrl.actual_mode, "ONE_BOARD")
 
-    def test_device_reboot_denied_bosminer_restart_allowed(self):
+    def test_device_reboot_start_and_restart_denied_before_http(self):
         tmp = Path(tempfile.mkdtemp(prefix="lard-braiins-deny-"))
         settings = Settings(braiins_password="x", data_dir=tmp, share_dir=tmp / "share")
         client = Braiins(settings, Logger(settings))
         client.token = "tok"
         client.token_ts = time.time()
-        with self.assertRaises(RuntimeError) as reboot_err:
-            client._call("PUT", "/api/v1/actions/reboot")
-        self.assertIn("reboot", str(reboot_err.exception).lower())
-        with self.assertRaises(RuntimeError):
-            client._call("PUT", "/api/v1/system/reboot")
-        with self.assertRaises(RuntimeError):
-            client._call("PUT", "/api/v1/actions/factory-reset")
-
-        class Resp:
-            status = 200
-
-            def read(self):
-                return b"true"
-
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *args):
-                return False
-
-        with unittest.mock.patch("urllib.request.urlopen", return_value=Resp()):
-            code, body = client.restart()
-        self.assertEqual(code, 200)
-        self.assertTrue(hasattr(Braiins, "start"))
+        with unittest.mock.patch("urllib.request.urlopen") as opened:
+            for path in (
+                "/api/v1/actions/reboot",
+                "/api/v1/system/reboot",
+                "/api/v1/actions/factory-reset",
+                "/api/v1/actions/start",
+                "/api/v1/actions/restart",
+            ):
+                with self.assertRaises(RuntimeError) as err:
+                    client._call("PUT", path)
+                self.assertIn("denied", str(err.exception).lower())
+            with self.assertRaises(RuntimeError):
+                client.start()
+            with self.assertRaises(RuntimeError):
+                client.restart()
+            opened.assert_not_called()
 
 
 class RecoveryStateMachineTests(unittest.TestCase):
@@ -1978,8 +1975,19 @@ class BlockerFixTests(unittest.TestCase):
         self.assertNotEqual(ctrl._health_class, "HASHING")
         self.assertFalse(ctrl._cooling_txn_active)
         self.assertEqual(b.power_w, 0.0)
-        self._assert_recovery_deadline(ctrl, b)
+        origin = getattr(b, "_first_resume_clock_at", None) or b._resume_clock_at
+        span = ctrl._clock.t - origin
+        # Running at 0 W has no named lifecycle token, so the window stops at
+        # the 240s expected bound, then one retry and the 180s post-retry bound.
+        self.assertGreaterEqual(span, 240 + 180)
+        self.assertLess(span, 240 + 180 + 40)
+        self.assertEqual(
+            ctrl._primary_recovery_deadline_ts - ctrl._primary_recovery_started_ts,
+            600,
+        )
         log = (ctrl.settings.data_dir / "controller.log").read_text()
+        self.assertIn("recovery_no_progress", log)
+        self.assertNotIn("recovery_hashing", log)
         self.assertIn("recovery_interim", log)
         self.assertIn("interim=operational", log)
         _forbid_control(self, b)
@@ -2387,6 +2395,507 @@ class BlockerFixTests(unittest.TestCase):
         self.assertEqual(log.count("escalate_blocked"), 2)
         self.assertNotIn("actions/start", log)
         self.assertNotIn("actions/restart", log)
+
+
+class WriteEnableHardeningTests(unittest.TestCase):
+    """H1–H7. Fake clock and barriers only — no real sleeps, no live Braiins."""
+
+    def _arm(self, braiins, settle=0):
+        ctrl = make_controller(braiins, "ONE_BOARD")
+        ctrl._cooling_applied = _applied(100)
+        ctrl._fan_max_seen = 100
+        ctrl.ha._states[ENT_FAN_MAX] = "60"
+        ctrl.settings.cooling_settle_seconds = settle
+        return ctrl
+
+    def _events(self, ctrl):
+        return [name for name, _payload in ctrl.ha.events]
+
+    def test_h1_disarm_before_pause_leaves_write_log_empty(self):
+        b = running_boards(["1"])
+        ctrl = self._arm(b)
+        orig = ctrl.observe_miner
+
+        def observe():
+            obs = orig()
+            if ctrl._cooling_phase == "PAUSE_REQUESTED":
+                ctrl.settings.enable_writes = False
+            return obs
+
+        ctrl.observe_miner = observe  # type: ignore[method-assign]
+        ctrl.tick()
+        self.assertEqual(b.write_names(), [])
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertEqual(b.resume_calls, 0)
+        self.assertIn("lard_write_denied", self._events(ctrl))
+        _forbid_control(self, b)
+
+    def test_h1_disarm_before_put_and_resume_and_retry(self):
+        b = running_boards(["1"])
+        b.lifecycle_after_resume = "cooldown"
+        b.resume_sets_running = False
+        ctrl = self._arm(b)
+        orig = ctrl.observe_miner
+
+        def observe():
+            obs = orig()
+            if ctrl._cooling_phase == "COOLING_APPLYING":
+                ctrl.settings.enable_writes = False
+            return obs
+
+        ctrl.observe_miner = observe  # type: ignore[method-assign]
+        ctrl.tick()
+        self.assertNotIn("set_cooling_auto", b.write_names())
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertEqual(b.resume_calls, 0)
+        self.assertIn("lard_write_denied", self._events(ctrl))
+        _forbid_control(self, b)
+
+        b2 = running_boards(["1"])
+        b2.lifecycle_after_resume = "cooldown"
+        b2.resume_sets_running = False
+        ctrl2 = self._arm(b2)
+        orig2 = ctrl2.observe_miner
+
+        def observe_resume():
+            obs = orig2()
+            if ctrl2._resume_gate == "primary":
+                ctrl2.settings.enable_writes = False
+            return obs
+
+        ctrl2.observe_miner = observe_resume  # type: ignore[method-assign]
+        before_puts = 0
+        ctrl2.tick()
+        self.assertEqual(b2.resume_calls, 0)
+        self.assertEqual(len(b2.cooling_puts()), 1)
+        self.assertGreater(len(b2.write_names()), before_puts)
+        self.assertNotIn("resume", b2.write_names())
+        _forbid_control(self, b2)
+
+        b3 = running_boards(["1"])
+        b3.running_zero_on_resume = True
+        b3.resume_sets_running = False
+        ctrl3 = self._arm(b3)
+        orig3 = ctrl3.observe_miner
+
+        def observe_retry():
+            obs = orig3()
+            if ctrl3._resume_gate == "retry":
+                ctrl3.settings.enable_writes = False
+            return obs
+
+        ctrl3.observe_miner = observe_retry  # type: ignore[method-assign]
+        ctrl3.tick()
+        self.assertEqual(b3.resume_calls, 1)
+        self.assertEqual(ctrl3._resume_retries_used, 0)
+        self.assertNotIn("start", b3.write_names())
+        self.assertNotIn("restart", b3.write_names())
+
+    def test_h1_txn_id_terminal_and_stale_block_put_or_resume(self):
+        b = running_boards(["1"])
+        ctrl = self._arm(b)
+        orig = ctrl.observe_miner
+
+        def tamper():
+            obs = orig()
+            if ctrl._cooling_phase == "COOLING_APPLYING":
+                ctrl._cooling_txn_id = "cool-tampered"
+            return obs
+
+        ctrl.observe_miner = tamper  # type: ignore[method-assign]
+        ctrl.tick()
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertEqual(b.resume_calls, 0)
+        self.assertIn("lard_write_denied", self._events(ctrl))
+        _forbid_control(self, b)
+
+        b2 = running_boards(["1"])
+        ctrl2 = self._arm(b2)
+        orig2 = ctrl2.observe_miner
+
+        def terminal():
+            obs = orig2()
+            if ctrl2._resume_gate == "primary":
+                ctrl2._health_class = "ERROR"
+                ctrl2._cooling_terminal_kind = "error"
+            return obs
+
+        ctrl2.observe_miner = terminal  # type: ignore[method-assign]
+        ctrl2.tick()
+        self.assertEqual(b2.resume_calls, 0)
+        self.assertEqual(len(b2.cooling_puts()), 1)
+        self.assertNotIn("resume", b2.write_names())
+        _forbid_control(self, b2)
+
+        b3 = running_boards(["1"])
+        ctrl3 = self._arm(b3)
+        orig3 = ctrl3.observe_miner
+
+        def stale():
+            obs = orig3()
+            if ctrl3._cooling_phase == "COOLING_APPLYING":
+                ctrl3._telemetry_freshness = "STALE"
+            return obs
+
+        ctrl3.observe_miner = stale  # type: ignore[method-assign]
+        ctrl3.tick()
+        self.assertEqual(b3.cooling_puts(), [])
+        self.assertEqual(b3.resume_calls, 0)
+        self.assertNotIn("set_cooling_auto", b3.write_names())
+        _forbid_control(self, b3)
+
+    def test_h2_recovery_and_reload_never_call_start_or_restart(self):
+        b = running_boards(["1"])
+        b.lifecycle_after_resume = "cooldown"
+        b.resume_sets_running = False
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.run_plain_pause_resume("ONE_BOARD")
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertFalse(ctrl._cooling_escalate_start())
+        self.assertFalse(ctrl._cooling_escalate_restart())
+        ctrl.reconcile_after_reload()
+        ctrl.tick()
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+
+    def test_h3_named_tokens_only(self):
+        b = running_boards(["1"])
+        ctrl = make_controller(b, "ONE_BOARD")
+
+        def obs(**kwargs):
+            base = dict(ok=True, details_ok=True, enabled_ids=["1"], boards_healthy=True)
+            base.update(kwargs)
+            return MinerObservation(**base)
+
+        self.assertFalse(ctrl._positive_lifecycle(obs(running=True, phase="running", power_w=0)))
+        self.assertFalse(ctrl._positive_lifecycle(obs(phase="mystery", paused=False, running=False)))
+        self.assertFalse(ctrl._positive_lifecycle(obs(phase="reinitializing")))
+        self.assertTrue(ctrl._positive_lifecycle(obs(phase="init")))
+        self.assertTrue(ctrl._positive_lifecycle(obs(phase="cooldown")))
+        self.assertTrue(ctrl._positive_lifecycle(obs(phase="preheat", preheating=True)))
+        self.assertTrue(ctrl._positive_lifecycle(obs(phase="applying")))
+        self.assertTrue(ctrl._positive_lifecycle(obs(phase="ramping", ramping=True)))
+        self.assertFalse(
+            ctrl._positive_lifecycle(obs(phase="preheat", pause_reason="overheat", preheating=True))
+        )
+        self.assertTrue(ctrl._hard_fault(obs(phase="preheat", pause_reason="overheat")))
+
+        unknown = running_boards(["1"])
+        unknown.resume_sets_running = False
+        unknown.lifecycle_after_resume = "mystery"
+        ctrl_u = make_controller(unknown, "ONE_BOARD")
+        ok = ctrl_u.run_plain_pause_resume("ONE_BOARD")
+        self.assertFalse(bool(ok))
+        self.assertEqual(ok.outcome, "degraded")
+        self.assertEqual(unknown.resume_calls, 2)
+        origin = unknown._first_resume_clock_at
+        span = ctrl_u._clock.t - origin
+        self.assertGreaterEqual(span, 240 + 180)
+        self.assertLess(span, 240 + 180 + 40)
+        self.assertEqual(ctrl_u._health_class, "DEGRADED_NEEDS_ATTENTION")
+        _forbid_control(self, unknown)
+
+    def test_h4_wall_jump_does_not_move_monotonic_window(self):
+        b = running_boards(["1"])
+        b.lifecycle_after_resume = "cooldown"
+        b.run_on_resume_number = 2
+        ctrl = make_controller(b, "ONE_BOARD")
+        wall = {"t": 1_700_000_000.0}
+        orig_sleep = ctrl._sleep
+
+        def sleep(seconds):
+            wall["t"] += 50_000.0
+            return orig_sleep(seconds)
+
+        ctrl._sleep = sleep  # type: ignore[method-assign]
+        with unittest.mock.patch("time.time", lambda: wall["t"]):
+            ok = ctrl.run_plain_pause_resume("ONE_BOARD")
+        self.assertTrue(bool(ok))
+        self.assertEqual(b.resume_calls, 2)
+        self.assertGreaterEqual(ctrl._clock.t - b._first_resume_clock_at, 600)
+        self.assertLess(ctrl._clock.t - b._first_resume_clock_at, 640)
+        _forbid_control(self, b)
+
+    def test_h4_boundaries_239_240_599_600_780(self):
+        b = running_boards(["1"])
+        b.resume_sets_running = False
+        b.running_zero_on_resume = True
+        ctrl = make_controller(b, "ONE_BOARD")
+        ctrl.settings.transition_poll_interval_seconds = 1
+        snaps = {}
+        orig = b.mining_state
+
+        def mining_state(details=None):
+            parsed = orig(details)
+            if ctrl._cooling_phase == "RECOVERING":
+                snaps[int(ctrl._recovery_elapsed_s)] = (
+                    b.resume_calls,
+                    ctrl._resume_retries_used,
+                    ctrl._health_class,
+                )
+            return parsed
+
+        b.mining_state = mining_state  # type: ignore[method-assign]
+        ok = ctrl.run_plain_pause_resume("ONE_BOARD")
+        self.assertFalse(bool(ok))
+        self.assertEqual(ok.outcome, "degraded")
+        self.assertIn(239, snaps)
+        self.assertEqual(snaps[239][0], 1)
+        self.assertEqual(snaps[239][1], 0)
+        self.assertEqual(snaps[239][2], "RECOVERING")
+        self.assertEqual(b.resume_calls, 2)
+        self.assertEqual(ctrl._health_class, "DEGRADED_NEEDS_ATTENTION")
+        span = ctrl._clock.t - b._first_resume_clock_at
+        self.assertGreaterEqual(span, 240 + 180)
+        self.assertLess(span, 240 + 180 + 5)
+        _forbid_control(self, b)
+
+        b2 = running_boards(["1"])
+        b2.resume_sets_running = False
+        b2.lifecycle_after_resume = "cooldown"
+        ctrl2 = make_controller(b2, "ONE_BOARD")
+        ctrl2.settings.transition_poll_interval_seconds = 1
+        snaps2 = {}
+        orig2 = b2.mining_state
+
+        def mining_state2(details=None):
+            parsed = orig2(details)
+            if ctrl2._cooling_phase == "RECOVERING" and not ctrl2._resume_retry_used:
+                snaps2[int(ctrl2._recovery_elapsed_s)] = b2.resume_calls
+            return parsed
+
+        b2.mining_state = mining_state2  # type: ignore[method-assign]
+        ok2 = ctrl2.run_plain_pause_resume("ONE_BOARD")
+        self.assertFalse(bool(ok2))
+        self.assertEqual(snaps2.get(599), 1)
+        self.assertEqual(b2.resume_calls, 2)
+        self.assertEqual(ctrl2._health_class, "DEGRADED_NEEDS_ATTENTION")
+        span2 = ctrl2._clock.t - b2._first_resume_clock_at
+        self.assertGreaterEqual(span2, 600 + 180)
+        self.assertLess(span2, 600 + 180 + 5)
+        self.assertEqual(
+            ctrl2._primary_recovery_deadline_ts - ctrl2._primary_recovery_started_ts,
+            600,
+        )
+        _forbid_control(self, b2)
+
+    def test_h5_cancel_reload_and_stale_txn_issue_no_command(self):
+        b = running_boards(["1"])
+        b.resume_sets_running = False
+        b.running_zero_on_resume = True
+        ctrl = make_controller(b, "ONE_BOARD")
+        ready = threading.Barrier(2)
+        released = threading.Event()
+        orig = b.mining_state
+
+        def mining_state(details=None):
+            parsed = orig(details)
+            if (
+                ctrl._cooling_phase == "RECOVERING"
+                and b.resume_calls == 1
+                and ctrl._recovery_elapsed_s >= 230
+                and not getattr(ctrl, "_cancel_hooked", False)
+            ):
+                ctrl._cancel_hooked = True
+                ready.wait(timeout=5)
+                self.assertTrue(released.wait(timeout=5))
+            return parsed
+
+        b.mining_state = mining_state  # type: ignore[method-assign]
+
+        def other():
+            ready.wait(timeout=5)
+            ctrl.cancel_cooling_transaction("test-cancel")
+            released.set()
+
+        thread = threading.Thread(target=other)
+        thread.start()
+        ctrl.run_plain_pause_resume("ONE_BOARD")
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(b.resume_calls, 1)
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertEqual(ctrl._health_class, "INTERRUPTED_MANUAL_REVIEW")
+
+        b2 = paused_one_board()
+        ctrl2 = make_controller(b2, "ONE_BOARD", enable_writes=True)
+        marker = {
+            "txn_id": "cool-old",
+            "phase": "COOLING_SETTLING",
+            "monotonic_deadline": 999999,
+            "resume_on_load": True,
+        }
+        (ctrl2.settings.data_dir / "cooling_txn_inflight.json").write_text(json.dumps(marker))
+        self.assertEqual(ctrl2.reconcile_after_reload(), "interrupted")
+        self.assertEqual(ctrl2._primary_recovery_deadline_ts, 0.0)
+        self.assertIsNone(ctrl2._pending_profile)
+        self.assertEqual(b2.write_names(), [])
+        ctrl2.tick()
+        self.assertEqual(b2.write_names(), [])
+        self.assertEqual(ctrl2._health_class, "INTERRUPTED_MANUAL_REVIEW")
+        denied = ctrl2._call_device("resume", lambda: b2.resume())
+        self.assertIsNone(denied)
+        self.assertEqual(b2.write_names(), [])
+        self.assertEqual(b2.resume_calls, 0)
+
+    def test_h6_one_owner_under_concurrent_pressure(self):
+        b = running_boards(["1"])
+        b.resume_sets_running = False
+        b.lifecycle_after_resume = "cooldown"
+        ctrl = self._arm(b, settle=45)
+        ready = threading.Barrier(2)
+        released = threading.Event()
+        orig_sleep = ctrl._sleep
+        depths = {"cur": 0, "max": 0}
+        depth_lock = threading.Lock()
+
+        def wrap(name, fn):
+            def wrapped(*args, **kwargs):
+                with depth_lock:
+                    depths["cur"] += 1
+                    depths["max"] = max(depths["max"], depths["cur"])
+                try:
+                    return fn(*args, **kwargs)
+                finally:
+                    with depth_lock:
+                        depths["cur"] -= 1
+
+            return wrapped
+
+        b.pause = wrap("pause", b.pause)  # type: ignore[method-assign]
+        b.resume = wrap("resume", b.resume)  # type: ignore[method-assign]
+        b.set_cooling_auto = wrap("put", b.set_cooling_auto)  # type: ignore[method-assign]
+
+        def sleep(seconds):
+            if ctrl._cooling_phase == "COOLING_SETTLING" and not getattr(ctrl, "_settle_hooked", False):
+                ctrl._settle_hooked = True
+                ready.wait(timeout=5)
+                self.assertTrue(released.wait(timeout=5))
+            return orig_sleep(seconds)
+
+        ctrl._sleep = sleep  # type: ignore[method-assign]
+
+        def other():
+            ready.wait(timeout=5)
+            ctrl.request_cooling_ceiling(70)
+            ctrl.request_cooling_ceiling(80)
+            ctrl.tick()
+            released.set()
+
+        thread = threading.Thread(target=other)
+        thread.start()
+        ctrl.tick()
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual([c[1] for c in b.cooling_puts()], [60])
+        self.assertIsNotNone(ctrl._pending_profile)
+        self.assertEqual(ctrl._pending_profile.max_fan_speed, 80)
+        self.assertEqual(depths["max"], 1)
+        self.assertEqual(ctrl._emit_overlap_violations, 0)
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+        self.assertEqual(ctrl._health_class, "DEGRADED_NEEDS_ATTENTION")
+
+    def test_h6_cancel_at_retry_and_telemetry_withhold_resume(self):
+        b = running_boards(["1"])
+        b.resume_sets_running = False
+        b.running_zero_on_resume = True
+        ctrl = make_controller(b, "ONE_BOARD")
+        ready = threading.Barrier(2)
+        released = threading.Event()
+        orig_gate = ctrl._gate_resume
+
+        def gate(label):
+            if label == "retry":
+                ready.wait(timeout=5)
+                self.assertTrue(released.wait(timeout=5))
+            return orig_gate(label)
+
+        ctrl._gate_resume = gate  # type: ignore[method-assign]
+
+        def other():
+            ready.wait(timeout=5)
+            b.details_http = 500
+            ctrl._note_telemetry_failure("retry_boundary")
+            released.set()
+
+        thread = threading.Thread(target=other)
+        thread.start()
+        ctrl.run_plain_pause_resume("ONE_BOARD")
+        thread.join(timeout=5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(b.resume_calls, 1)
+        self.assertNotIn("start", b.write_names())
+        self.assertNotIn("restart", b.write_names())
+
+    def test_h7_migration_cannot_arm_writes_or_pending(self):
+        cases = [
+            {},
+            {"enable_writes": None, "auto_fan_ceiling_enabled": None},
+            {"enable_writes": "maybe", "auto_fan_ceiling_enabled": "not-a-bool"},
+            {"enable_writes": False, "auto_fan_ceiling_enabled": "false"},
+            {"enable_writes": "", "cooling_writes_only_when_paused": None},
+            {"enable_writes": {"bad": True}, "auto_fan_ceiling_enabled": ["x"]},
+        ]
+        old_opt = os.environ.get("LARD_OPTIONS")
+        old_sec = os.environ.get("LARD_SECRETS")
+        try:
+            for options in cases:
+                folder = Path(tempfile.mkdtemp(prefix="lard-migrate-"))
+                (folder / "options.json").write_text(json.dumps(options))
+                (folder / "secrets.json").write_text("{}")
+                os.environ["LARD_OPTIONS"] = str(folder / "options.json")
+                os.environ["LARD_SECRETS"] = str(folder / "secrets.json")
+                loaded = load_settings()
+                self.assertFalse(loaded.enable_writes, options)
+                self.assertFalse(loaded.auto_fan_ceiling_enabled, options)
+                self.assertTrue(loaded.cooling_writes_only_when_paused, options)
+            folder = Path(tempfile.mkdtemp(prefix="lard-badjson-"))
+            (folder / "options.json").write_text("{not json")
+            (folder / "secrets.json").write_text("{}")
+            os.environ["LARD_OPTIONS"] = str(folder / "options.json")
+            os.environ["LARD_SECRETS"] = str(folder / "secrets.json")
+            broken = load_settings()
+            self.assertFalse(broken.enable_writes)
+            self.assertFalse(broken.auto_fan_ceiling_enabled)
+        finally:
+            if old_opt is None:
+                os.environ.pop("LARD_OPTIONS", None)
+            else:
+                os.environ["LARD_OPTIONS"] = old_opt
+            if old_sec is None:
+                os.environ.pop("LARD_SECRETS", None)
+            else:
+                os.environ["LARD_SECRETS"] = old_sec
+
+        fresh = Settings()
+        self.assertFalse(fresh.enable_writes)
+        self.assertFalse(fresh.auto_fan_ceiling_enabled)
+        self.assertTrue(fresh.cooling_writes_only_when_paused)
+
+        b = paused_one_board()
+        ctrl = make_controller(b, "ONE_BOARD", enable_writes=True)
+        (ctrl.settings.data_dir / "cooling_txn_inflight.json").write_text(
+            json.dumps(
+                {
+                    "txn_id": "cool-migrate",
+                    "phase": "RECOVERING",
+                    "pending_ceiling": 80,
+                    "monotonic_deadline": 12345,
+                }
+            )
+        )
+        ctrl._pending_profile = CoolingProfile("EXPLICIT", 80, None, None)
+        ctrl._pending_explicit = True
+        self.assertEqual(ctrl.reconcile_after_reload(), "interrupted")
+        self.assertIsNone(ctrl._pending_profile)
+        ctrl.tick()
+        self.assertEqual(b.write_names(), [])
+        self.assertEqual(b.cooling_puts(), [])
+        self.assertNotIn((ENT_OLD_AUTO, "on"), ctrl.ha.writes)
 
 
 if __name__ == "__main__":

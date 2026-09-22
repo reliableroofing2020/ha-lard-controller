@@ -27,5 +27,5 @@ LABEL \
     io.hass.name="LARD Controller" \
     io.hass.description="Board-priority Braiins actuator supervised by HA Supervisor" \
     io.hass.type="addon" \
-    io.hass.version="0.1.7" \
+    io.hass.version="0.1.8" \
     io.hass.arch="amd64|aarch64|armv7"

@@ -1,4 +1,101 @@
-# LARD Controller 0.1.7 notes
+# Write-Enable Hardening PR Report
+
+Addon version **0.1.8**. Base is `main` at 0.1.7 (PR #7, `2d3edfc`). This change hardens write paths only. It does not enable writes, AUTO, or any live control. Do not merge, do not deploy, do not set `enable_writes`, and do not turn on `switch.solar_miner_auto_enable`.
+
+## Scope
+
+- Files: `app/controller.py`, `app/test_controller.py`, `config.yaml`, `Dockerfile`, `CHANGELOG.md`, `README.md`, `NOTES.md`.
+- Version bump: `ADDON_VERSION`, `config.yaml` `version`, and `io.hass.version` are `0.1.8`.
+- Write authorization, Start/Restart deny-list, named lifecycle tokens, monotonic deadlines, reload/cancel, single-owner cooling transactions, and fail-closed config migration.
+- Preserved from 0.1.7: pending auto-applies only after `HASHING` (B1); `operational` / `applying` are interim (B2); a settle or pre-resume hard fault does not ResumeMining (B3); board health fails closed (B4); two-poll pause confirmation; same-value cooling no-op; bounded 5xx resume; first telemetry miss is `UNKNOWN` / `STALE`; device reboot stays denied.
+- Out of scope: enabling writes or AUTO, cooling PUT against a live miner, Fan Max, Pause/Resume/Start/Restart/reboot, Home Assistant changes, and any live Braiins call.
+
+## H1
+
+Every device-changing call goes through `_call_device`, which runs `_authorize_device_write` and then runs it again under `_emit_lock` immediately before the client function. A denial returns `None`, does not call the client, logs `write_denied`, and emits `lard_write_denied`.
+
+The check requires `enable_writes`, the HA master gate, and `switch.solar_miner_auto_enable` off. Cooling actions (`pause`, `cooling_put`, `resume`, failsafe pause/restore) also require an active transaction owned by this thread, `_owner_txn_id == _cooling_txn_id`, a phase that allows that command, no cancel, and a non-terminal health class. A cooling PUT also requires `FRESH` telemetry, a paused-idle observation, and no hard fault. A retry resume is refused when retries already exceed `max_resume_retries_per_transaction`. The retry counter increments only after a non-denied emit. `start`, `restart`, and `reboot` return `structural_deny` before any other check.
+
+A denial while a transaction is active sets cancel and `reload_hold`. Health becomes `INTERRUPTED_MANUAL_REVIEW` unless it is already `DEGRADED_NEEDS_ATTENTION` or `ERROR`. Covered emit sites include cooling pause, cooling PUT, initial and retry resume, failsafe pause/restore, mode pause/resume, power target, and board enable/disable.
+
+Tests: `test_h1_disarm_before_pause_leaves_write_log_empty` (disarm between tick and pause; `write_names()` empty, zero cooling PUTs, zero resumes). `test_h1_disarm_before_put_and_resume_and_retry` (disarm before PUT: no `set_cooling_auto`, zero resumes; disarm on the primary gate: one PUT and zero resumes; disarm on the retry gate: one resume already sent, `_resume_retries_used == 0`). `test_h1_txn_id_terminal_and_stale_block_put_or_resume` (a changed txn id and stale telemetry leave cooling PUTs and resumes at 0; terminal health before the primary resume leaves the one PUT already sent and zero resumes).
+
+## H2
+
+`BRAIINS_DENY_PATHS` includes `/actions/start`, `/actions/restart`, reboot, and factory reset. `Braiins._call` raises `refused Braiins path … (structurally denied before HTTP)` before `ensure_auth` and before any socket. `_cooling_escalate_start` and `_cooling_escalate_restart` stay permanently disabled: they emit `lard_cooling_escalate_blocked` and return false with no device call. Recovery comments do not describe Restart as a last resort.
+
+Tests: `test_device_reboot_start_and_restart_denied_before_http` patches `urllib.request.urlopen` and asserts start, restart, reboot, and factory reset raise with `urlopen` not called. `test_h2_recovery_and_reload_never_call_start_or_restart` runs recovery and reload and asserts those commands are absent. `test_escalate_helpers_cannot_command` still covers the disabled helpers.
+
+## H3
+
+`_positive_lifecycle` is an exact-token match against `LEGITIMATE_LIFECYCLE_TOKENS` (applying, cooldown, cooling_down, preheat/preheating, startup, starting, init, initializing, autotune/tuning/tuner, ramping/ramp/quick_ramping, warming/warmup, booting) plus adjacent bigrams (`cooling down` → `cooling_down`). Parser flags `starting`, `preheating`, and `ramping` are equality checks. Hard fault is checked first and is not positive. Blanket `running`, not-paused, unqualified watts, unknown strings, and `miner_ready is False` do not extend the window. `init` does not match `reinitializing`.
+
+The primary deadline is still stamped at start + maximum (default 600s). The recovery loop, including the `_active_confirmed` branch, returns exhausted once elapsed reaches the expected window (default 240s) unless the observation is a named positive lifecycle. A non-positive path is then one resume retry and the 180s post-retry window (about 420s). A named token still runs to the 600s maximum plus 180s (about 780s).
+
+Tests: `test_h3_named_tokens_only` (running at 0 W, an unknown string, and `reinitializing` are not positive; `init`, cooldown, preheat, applying, and ramping are; a hard fault wins). An unknown lifecycle then ends `DEGRADED_NEEDS_ATTENTION` near 420s with two resumes. `test_b2_running_zero_watts_reaches_degraded_not_success` expects that same non-positive span. Persistent applying still uses the 780s window.
+
+## H4
+
+`Controller._now` is `time.monotonic()` and is the only clock for transaction deadlines, settle, retry, recovery budgets, and cooling dwell. `Controller._wall` is `time.time()` for human stamps, anti-flap, `mode_entered_ts`, `last_board_change_ts`, and telemetry success timestamps. Those two clocks are not mixed into one deadline. The inflight marker stores `monotonic_deadline: null` and `resume_on_load: false`. `reconcile_after_reload` zeroes in-memory deadline fields and ignores any numeric deadline a previous process wrote.
+
+Tests use `FakeClock` via `_now` and `_sleep`. `test_h4_wall_jump_does_not_move_monotonic_window` advances wall clock by 50000s during sleep while the monotonic fake clock advances normally; a cooldown lifecycle still spans the monotonic 600s window. `test_h4_boundaries_239_240_599_600_780` checks command counts at 239/240 (non-positive: one resume still in `RECOVERING`, then two resumes and about 420s) and 599/600/780 (cooldown: one resume at 599s, span about 780s, primary deadline delta 600s).
+
+## H5
+
+`cancel_cooling_transaction` clears `_cooling_txn_id`, bumps `_emit_generation`, sets cancel and `reload_hold`, publishes `INTERRUPTED_MANUAL_REVIEW`, emits `lard_cooling_interrupted`, and does not Resume, Start, Restart, or PUT. Recovery and settle loops return exhausted or cancelled on cancel or owner-id mismatch and do not retry. `_note_recovery_interim` returns immediately when health is already terminal or cancel is set, so a later poll cannot overwrite `INTERRUPTED_MANUAL_REVIEW` with `RECOVERING`.
+
+`reconcile_after_reload` runs from `main()` immediately after `Controller()` is constructed. A missing marker is a clean start. A present, unreadable, or deadline-bearing marker clears pending, discards monotonic deadlines, sets `INTERRUPTED_MANUAL_REVIEW`, and issues no command. `_auto_apply_pending_allowed` is false while `reload_hold`, cancel, terminal health, or terminal kind `interrupted` is set, so a paused interrupted transaction is not auto-resumed. A tick in that state publishes and returns without a miner read and without writes.
+
+Tests: `test_h5_cancel_reload_and_stale_txn_issue_no_command` cancels during recovery (one resume already sent, zero cooling PUTs, health `INTERRUPTED_MANUAL_REVIEW`). A marker with `monotonic_deadline: 999999` and `resume_on_load: true` reconciles to `interrupted`, zeroes the deadline, drops pending, and the following tick has an empty write log. A resume `_call_device` after that reconcile returns `None` and adds no command.
+
+## H6
+
+One active cooling transaction. `request_cooling_ceiling` takes `_txn_lock` and, if a transaction is active, coalesces the newest ceiling and returns without starting another cycle. `_emit_lock` serializes device HTTP. `_emit_inflight` counts an overlap and denies the second emit. Cooling commands require the same-thread owner and the live txn id. `tick` returns observe-only when a transaction is active, `reload_hold` is set, or health is `INTERRUPTED_MANUAL_REVIEW`, so a second tick cannot open another cycle or perturb scripted miner state.
+
+Tests (thread barriers, no sleeps): `test_h6_one_owner_under_concurrent_pressure` requests newer ceilings and a tick during settle; one cooling PUT of the original ceiling, pending is the newest value, overlap violations stay 0, and no Start/Restart/reboot. `test_h6_cancel_at_retry_and_telemetry_withhold_resume` cancels at the retry gate while telemetry is withheld; resume count stays at the one primary resume.
+
+## H7
+
+`Settings` defaults remain `enable_writes=False`, `auto_fan_ceiling_enabled=False`, and `cooling_writes_only_when_paused=True`. `load_settings` skips `None` and empty strings. `_truthy` is true only for boolean `True` or the strings `1`, `true`, `yes`, and `on`. A dict, list, or other malformed value is not true. Malformed JSON loads as `{}`. Nothing in this process sets `switch.solar_miner_auto_enable` to on. After reload, pending is cleared and cannot auto-run. Invalid config fails closed to the defaults above.
+
+Tests: `test_h7_migration_cannot_arm_writes_or_pending` covers absent, null, and malformed options and bad JSON; reconcile drops pending and any monotonic deadline; the following tick has an empty write log; `ENT_OLD_AUTO` is never set on.
+
+## B1–B4 Regression Check
+
+- **B1.** `_auto_apply_pending_allowed` is still `HASHING` only. `DEGRADED_NEEDS_ATTENTION`, `ERROR`, and `INTERRUPTED_MANUAL_REVIEW` hold pending. `reload_hold` and cancel also block auto-apply. `BlockerFixTests.test_b1_*` still pass, including stale callback after `ERROR`.
+- **B2.** `operational` and `applying` still return a falsy interim `CoolingResult` and do not close the transaction. Running at 0 W with no named token now exhausts at the expected window (H3) and still ends `DEGRADED_NEEDS_ATTENTION`, not success. Persistent applying still waits the maximum window.
+- **B3.** Settle and pre-resume hard faults still abort before ResumeMining. No Start, Restart, or extra cooling PUT on that path. `test_b3_*` still pass.
+- **B4.** Board health still fails closed: missing hook, stale, malformed, incomplete, or unhealthy boards are not `HASHING`. Watts and TH/s alone are not success. `test_b4_*` still pass.
+- Also unchanged: two consecutive pause polls, same-value cooling no-op, bounded 5xx resume (not Start/Restart), first telemetry miss is `UNKNOWN` or `STALE` and does not cancel an active transaction, device reboot denied.
+
+## Test Results
+
+Command: `python3 -m unittest test_controller` from `lard_controller/app`.
+
+Result: **Ran 110 tests in 0.336s — OK.**
+
+The 0.1.7 suite was 99 tests. This PR adds 11 tests in `WriteEnableHardeningTests` (`test_h1_*` through `test_h7_*`, including the boundary, wall-clock, cancel/reload, and concurrency cases) and replaces the old reboot test with `test_device_reboot_start_and_restart_denied_before_http`. The clock is `FakeClock` on `_now` and `_sleep`. There are no real multi-minute sleeps and no live Braiins calls.
+
+Denied paths assert command counts: `write_names()` empty or missing the denied verb, `cooling_puts()` empty where the PUT must not happen, `resume_calls` at the expected count (often 0), and `_forbid_control` (no start, restart, or reboot). Overlap violations stay 0. Pending coalescing asserts the newest ceiling and a single owner.
+
+## Remaining Risks
+
+- Defaults stay observe-only. This PR does not arm `enable_writes`, `auto_fan_ceiling_enabled`, or solar auto, and it was not deployed.
+- A mid-transaction auth denial or cancel latches `reload_hold` and `INTERRUPTED_MANUAL_REVIEW` until the next process start reconciles. That is fail-closed. It does not auto-resume a paused miner.
+- H3 changes the 0.1.7 window for running at 0 W with no named lifecycle token: expected 240s, one retry, then 180s (about 420s), instead of waiting until 600s. Named tokens still use the 600s maximum plus 180s.
+- Anti-flap and human timestamps still use wall clock. Transaction deadlines do not.
+- Concurrency coverage is deterministic thread barriers in unit tests, not a live miner. The gated transition still holds the Braiins mutex for its own body; a second ceiling request coalesces under `_txn_lock` without taking that mutex.
+- No live Braiins, Home Assistant, Pause, Resume, Start, Restart, reboot, Fan Max, or cooling PUT was performed.
+
+## Merge Readiness: READY FOR SAFETY REVIEW
+
+Full suite is green (110 tests, OK). H1–H7 are implemented. B1–B4 tests still pass. Denied paths assert empty or exact command counts. Do not merge from this review. Do not deploy. Do not enable writes or AUTO.
+
+---
+
+# LARD Controller 0.1.7 notes (historical)
+
+The sections below are the 0.1.7 review notes. The follow-ups they list (broad lifecycle match, wall-clock deadlines, reload policy, concurrency) are closed by the 0.1.8 report above.
 
 ## Files
 
