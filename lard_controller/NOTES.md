@@ -1,3 +1,7 @@
+# Phase 1 observe-only (0.1.12)
+
+Addon version **0.1.12**. Writes stay disarmed. Operator note, bosminer-vs-telemetry troubleshooting, cooling-helper migration, the observe-only checklist, rollback, and the Home Assistant writer fence are in [docs/phase1-observe-only.md](docs/phase1-observe-only.md). Do not deploy this from the repo task. Do not set `enable_writes`. Do not merge until review.
+
 # Braiins owns cooling (0.1.11)
 
 Addon version **0.1.11**. `cooling_control_enabled` defaults **false**. Braiins OS owns cooling: LARD does not `PUT /api/v1/cooling/mode`, does not pause for a fan or temperature write, ignores target/hot/dangerous/fan-max helper changes, and does not open the fan envelope on thermal abort. Hashboard pause, resume, power target, and board-priority switching stay. Chip temps and health stay read-only. `enable_writes` stays false. Do not turn on `switch.solar_miner_auto_enable`. Do not delete HA helpers from this change; that cleanup is separate. `native_auto_target` and `legacy_fan_ceiling` do nothing unless `cooling_control_enabled` is explicitly set true later.

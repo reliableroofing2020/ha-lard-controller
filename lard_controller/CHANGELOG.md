@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.1.12
+
+- Observe-only Phase 1. `enable_writes` still defaults **false**. A process write gate starts disarmed on startup and on reload. Pause, resume, power-target, hashboard PATCH, and cooling PUT return before any HTTP body is built while that gate is disarmed. Structured log: `write blocked` with `op`, `source`, `reason`, and `state`. Recovery readiness does not arm the gate.
+- Cooling helpers: canonical read is the existing `input_number.lard_cooling_*_c` entity. The number is °F. The `_c` suffix is not unit metadata and is not converted. Optional `lard_cooling_*_f` aliases are read only when the canonical helper has no number. A missing alias is a cached miss with monotonic exponential backoff and one diagnostic per window. It is not a miner telemetry failure while `cooling_control_enabled` is false.
+- Miner-plane classes: `API_UNREACHABLE`, `AUTHENTICATION_FAILED`, `BOSMINER_UNAVAILABLE` (connection refused, bosminer not running, related 500/412), `REQUIRED_TELEMETRY_MALFORMED`, `VALID_PAUSED`, `VALID_TRANSITION` (only with coherent lifecycle evidence), `RUNNING_HEALTHY`, `FAULT_LATCHED`. HTTP 200 on a hashboard PATCH is not success. Expected `[1,2,3]` with readback `[1]` or `[]` is faulted/unverified. Zero watts is not a fault for `VALID_PAUSED` or `VALID_TRANSITION`.
+- `APPLYING` cannot stick when the API or bosminer is unavailable. No fresh lifecycle evidence → `FAULT_LATCHED`. Fresh lifecycle evidence → `WAITING_FOR_BRAIINS`. Requested mode and observed state are published separately.
+- Recovery ready after 5 consecutive valid polls with auth, bosminer available, no critical fault, and no competing-writer flag (`binary_sensor.lard_competing_writer` or `switch.solar_miner_auto_enable`). Writes stay off until a human re-arms later. Timeouts, helper backoff, and freshness use `time.monotonic()`.
+- Not in this version: automatic board ladder, power tiers, hashrate-target automation, loft control, cooling writes, live deploy. See `docs/phase1-observe-only.md`.
+
 ## 0.1.11
 
 - Braiins OS owns cooling. New option `cooling_control_enabled` defaults **false**. While it is false, LARD schedules zero cooling transactions: no `PUT /api/v1/cooling/mode`, no pause-for-cooling, no thermal-abort open-fan write. Helper changes for target, hot, dangerous, and fan max are ignored. `native_auto_target` and `legacy_fan_ceiling` stay inert until the option is explicitly true.

@@ -94,7 +94,7 @@ A live `PUT /api/v1/cooling/mode` while hashing is unsafe on this BOS+ build. An
 | Read telemetry | `GET /api/v1/cooling/state` (RPM / `target_speed_ratio`). No ceiling. `GET /cooling/mode` is **405** |
 | Read setpoints | `GET /api/v1/configuration/miner` → `temperature.mode` |
 | Auth | `Authorization: <raw token>` (no Bearer) |
-| Policy helpers | `input_number.lard_cooling_target_c` / `_hot_c` / `_dangerous_c` keep those IDs; the number is °F (the `_c` suffix is historical). Optional `lard_cooling_target_f` / `_hot_f` / `_dangerous_f` win when they have a numeric state. Envelope min/max default 0–100 |
+| Policy helpers | `input_number.lard_cooling_target_c` / `_hot_c` / `_dangerous_c` are canonical; the number is °F (the `_c` suffix is not unit metadata and is not converted). Optional `lard_cooling_*_f` is used only when the canonical helper has no number, and a missing alias is not polled every tick. Envelope min/max default 0–100. Phase 1 observe-only: [docs/phase1-observe-only.md](docs/phase1-observe-only.md) |
 | Legacy helpers | `lard_fan_max_pct` and per-board profiles. Not scheduled under the native policy |
 
 Add-on options stay internal Celsius: target 70 °C, hot 85 °C, dangerous 95 °C (Braiins Toolbox examples inside the OpenAPI 0–200 range). They are the fallback when no helper state exists, not the operator unit, and not a claimed 26.09 firmware default. Operator helpers are Fahrenheit. Package initials are 158 / 185 / 203 °F. A site moving off 70 / 79 / 95 °C sets the helpers to 158 / 174 / 203 °F. Order is `target < hot < dangerous` in °F before convert. After convert, each `degree_c` must be in 0–200 and still strictly ordered.

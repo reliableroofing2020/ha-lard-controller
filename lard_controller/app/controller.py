@@ -61,6 +61,10 @@ ENT_COOLING_HOT_C = "input_number.lard_cooling_hot_c"
 ENT_COOLING_DANGEROUS_C = "input_number.lard_cooling_dangerous_c"
 ENT_COOLING_ENVELOPE_MIN = "input_number.lard_cooling_envelope_min_pct"
 ENT_COOLING_ENVELOPE_MAX = "input_number.lard_cooling_envelope_max_pct"
+# Optional HA fence. Missing is not a competing writer. ON denies arming.
+# Created by the operator while upstairs-AC / pause scripts / resume spam
+# are still live. This add-on does not create the entity.
+ENT_COMPETING_WRITER = "binary_sensor.lard_competing_writer"
 
 # Heartbeat / health entities published every loop (not /local JSON)
 ENT_CTRL_ONLINE = "binary_sensor.lard_controller_online"
@@ -144,7 +148,12 @@ COOLING_STABILIZE_S = 5
 COOLING_RESUME_SETTLE_S = 20
 # Kept so 0.1.6 imports stay valid. 0.1.7 does not loop ResumeMining on 500.
 COOLING_RESUME_BACKOFF_S = (5, 10, 20)
-ADDON_VERSION = "0.1.11"
+ADDON_VERSION = "0.1.12"
+# Optional cooling-helper misses. Monotonic. One diagnostic per window.
+HELPER_MISS_BACKOFF_START_S = 30.0
+HELPER_MISS_BACKOFF_MAX_S = 600.0
+# Recovery readiness is advisory. It never sets the write gate.
+RECOVERY_READY_POLLS = 5
 # Cooling policy. These names only matter when cooling_control_enabled is
 # explicitly true. Default is false: Braiins OS owns cooling, and neither
 # policy schedules a cooling transaction.
@@ -192,6 +201,38 @@ POST_RETRY_RECOVERY_S = 180
 STABLE_HASH_POLLS = 3
 TELEMETRY_FAILURES_BEFORE_ERROR = 3
 MAX_RESUME_RETRIES_PER_TXN = 1
+
+# Phase 1 miner-plane classes. Deterministic. Do not invent a transition
+# from zero watts, a stuck APPLYING label, or an HTTP 200 alone.
+TELEMETRY_CLASSES = (
+    "API_UNREACHABLE",
+    "AUTHENTICATION_FAILED",
+    "BOSMINER_UNAVAILABLE",
+    "REQUIRED_TELEMETRY_MALFORMED",
+    "VALID_PAUSED",
+    "VALID_TRANSITION",
+    "RUNNING_HEALTHY",
+    "FAULT_LATCHED",
+    "WAITING_FOR_BRAIINS",
+    "UNKNOWN",
+)
+_BOSMINER_MARKERS = (
+    "connection refused",
+    "os error 111",
+    "errno 111",
+    "econnrefused",
+    "bosminer is not running",
+    "bosminer api connection",
+    "bosminer_not_running",
+    "bosminer not running",
+)
+_AUTH_MARKERS = (
+    "authentication",
+    "invalid authentication",
+    "missing or invalid authentication",
+    "invalid token",
+    "unauthorized",
+)
 
 # Published health classification. Finer cooling phases stay on attributes.
 # INTERRUPTED_MANUAL_REVIEW is a reload/cancel hold: observe-only, no auto-resume.
@@ -651,6 +692,88 @@ def utc_iso() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+class WritePermission:
+    """Process-local Braiins write gate.
+
+    Starts disarmed. Reload disarms. A recovery-ready streak does not arm it.
+    ``permitted`` is true only for the duration of one already-authorized call.
+    """
+
+    def __init__(self) -> None:
+        self.permitted = False
+        self.reason = "startup_disarmed"
+        self.source = "startup"
+
+    def disarm(self, source: str, reason: str = "startup_disarmed") -> None:
+        self.permitted = False
+        self.reason = reason
+        self.source = source
+
+
+def board_patch_readback(expect, actual, patch_http: int | None) -> str:
+    """HTTP 200 on hashboard PATCH is accepted, not applied.
+
+    ``verified`` only when the readback ids match ``expect``.
+    Expected ``[1, 2, 3]`` with actual ``[1]`` or ``[]`` is ``faulted_unverified``.
+    """
+    exp = sorted(norm_board_id(x) for x in (expect or []) if norm_board_id(x))
+    act = sorted(norm_board_id(x) for x in (actual or []) if norm_board_id(x))
+    if exp != act:
+        return "faulted_unverified"
+    if patch_http != 200:
+        return "unverified"
+    return "verified"
+
+
+def classify_miner_telemetry(
+    *,
+    ok: bool,
+    http_code: int | None = None,
+    error_text: str = "",
+    paused: bool = False,
+    user_paused: bool = False,
+    running: bool = False,
+    positive_lifecycle: bool = False,
+    power_w: float | None = None,
+    critical_fault: bool = False,
+    malformed: bool = False,
+    board_unverified: bool = False,
+) -> str:
+    """Map one read onto a Phase 1 telemetry class.
+
+    Zero watts is not a fault when the read is ``VALID_PAUSED`` or
+    ``VALID_TRANSITION``. ``VALID_TRANSITION`` is returned only when the
+    caller already has coherent lifecycle evidence. A stuck APPLYING label,
+    a bare 0 W, or HTTP 200 without a matching board readback is not that
+    evidence. Connection refused / bosminer not running is
+    ``BOSMINER_UNAVAILABLE`` and is not a successful read.
+    """
+    text = (error_text or "").lower()
+    auth = http_code == 401 or any(marker in text for marker in _AUTH_MARKERS)
+    if auth:
+        return "AUTHENTICATION_FAILED"
+    bosminer = http_code == 412 or any(marker in text for marker in _BOSMINER_MARKERS)
+    if bosminer:
+        return "BOSMINER_UNAVAILABLE"
+    if malformed or "malformed" in text or "required_telemetry_malformed" in text:
+        return "REQUIRED_TELEMETRY_MALFORMED"
+    if board_unverified or critical_fault:
+        return "FAULT_LATCHED"
+    if not ok:
+        return "API_UNREACHABLE"
+    if paused or user_paused:
+        return "VALID_PAUSED"
+    if positive_lifecycle:
+        return "VALID_TRANSITION"
+    if (
+        running
+        and power_w is not None
+        and float(power_w) > COOLING_IDLE_POWER_W
+    ):
+        return "RUNNING_HEALTHY"
+    return "UNKNOWN"
+
+
 # ---------------------------------------------------------------------------
 # Home Assistant client
 # ---------------------------------------------------------------------------
@@ -660,8 +783,12 @@ class HA:
         self.token = token
         self.log = log
         self.fail_count = 0
+        # True when the last state() read failed at the transport (404, refused).
+        # A client that simply has no value leaves this false so tests can
+        # populate a helper on the next tick without waiting out backoff.
+        self.last_read_absent = False
 
-    def _req(self, method: str, path: str, body=None, timeout=30):
+    def _req(self, method: str, path: str, body=None, timeout=30, count_failure: bool = True):
         if not self.token:
             raise RuntimeError("HA token missing (SUPERVISOR_TOKEN or ha_token / secrets)")
         if not self.bases:
@@ -685,17 +812,32 @@ class HA:
             except Exception as e:
                 last = e
                 continue
-        self.fail_count += 1
+        if count_failure:
+            self.fail_count += 1
         raise RuntimeError(f"HA {method} {path} failed: {last}")
 
-    def state(self, entity_id: str):
+    def state(self, entity_id: str, *, quiet: bool = False):
+        """Read one entity. ``quiet`` misses do not increment the API fail counter.
+
+        Optional cooling helpers use quiet mode so a missing ``lard_cooling_*_f``
+        alias is not a miner telemetry failure.
+        """
+        self.last_read_absent = False
         try:
-            code, data = self._req("GET", f"/api/states/{entity_id}")
+            code, data = self._req(
+                "GET",
+                f"/api/states/{entity_id}",
+                count_failure=not quiet,
+            )
             if code == 200 and isinstance(data, dict):
                 return data.get("state")
+            self.last_read_absent = True
         except Exception as e:
-            self.log(f"ha_state_err {entity_id}: {e}")
-            self.fail_count += 1
+            self.last_read_absent = True
+            if not quiet:
+                self.log(f"ha_state_err {entity_id}: {e}")
+                self.fail_count += 1
+            return None
         return None
 
     def set_state(self, entity_id: str, state, attributes=None):
@@ -1114,6 +1256,30 @@ class Braiins:
         self.fail_count = 0
         self.last_ok_iso = ""
         self._io_lock = threading.RLock()
+        # Unbound (None) keeps direct client tests on the pre-gate path.
+        # Controller binds a WritePermission that starts disarmed.
+        self.write_permission: WritePermission | None = None
+
+    def _blocked_write(self, op: str):
+        """Return a denial tuple before any request body is built, or None to proceed.
+
+        An unbound gate does not block. A bound disarmed gate blocks.
+        """
+        gate = self.write_permission
+        if gate is None or gate.permitted:
+            return None
+        reason = gate.reason or "writes_disarmed"
+        state = {
+            "enable_writes": bool(self.settings.enable_writes),
+            "source_gate": gate.source,
+            "writes_permitted": False,
+        }
+        self.log(
+            "write blocked "
+            f"op={op} source=braiins reason={reason} "
+            f"state={json.dumps(state, sort_keys=True)}"
+        )
+        return 0, {"denied": True, "write_blocked": True, "op": op, "reason": reason}
 
     @property
     def miner(self) -> str:
@@ -1187,9 +1353,15 @@ class Braiins:
             raise
 
     def pause(self):
+        blocked = self._blocked_write("pause")
+        if blocked is not None:
+            return blocked
         return self._call("PUT", "/api/v1/actions/pause")
 
     def resume(self):
+        blocked = self._blocked_write("resume")
+        if blocked is not None:
+            return blocked
         return self._call("PUT", "/api/v1/actions/resume")
 
     def start(self):
@@ -1201,12 +1373,18 @@ class Braiins:
         return self._call("PUT", "/api/v1/actions/restart")
 
     def set_power(self, watt: int):
+        blocked = self._blocked_write("set_power")
+        if blocked is not None:
+            return blocked
         return self._call("PUT", "/api/v1/performance/power-target", {"watt": int(watt)})
 
     def get_power_target(self):
         return self._call("GET", "/api/v1/performance/power-target")
 
     def patch_boards(self, enable: bool, ids: list[str]):
+        blocked = self._blocked_write("patch_boards")
+        if blocked is not None:
+            return blocked
         if not ids:
             return 200, {}
         return self._call(
@@ -1360,13 +1538,17 @@ class Braiins:
         {"target_temperature": {"degree_c": N}, ...} on the auto object.
 
         Refused before HTTP unless cooling_control_enabled is explicitly true.
-        Braiins OS owns cooling in the default posture.
+        Braiins OS owns cooling in the default posture. A bound write gate
+        that is disarmed returns before the auto body is built.
         """
         if not bool(self.settings.cooling_control_enabled):
             raise RuntimeError(
                 "refused Braiins path /api/v1/cooling/mode "
                 "(cooling_control_disabled before HTTP)"
             )
+        blocked = self._blocked_write("cooling_put")
+        if blocked is not None:
+            return blocked
         n = clamp_fan_max_pct(max_fan_speed)
         auto: dict[str, Any] = dict(extra_auto or {})
         auto["max_fan_speed"] = n
@@ -2319,6 +2501,26 @@ class Controller:
         self._txn_seq = 0
         self._cooling_phase = "IDLE"
         self._health_class = "UNKNOWN"
+        self.write_permission = WritePermission()
+        if hasattr(self.b, "write_permission"):
+            self.b.write_permission = self.write_permission
+        self.telemetry_class = "UNKNOWN"
+        self.observed_state = "UNKNOWN"
+        self.recovery_ready = False
+        self._valid_poll_streak = 0
+        self._auth_ok = False
+        self._bosminer_available = False
+        self._critical_fault = False
+        self._transition_evidence = False
+        self._transition_evidence_mono = 0.0
+        self._apply_depth = 0
+        self._helper_miss_until: dict[str, float] = {}
+        self._helper_backoff: dict[str, float] = {}
+        self._helper_logged_until: dict[str, float] = {}
+        self._last_transport = ""
+        self._last_http_code: int | None = None
+        self._telemetry_last_success_mono = 0.0
+        self._board_unverified = False
         self._pending_profile: CoolingProfile | None = None
         self._pending_explicit = False
         self._pending_hold_logged: tuple | None = None
@@ -2558,6 +2760,24 @@ class Controller:
             old_auto = True
         if old_auto:
             return "old_auto_on"
+        if self.competing_writer_blocks_arming():
+            return "competing_writer"
+        return None
+
+    def competing_writer_blocks_arming(self) -> str | None:
+        """Arming denial hook. Missing entity is not a writer and is not polled hot.
+
+        ``switch.solar_miner_auto_enable`` is checked separately so its
+        existing refusal string stays stable. This hook is the optional
+        ``binary_sensor.lard_competing_writer`` fence (upstairs AC mode
+        writes, pause/resume scripts, resume-button spam).
+        """
+        try:
+            raw = self._read_cooling_helper(ENT_COMPETING_WRITER, cache_miss=True)
+        except Exception:
+            return None
+        if raw == "on":
+            return "competing_writer"
         return None
 
     def _authorize_device_write(self, action: str) -> str | None:
@@ -2633,8 +2853,26 @@ class Controller:
             return "cancelled"
         return None
 
+    def _log_write_blocked(self, op: str, source: str, reason: str) -> None:
+        """Structured denial. Emitted before any Braiins write body is built."""
+        state = {
+            "actual_mode": self.actual_mode,
+            "cooling_control_enabled": bool(self.settings.cooling_control_enabled),
+            "enable_writes": bool(self.settings.enable_writes),
+            "observed_state": self.observed_state,
+            "recovery_ready": bool(self.recovery_ready),
+            "telemetry_class": self.telemetry_class,
+            "writes_permitted": bool(self.write_permission.permitted),
+        }
+        self.log(
+            "write blocked "
+            f"op={op} source={source} reason={reason} "
+            f"state={json.dumps(state, sort_keys=True)}"
+        )
+
     def _deny_write(self, action: str, reason: str) -> None:
         """Log a denial. A mid-transaction denial holds the miner for review."""
+        self._log_write_blocked(action, "controller", reason)
         self._log_txn(f"write_denied action={action} reason={reason}")
         self._emit("lard_write_denied", action=action, reason=reason)
         self._last_cooling_result = f"denied_{reason}"
@@ -2666,9 +2904,14 @@ class Controller:
                 self._deny_write(action, "overlap")
                 return None
             self._emit_inflight = action
+            # Permit only this already-authorized call. The gate returns to
+            # disarmed immediately after, including on reload and on recovery.
+            self.write_permission.permitted = True
             try:
                 return fn()
             finally:
+                self.write_permission.permitted = False
+                self.write_permission.reason = "call_finished_disarmed"
                 self._emit_inflight = None
 
     def _device_tuple(self, action: str, fn):
@@ -2742,6 +2985,7 @@ class Controller:
         except Exception:
             raw = {"txn_id": "", "phase": "unreadable", "malformed": True}
         self._clear_inflight_marker()
+        self.write_permission.disarm("reload", "reload_disarmed")
         self._primary_recovery_started_ts = 0.0
         self._primary_recovery_deadline_ts = 0.0
         self._recovery_started_ts = 0.0
@@ -2963,6 +3207,7 @@ class Controller:
         expect = sorted(to_enable)
         deadline = self._now() + self._board_wait_s()
         empty_attempt = 0
+        last_actual: list[str] = []
         while self._now() < deadline:
             self.health.touch()
             try:
@@ -2970,8 +3215,11 @@ class Controller:
             except Exception as e:
                 self.log(f"board_poll exc: {e}")
                 actual, code = [], 0
+            last_actual = list(actual or [])
             self.log(f"board_poll expect={expect} actual={actual} http={code}")
-            if code == 200 and self._boards_match(actual, expect):
+            # PATCH HTTP 200 is not success. Readback must match.
+            if board_patch_readback(expect, actual, code) == "verified":
+                self._board_unverified = False
                 self.last_board_change_ts = self._wall()
                 self.boards_str = ",".join(sorted(expect)) if expect else "none"
                 return True
@@ -2985,7 +3233,15 @@ class Controller:
                 self._sleep(delay)
                 continue
             self._sleep(BOARD_POLL_S)
-        self.last_error = f"board_wait_timeout expect={expect}"
+        status = board_patch_readback(expect, last_actual, 200)
+        self._board_unverified = status != "verified"
+        self.telemetry_class = "FAULT_LATCHED"
+        self.observed_state = "FAULT_LATCHED"
+        self.last_error = f"board_wait_timeout expect={expect} readback={status}"
+        self.log(
+            f"board_readback faulted_unverified expect={expect} "
+            f"readback={status} patch_http=200"
+        )
         return False
 
     def _ensure_power_target(self) -> bool:
@@ -3266,19 +3522,72 @@ class Controller:
         """True unless the operator explicitly selected the legacy fan-ceiling policy."""
         return str(self.settings.cooling_policy).strip().lower() != COOLING_POLICY_LEGACY
 
+    def _ha_state(self, entity_id: str, *, quiet: bool) -> Any:
+        fn = self.ha.state
+        try:
+            return fn(entity_id, quiet=quiet)
+        except TypeError:
+            return fn(entity_id)
+
+    def _note_helper_miss(self, entity_id: str) -> None:
+        """Cache a missing optional helper. One log line per backoff window.
+
+        Uses the monotonic clock. A miss is not miner telemetry, and while
+        cooling control is off it does not increment the HA API fail counter
+        (the read is quiet).
+        """
+        delay = float(self._helper_backoff.get(entity_id, HELPER_MISS_BACKOFF_START_S))
+        until = self._now() + delay
+        self._helper_miss_until[entity_id] = until
+        self._helper_backoff[entity_id] = min(delay * 2.0, HELPER_MISS_BACKOFF_MAX_S)
+        if self._helper_logged_until.get(entity_id, 0.0) <= self._now():
+            self.log(
+                f"helper_miss entity={entity_id} optional=true "
+                f"backoff_s={delay:g} cooling_control={str(self._cooling_control_enabled()).lower()} "
+                "— cached miss, not miner telemetry"
+            )
+            self._helper_logged_until[entity_id] = until
+
+    def _read_cooling_helper(self, entity_id: str, *, cache_miss: bool) -> Any:
+        """Quiet read. Optional aliases negative-cache transport misses only.
+
+        The number is returned unchanged. No unit conversion.
+        """
+        now = self._now()
+        if cache_miss:
+            until = self._helper_miss_until.get(entity_id)
+            if until is not None and now < until:
+                return None
+        raw = self._ha_state(entity_id, quiet=True)
+        if raw not in (None, "unknown", "unavailable", ""):
+            self._helper_miss_until.pop(entity_id, None)
+            self._helper_backoff.pop(entity_id, None)
+            return raw
+        if cache_miss and bool(getattr(self.ha, "last_read_absent", False)):
+            self._note_helper_miss(entity_id)
+        return None
+
     def _operator_temp_f(self, f_entity: str, c_entity: str, default_c: int) -> float | None:
         """One setpoint in operator °F.
 
-        Prefer the _f helper. If it has no number, use the historical _c
-        entity id — that suffix is compatibility only; the state is still °F.
+        Canonical entity is the verified historical id
+        ``input_number.lard_cooling_*_c``. Its numeric state is °F. The ``_c``
+        suffix is not unit metadata and is not converted. Optional ``_f``
+        aliases are consulted only when the canonical helper has no number,
+        and a missing alias is a cached miss with backoff — it is not polled
+        every tick and it is not a miner telemetry failure.
         If neither helper has a number, express the add-on option (internal
         °C) as °F so the order check uses one unit. The option is not
-        reinterpreted as Fahrenheit.
+        reinterpreted as Fahrenheit. Conversion to ``degree_c`` still happens
+        only inside ``operator_setpoints_to_degree_c`` when a cooling profile
+        is built, and cooling writes stay off unless cooling control is on.
         """
-        for entity_id in (f_entity, c_entity):
-            parsed = parse_helper_temp(self.ha.state(entity_id))
-            if parsed is not None:
-                return parsed
+        canonical = parse_helper_temp(self._read_cooling_helper(c_entity, cache_miss=False))
+        if canonical is not None:
+            return canonical
+        optional = parse_helper_temp(self._read_cooling_helper(f_entity, cache_miss=True))
+        if optional is not None:
+            return optional
         try:
             return celsius_to_fahrenheit(default_c)
         except (TypeError, ValueError):
@@ -3937,6 +4246,7 @@ class Controller:
         self._telemetry_fault = False
         self._telemetry_freshness = "FRESH"
         self._telemetry_last_success_ts = self._wall()
+        self._telemetry_last_success_mono = self._now()
         if self.power_w is not None:
             self._last_good_power_w = self.power_w
         if self.boards_str:
@@ -4468,6 +4778,14 @@ class Controller:
             "cooling_writes_only_when_paused": bool(self.settings.cooling_writes_only_when_paused),
             "cooling_policy": self.settings.cooling_policy,
             "cooling_control_enabled": bool(self.settings.cooling_control_enabled),
+            "telemetry_class": self.telemetry_class,
+            "observed_state": self.observed_state,
+            "requested_mode": self.desired_mode,
+            "recovery_ready": bool(self.recovery_ready),
+            "recovery_valid_polls": int(self._valid_poll_streak),
+            "writes_permitted": bool(self.write_permission.permitted),
+            "auth_ok": bool(self._auth_ok),
+            "bosminer_available": bool(self._bosminer_available),
             "desired_target_c": None
             if self._cooling_desired is None
             else self._cooling_desired.target_temperature_c,
@@ -5106,28 +5424,154 @@ class Controller:
         obs.board_health_verified = verified
         obs.boards_healthy = bool(healthy and verified and not obs.safety_fault and not obs.board_stale)
 
+    def _transition_evidence_fresh(self) -> bool:
+        """Coherent lifecycle evidence still inside the monotonic recovery window.
+
+        A previous APPLYING label is not evidence. Zero watts is not evidence.
+        """
+        if not self._transition_evidence:
+            return False
+        window = float(self.settings.expected_recovery_seconds or EXPECTED_RECOVERY_S)
+        return (self._now() - self._transition_evidence_mono) <= max(1.0, window)
+
+    def _recovery_sample_ok(self, obs: MinerObservation) -> bool:
+        """One poll toward recovery readiness. Does not arm writes."""
+        if not obs.ok or not self._auth_ok or not self._bosminer_available:
+            return False
+        if self.telemetry_class not in {"VALID_PAUSED", "VALID_TRANSITION", "RUNNING_HEALTHY"}:
+            return False
+        if self._critical_fault:
+            return False
+        if self.ha.state(ENT_OLD_AUTO) == "on":
+            return False
+        if self.competing_writer_blocks_arming():
+            return False
+        return True
+
+    def _settle_unavailable_applying(self, obs: MinerObservation) -> None:
+        """APPLYING cannot stick when the API or bosminer is unavailable.
+
+        In-flight apply/cooling transactions keep their own phase. With no
+        fresh lifecycle evidence the published mode leaves APPLYING for
+        FAULT_LATCHED. WAITING_FOR_BRAIINS requires that evidence.
+        """
+        if self._cooling_txn_active or self._apply_depth:
+            return
+        applying = self.actual_mode == "APPLYING" or self._cooling_transition_active
+        if not applying:
+            return
+        unavailable = (not obs.ok) or self.telemetry_class in {
+            "API_UNREACHABLE",
+            "AUTHENTICATION_FAILED",
+            "BOSMINER_UNAVAILABLE",
+            "REQUIRED_TELEMETRY_MALFORMED",
+        }
+        if not unavailable:
+            return
+        prior = self.telemetry_class
+        if self._transition_evidence_fresh():
+            self.telemetry_class = "WAITING_FOR_BRAIINS"
+            self.observed_state = "WAITING_FOR_BRAIINS"
+            self.actual_mode = "WAITING_FOR_BRAIINS"
+            self._cooling_transition_active = False
+            return
+        if prior == "BOSMINER_UNAVAILABLE" and "bosminer_unavailable" not in (self.last_error or ""):
+            self.last_error = f"{self.last_error}|bosminer_unavailable"
+        self.telemetry_class = "FAULT_LATCHED"
+        self.observed_state = "FAULT_LATCHED"
+        self.actual_mode = "FAULT_LATCHED"
+        self._health_class = "FAULT_LATCHED"
+        self._cooling_transition_active = False
+        if not self.last_error:
+            self.last_error = "applying_without_miner"
+
+    def _finish_observation(self, obs: MinerObservation) -> None:
+        """Classify the read, update recovery readiness, settle stuck APPLYING.
+
+        Recovery readiness never sets ``write_permission.permitted``.
+        """
+        if obs.ok:
+            error_text = ""
+            http_code = None
+        else:
+            error_text = f"{self.last_error or ''} {self._last_transport or ''}"
+            http_code = self._last_http_code
+        positive = bool(obs.ok and self._positive_lifecycle(obs))
+        malformed = (not obs.ok) and ("malformed" in error_text.lower())
+        self.telemetry_class = classify_miner_telemetry(
+            ok=bool(obs.ok),
+            http_code=http_code,
+            error_text=error_text,
+            paused=bool(obs.paused),
+            user_paused=bool(obs.user_paused),
+            running=bool(obs.running),
+            positive_lifecycle=positive,
+            power_w=obs.power_w,
+            critical_fault=bool(obs.ok and self._hard_fault(obs)),
+            malformed=malformed,
+            board_unverified=False,
+        )
+        if self.telemetry_class == "AUTHENTICATION_FAILED":
+            self._auth_ok = False
+        elif obs.ok:
+            self._auth_ok = True
+        if self.telemetry_class == "BOSMINER_UNAVAILABLE":
+            self._bosminer_available = False
+        elif obs.ok:
+            self._bosminer_available = True
+        self._critical_fault = bool(obs.ok and self._hard_fault(obs))
+        if positive:
+            self._transition_evidence = True
+            self._transition_evidence_mono = self._now()
+        elif obs.ok:
+            self._transition_evidence = False
+        if self._recovery_sample_ok(obs):
+            self._valid_poll_streak += 1
+        else:
+            self._valid_poll_streak = 0
+        self.recovery_ready = self._valid_poll_streak >= RECOVERY_READY_POLLS
+        self._settle_unavailable_applying(obs)
+        if self.actual_mode in {"FAULT_LATCHED", "WAITING_FOR_BRAIINS"}:
+            self.observed_state = self.actual_mode
+        else:
+            self.observed_state = self.telemetry_class
+
     def observe_miner(self) -> MinerObservation:
         """Read boards + pause/mining state. Topology alone never confirms a live mode."""
         obs = MinerObservation()
         try:
-            ids, code, _ = self.b.enabled_ids()
+            return self._observe_miner_body(obs)
+        finally:
+            self._finish_observation(obs)
+
+    def _observe_miner_body(self, obs: MinerObservation) -> MinerObservation:
+        try:
+            ids, code, body = self.b.enabled_ids()
         except Exception as e:
             self.last_error = f"read_boards_exc:{e}"
+            self._last_transport = str(e)
+            self._last_http_code = None
             return obs
         if code != 200:
             self.last_error = f"read_boards_http_{code}"
+            self._last_transport = _summarize_http_body(body)
+            self._last_http_code = int(code) if code is not None else None
             return obs
         obs.enabled_ids = [norm_board_id(i) for i in ids if norm_board_id(i)]
         obs.boards_ok = True
         self.boards_str = ",".join(obs.enabled_ids) if obs.enabled_ids else "none"
 
         try:
-            parsed, dcode, _ = self.b.mining_state()
+            parsed, dcode, dbody = self.b.mining_state()
         except Exception as e:
             self.last_error = f"read_details_exc:{e}"
+            self._last_transport = str(e)
+            self._last_http_code = None
             return obs
         if dcode != 200:
             self.last_error = f"read_details_http_{dcode}"
+            self._last_transport = _summarize_http_body(dbody)
+            self._last_http_code = int(dcode) if dcode is not None else None
             return obs
         if not isinstance(parsed, dict):
             parsed = parse_mining_state({})
@@ -5313,6 +5757,7 @@ class Controller:
         """
         self.log(f"APPLY begin mode={mode}")
         self.actual_mode = "APPLYING"
+        self._apply_depth += 1
         previous_cooling = self._cooling_applied
         cooling_changed = False
         abort = self._thermal_abort_needed()
@@ -5328,6 +5773,7 @@ class Controller:
             self.log(f"APPLY exc {traceback.format_exc()}")
             return False
         finally:
+            self._apply_depth = max(0, self._apply_depth - 1)
             self._cooling_transition_active = False
             if self._txn_owner == threading.get_ident():
                 self._release_cooling_owner()
@@ -5531,7 +5977,12 @@ class Controller:
             "writes_allowed": self.writes_allowed(enable_on),
             "mode_request": self.mode_request,
             "desired_mode": self.desired_mode,
+            "requested_mode": self.desired_mode,
             "actual_mode": self.actual_mode,
+            "observed_state": self.observed_state,
+            "telemetry_class": self.telemetry_class,
+            "recovery_ready": bool(self.recovery_ready),
+            "writes_permitted": bool(self.write_permission.permitted),
             "confirmed_operational": self.confirmed_operational,
             "miner_paused": self.miner_paused,
             "mining_phase": self.mining_phase,
@@ -5736,6 +6187,8 @@ class Controller:
     def read_actual_from_miner(self):
         """Observe miner. Hashboard set {1} while user-paused is PAUSED, not ONE_BOARD."""
         obs = self.observe_miner()
+        if self.actual_mode in {"FAULT_LATCHED", "WAITING_FOR_BRAIINS"}:
+            return obs
         if self._cooling_transition_active:
             self.actual_mode = "APPLYING"
             return obs
@@ -5791,6 +6244,20 @@ class Controller:
             self.last_error = "refusing_writes_old_auto_enable_is_on"
             if native:
                 self._absorb_temperature_policy_while_disarmed()
+            self.publish(solar_avg, enable_on)
+            return
+
+        if self.competing_writer_blocks_arming():
+            self.acting = False
+            self.last_error = "refusing_writes_competing_writer"
+            self.reason = f"{reason}|competing_writer"
+            self._log_write_blocked("arm", "tick", "competing_writer")
+            if native:
+                self._absorb_temperature_policy_while_disarmed()
+            try:
+                self.read_actual_from_miner()
+            except Exception as e:
+                self.log(f"observe miner failed: {e}")
             self.publish(solar_avg, enable_on)
             return
 
@@ -5968,6 +6435,7 @@ def main() -> int:
         f"miner={settings.miner_url} poll={settings.poll_seconds}s "
         f"board_wait>={settings.board_wait_seconds}s resume_wait={RESUME_WAIT_S}s "
         f"enable_writes={settings.enable_writes} "
+        f"writes_permitted=false "
         f"power_target={settings.power_target_w}W "
         f"version={ADDON_VERSION} chip_abort_f={CHIP_ABORT_F} "
         f"cooling_dwell={settings.cooling_dwell_seconds}s "

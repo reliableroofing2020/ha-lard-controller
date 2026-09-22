@@ -9,7 +9,7 @@ Supervisor owns start / stop / restart. This is not an Advanced SSH `nohup` job 
 | | |
 | --- | --- |
 | Slug | `lard_controller` |
-| Version | `0.1.11` |
+| Version | `0.1.12` |
 | Miner | Braiins OS+ REST @ `http://192.168.1.113` (API ~1.8.0) |
 | Network | `host_network: true` |
 | Health | `http://<ha-host>:8099/health` (Supervisor watchdog) |
@@ -84,6 +84,10 @@ Before `enable_writes: true`, turn **off**:
 HVAC-only automations (`solar_miner_lower_ac`, `solar_miner_upstairs_ac`, presence comfort) are not Braiins writers.
 
 Drop [`../package/lard_controller_watchdog.yaml`](../package/lard_controller_watchdog.yaml) into `config/packages/` (watchdog) and [`ha_packages/lard_cooling_target.yaml`](ha_packages/lard_cooling_target.yaml) (target / hot / dangerous in °F). [`ha_packages/lard_fan_max.yaml`](ha_packages/lard_fan_max.yaml) and [`ha_packages/lard_cooling_profiles.yaml`](ha_packages/lard_cooling_profiles.yaml) are legacy fan-ceiling helpers only.
+
+## Phase 1 (0.1.12 — observe only)
+
+Writes default off. Health classes, the disarmed write gate, and the cooling-helper migration are in [lard_controller/docs/phase1-observe-only.md](lard_controller/docs/phase1-observe-only.md).
 
 ## Cooling (0.1.11 — Braiins owns cooling)
 
