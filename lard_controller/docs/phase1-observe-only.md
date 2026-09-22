@@ -2,13 +2,21 @@
 
 This add-on version classifies the miner and refuses Braiins writes unless a human later re-arms them. It does not deploy itself, does not set `enable_writes`, and does not call the miner.
 
-`enable_writes` still defaults **false**. On process start and on reload the write gate is disarmed. Pause, resume, power-target, hashboard PATCH, and cooling PUT return before any HTTP body is built. The log line is:
+`enable_writes` still defaults **false**. On process start and on reload the controller state is `DISARMED` and `writes_permitted` is false. `write_gate` is the option posture: `DISARMED` while `enable_writes` is false, `ARMED` only when that option is true. `write_gate=ARMED` is not authorization. The master boolean, the old auto switch, and a competing writer can still deny the call. No code path sets `controller_state` to `ARMED`. `MAINTENANCE_LOCKOUT` is reserved and unused: there is no maintenance PATCH tool.
+
+Pause, resume, power-target, hashboard PATCH, cooling PUT, `apply_mode`, and the legacy cooling requests refuse **before** a request object is built when `enable_writes` is false. An unbound Braiins client is included: `enable_writes` false blocks even if no controller has bound a gate. The log line and the return value are:
 
 ```text
-write blocked op=<pause|resume|set_power|patch_boards|cooling_put|arm> source=<controller|braiins|tick> reason=<...> state={...}
+write blocked result=WRITE_BLOCKED op=<...> requested_operation=<...> source=<controller|braiins> reason=<...> controller_state=<...> enable_writes=false network_write_sent=false state={...}
 ```
 
-Recovery readiness does not flip that gate.
+```json
+{"result":"WRITE_BLOCKED","requested_operation":"...","source":"...","controller_state":"DISARMED","enable_writes":false,"reason":"enable_writes_false","network_write_sent":false,"denied":true,"write_blocked":true,"op":"..."}
+```
+
+`network_write_sent` is false. Start, restart, reboot, and factory reset raise before any socket instead of returning this record. The full path list is [phase1-writer-inventory.md](phase1-writer-inventory.md).
+
+Recovery readiness does not flip the gate and does not mean armed.
 
 ## Operator note
 
@@ -20,7 +28,11 @@ Published separately:
 | --- | --- |
 | `sensor.lard_controller_requested_mode` | What LARD was asked for (`desired_mode`). Not the miner |
 | `observed_miner_mode` | Verified physical mode only: `PAUSED`, `ONE_BOARD`, `TWO_BOARD`, `THREE_BOARD`. Otherwise `UNVERIFIED` |
-| `controller_state` | Controller lifecycle: `DISARMED`, `OBSERVING`, `APPLYING`, `WAITING_FOR_BRAIINS`, `RUNNING`, `FAULT_LATCHED`, `ERROR` |
+| `controller_state` | Controller lifecycle actually published: `DISARMED`, `OBSERVING`, `APPLYING`, `WAITING_FOR_BRAIINS`, `RUNNING`, `FAULT_LATCHED`, `ERROR`. `ARMED` and `MAINTENANCE_LOCKOUT` are in the typed set and are not assigned. Option posture is `write_gate` |
+| `write_gate` | `DISARMED` or `ARMED` from `enable_writes` only. Not a physical mode and not permission to write |
+| `health_classification` | Same value as `telemetry_class` for this poll |
+| `api_reachable` / `bosminer_available` | Separate. A gateway HTTP 500 can be reachable and still bosminer-down |
+| `sensor.lard_controller_power_w` / `sensor.lard_controller_boards` | Fresh only after a required boards+details read. Otherwise state `unknown` / `unverified`, with `last_power_w` / `last_boards` kept as attributes |
 | `sensor.lard_controller_actual_mode` | Compatibility sensor. See the migration note below. Not a physical mode when the value is `APPLYING`, `WAITING_FOR_BRAIINS`, `FAULT_LATCHED`, or `ERROR` |
 | Health attribute `telemetry_class` | This poll's miner-plane class |
 | Health attribute `recovery_ready` | Five good polls. Advisory only. Does not clear `FAULT_LATCHED` and does not arm writes |
@@ -89,6 +101,18 @@ Dashboards that need the miner, not the controller, should read attribute `obser
 
 Zero watts alone is not a fault.
 
+## Freshness
+
+Required telemetry is `GET /api/v1/miner/hw/hashboards` plus `GET /api/v1/miner/details`. A failed required read publishes power as `unknown` and boards as `unverified`. The last good watts and board list stay in attributes. They are not the sensor state. Cooling `GET /api/v1/cooling/state` is optional: its failure class is recorded on the `cooling` endpoint and does not by itself become a board or API fault. Each of `boards`, `details`, and `cooling` keeps `last_success_mono`, `last_failure_mono`, `last_failure_class`, and a redacted `last_failure_summary`.
+
+There is no second 5-second poller. These notes are taken from the existing tick. Optional `lard_cooling_*_f` misses keep the existing negative cache (30s, doubling, cap 600s). Canonical `input_number.lard_cooling_*_c` values are °F. This version does not convert them and does not add another `_c` / `_f` helper layer.
+
+A disarmed tick, a fault latch, and a reload drop any coalesced cooling profile so a later arm cannot replay it. A failed board readback does not re-PATCH. `APPLYING` and `WAITING_FOR_BRAIINS` both end in `FAULT_LATCHED` when the monotonic evidence deadline passes.
+
+## Aleixps
+
+Concepts borrowed, not code: separate API reachability from bosminer availability, per-endpoint freshness, and do not present a failed required read as fresh. Do not install Aleixps. Do not copy or vendor that source. The license is unclear and LARD's implementation is independent.
+
 ## Bosminer unavailable vs telemetry failure
 
 | What you see | What it means | What LARD does |
@@ -117,7 +141,7 @@ No Home Assistant entity is deleted by this version.
 
 ## Home Assistant writer fence
 
-This repository does not change Home Assistant automations. The live fence is parallel work. Expected state before anyone re-arms LARD:
+This repository fences every in-repo write path. It does not change Home Assistant automations, and it does not claim those automations are fenced. Fill in [phase1-writer-inventory.md](phase1-writer-inventory.md) section “HA paths (to be filled by live inventory)” on the live system. Expected state before anyone re-arms LARD:
 
 - Add-on `enable_writes` remains **false**
 - `switch.solar_miner_auto_enable` remains **off** (LARD never turns it on)
@@ -149,6 +173,8 @@ This repository does not change Home Assistant automations. The live fence is pa
 4. Leave `switch.solar_miner_auto_enable` off.
 5. Confirm the new container log says version `0.1.11` and `WRITES DISARMED` before walking away.
 
-## Explicitly not in 0.1.12
+## Still outside this add-on
 
-Automatic board ladder, power tiers, hashrate-target automation, loft HVAC control, cooling writes, and any live Braiins command.
+The deployed supervisor image seen in the prior live review was **0.1.11**, with bosminer instability (`read_boards_http_500`, health `UNKNOWN`). This git change does not deploy 0.1.12 and does not repair or restart BOSminer. Live miner HTTP from this task is not required and was not used.
+
+Automatic board ladder, power tiers, hashrate-target automation, loft HVAC control, cooling writes, and any live Braiins command stay out. Observe-only deployment, merge, and write arming are not authorized.

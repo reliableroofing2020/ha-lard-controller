@@ -13,6 +13,7 @@ foreground; a crash exits non-zero so Supervisor restarts the container.
 from __future__ import annotations
 
 import json
+import re
 import os
 import socket
 import threading
@@ -96,11 +97,14 @@ OBSERVED_MINER_MODES = ("PAUSED", "ONE_BOARD", "TWO_BOARD", "THREE_BOARD")
 CONTROLLER_STATES = (
     "OBSERVING",
     "DISARMED",
+    "ARMED",
     "APPLYING",
     "WAITING_FOR_BRAIINS",
     "RUNNING",
     "FAULT_LATCHED",
     "ERROR",
+    # Reserved. No in-repo path enters it. There is no maintenance PATCH tool.
+    "MAINTENANCE_LOCKOUT",
 )
 # Compatibility values historically published on sensor.lard_controller_actual_mode.
 # A value is a verified physical miner mode only when it is also in
@@ -731,11 +735,198 @@ class WritePermission:
         self.permitted = False
         self.reason = "startup_disarmed"
         self.source = "startup"
+        self.controller_state = "DISARMED"
 
     def disarm(self, source: str, reason: str = "startup_disarmed") -> None:
         self.permitted = False
         self.reason = reason
         self.source = source
+
+
+def write_blocked_record(
+    *,
+    requested_operation: str,
+    source: str,
+    controller_state: str,
+    enable_writes: bool,
+    reason: str,
+) -> dict[str, Any]:
+    """Denial returned before a Braiins request body or socket exists.
+
+    ``network_write_sent`` is always false. Older callers still read
+    ``denied``, ``write_blocked``, ``op``, and ``reason``.
+    """
+    return {
+        "result": "WRITE_BLOCKED",
+        "requested_operation": requested_operation,
+        "source": source,
+        "controller_state": controller_state or "DISARMED",
+        "enable_writes": bool(enable_writes),
+        "reason": reason,
+        "network_write_sent": False,
+        "denied": True,
+        "write_blocked": True,
+        "op": requested_operation,
+    }
+
+
+def _redact_summary(text: str, limit: int = 120) -> str:
+    """Short failure text with credential-shaped fields removed."""
+    raw = str(text or "").replace("\n", " ")
+    redacted = re.sub(
+        r"(?i)(password|token|authorization|secret)(\"?\s*[:=]\s*)([^,\s}\]]+)",
+        r"\1\2REDACTED",
+        raw,
+    )
+    if len(redacted) > limit:
+        return redacted[:limit] + "…"
+    return redacted
+
+
+# In-repo miner write paths. Home Assistant automations are not in this list.
+# See docs/phase1-writer-inventory.md. MAINTENANCE_LOCKOUT is not an entry.
+WRITER_INVENTORY = (
+    {
+        "path": "Braiins.pause",
+        "location": "app/controller.py Braiins.pause",
+        "network": "PUT /api/v1/actions/pause",
+        "direct": True,
+        "user_reachable": "only after enable_writes and the HA master gate, via apply_mode",
+        "gate_before_network": "_blocked_write then Controller._authorize_device_write",
+        "disposition": "gated",
+        "status": "active",
+    },
+    {
+        "path": "Braiins.resume",
+        "location": "app/controller.py Braiins.resume",
+        "network": "PUT /api/v1/actions/resume",
+        "direct": True,
+        "user_reachable": "only after enable_writes and the HA master gate, via apply_mode",
+        "gate_before_network": "_blocked_write then Controller._authorize_device_write",
+        "disposition": "gated",
+        "status": "active",
+    },
+    {
+        "path": "Braiins.set_power",
+        "location": "app/controller.py Braiins.set_power",
+        "network": "PUT /api/v1/performance/power-target",
+        "direct": True,
+        "user_reachable": "only after enable_writes and the HA master gate, via apply_mode",
+        "gate_before_network": "_blocked_write before the watt body is built",
+        "disposition": "gated",
+        "status": "active",
+    },
+    {
+        "path": "Braiins.patch_boards",
+        "location": "app/controller.py Braiins.patch_boards",
+        "network": "PATCH /api/v1/miner/hw/hashboards",
+        "direct": True,
+        "user_reachable": "only after enable_writes and the HA master gate, via apply_mode",
+        "gate_before_network": "_blocked_write before the hashboard body is built",
+        "disposition": "gated",
+        "status": "active",
+    },
+    {
+        "path": "Braiins.set_cooling_auto",
+        "location": "app/controller.py Braiins.set_cooling_auto",
+        "network": "PUT /api/v1/cooling/mode",
+        "direct": True,
+        "user_reachable": "cooling_control_enabled and enable_writes, via a cooling transaction",
+        "gate_before_network": "cooling_control_enabled check, then _blocked_write, before the auto body",
+        "disposition": "gated",
+        "status": "active",
+    },
+    {
+        "path": "Braiins.start",
+        "location": "app/controller.py Braiins.start",
+        "network": "PUT /api/v1/actions/start",
+        "direct": True,
+        "user_reachable": "no",
+        "gate_before_network": "BRAIINS_DENY_PATHS inside _call before ensure_auth and before any socket",
+        "disposition": "structurally_denied",
+        "status": "retired",
+    },
+    {
+        "path": "Braiins.restart",
+        "location": "app/controller.py Braiins.restart",
+        "network": "PUT /api/v1/actions/restart",
+        "direct": True,
+        "user_reachable": "no",
+        "gate_before_network": "BRAIINS_DENY_PATHS inside _call before ensure_auth and before any socket",
+        "disposition": "structurally_denied",
+        "status": "retired",
+    },
+    {
+        "path": "Braiins._call reboot/factory-reset",
+        "location": "app/controller.py BRAIINS_DENY_PATHS",
+        "network": "PUT reboot or factory-reset",
+        "direct": True,
+        "user_reachable": "no",
+        "gate_before_network": "BRAIINS_DENY_PATHS before ensure_auth and before any socket",
+        "disposition": "structurally_denied",
+        "status": "retired",
+    },
+    {
+        "path": "Controller._cooling_escalate_start",
+        "location": "app/controller.py",
+        "network": "none",
+        "direct": False,
+        "user_reachable": "no",
+        "gate_before_network": "helper returns false and does not call the client",
+        "disposition": "retired",
+        "status": "retired",
+    },
+    {
+        "path": "Controller._cooling_escalate_restart",
+        "location": "app/controller.py",
+        "network": "none",
+        "direct": False,
+        "user_reachable": "no",
+        "gate_before_network": "helper returns false and does not call the client",
+        "disposition": "retired",
+        "status": "retired",
+    },
+    {
+        "path": "Controller.apply_mode",
+        "location": "app/controller.py Controller.tick / apply_mode",
+        "network": "indirect pause, resume, power-target, hashboard PATCH",
+        "direct": False,
+        "user_reachable": "tick when enable_writes and the HA master gate are both on",
+        "gate_before_network": "tick returns before apply_mode when writes are disallowed; each command re-checks _authorize_device_write",
+        "disposition": "gated",
+        "status": "active",
+    },
+    {
+        "path": "Controller.request_cooling_ceiling",
+        "location": "app/controller.py",
+        "network": "indirect cooling PUT",
+        "direct": False,
+        "user_reachable": "explicit call only; refused while cooling control is off",
+        "gate_before_network": "_cooling_control_enabled, _policy_denial, then _call_device",
+        "disposition": "gated",
+        "status": "active",
+    },
+    {
+        "path": "Controller.request_temperature_policy",
+        "location": "app/controller.py",
+        "network": "indirect cooling PUT",
+        "direct": False,
+        "user_reachable": "explicit call only; refused while cooling control is off",
+        "gate_before_network": "_cooling_control_enabled, _policy_denial, then _call_device",
+        "disposition": "gated",
+        "status": "active",
+    },
+    {
+        "path": "health HTTP server",
+        "location": "app/controller.py start_health_server",
+        "network": "none (GET /health /status / only)",
+        "direct": False,
+        "user_reachable": "read-only",
+        "gate_before_network": "no POST/PUT/PATCH handler",
+        "disposition": "read_only",
+        "status": "active",
+    },
+)
 
 
 def board_patch_readback(expect, actual, patch_http: int | None) -> str:
@@ -1289,25 +1480,40 @@ class Braiins:
         self.write_permission: WritePermission | None = None
 
     def _blocked_write(self, op: str):
-        """Return a denial tuple before any request body is built, or None to proceed.
+        """Return a WRITE_BLOCKED tuple before any request body is built, or None.
 
-        An unbound gate does not block. A bound disarmed gate blocks.
+        ``enable_writes`` false blocks even when no Controller has bound a gate.
+        A bound disarmed gate also blocks. A permitted gate, or an unbound
+        client whose option ``enable_writes`` is true, may proceed.
         """
         gate = self.write_permission
-        if gate is None or gate.permitted:
+        writes_on = bool(self.settings.enable_writes)
+        if writes_on and (gate is None or gate.permitted):
             return None
-        reason = gate.reason or "writes_disarmed"
-        state = {
-            "enable_writes": bool(self.settings.enable_writes),
-            "source_gate": gate.source,
-            "writes_permitted": False,
-        }
+        if not writes_on:
+            reason = "enable_writes_false"
+        else:
+            reason = (gate.reason if gate is not None else None) or "writes_disarmed"
+        controller_state = "DISARMED"
+        if gate is not None:
+            controller_state = getattr(gate, "controller_state", None) or "DISARMED"
+        record = write_blocked_record(
+            requested_operation=op,
+            source="braiins",
+            controller_state=controller_state,
+            enable_writes=writes_on,
+            reason=reason,
+        )
         self.log(
             "write blocked "
-            f"op={op} source=braiins reason={reason} "
-            f"state={json.dumps(state, sort_keys=True)}"
+            f"result=WRITE_BLOCKED op={op} requested_operation={op} "
+            f"source=braiins reason={reason} "
+            f"controller_state={record['controller_state']} "
+            f"enable_writes={str(writes_on).lower()} "
+            f"network_write_sent=false "
+            f"state={json.dumps(record, sort_keys=True)}"
         )
-        return 0, {"denied": True, "write_blocked": True, "op": op, "reason": reason}
+        return 0, record
 
     @property
     def miner(self) -> str:
@@ -2535,7 +2741,12 @@ class Controller:
         self.telemetry_class = "UNKNOWN"
         self.observed_state = "UNKNOWN"
         self.controller_state = "DISARMED"
+        self.write_gate = "DISARMED"
         self.observed_miner_mode = "UNVERIFIED"
+        self._api_reachable = False
+        self._required_telemetry_fresh = False
+        self._last_write_blocked: dict[str, Any] | None = None
+        self._endpoints: dict[str, dict[str, Any]] = {}
         self._last_verified_miner_mode = ""
         self._fault_latched = False
         self._verification_ctx = {
@@ -2895,20 +3106,33 @@ class Controller:
         return None
 
     def _log_write_blocked(self, op: str, source: str, reason: str) -> None:
-        """Structured denial. Emitted before any Braiins write body is built."""
-        state = {
-            "actual_mode": self.actual_mode,
-            "cooling_control_enabled": bool(self.settings.cooling_control_enabled),
-            "enable_writes": bool(self.settings.enable_writes),
-            "observed_state": self.observed_state,
-            "recovery_ready": bool(self.recovery_ready),
-            "telemetry_class": self.telemetry_class,
-            "writes_permitted": bool(self.write_permission.permitted),
-        }
+        """Structured WRITE_BLOCKED. Emitted before any Braiins write body is built."""
+        record = write_blocked_record(
+            requested_operation=op,
+            source=source,
+            controller_state=self.controller_state,
+            enable_writes=bool(self.settings.enable_writes),
+            reason=reason,
+        )
+        record["actual_mode"] = self.actual_mode
+        record["observed_miner_mode"] = self.observed_miner_mode
+        record["observed_state"] = self.observed_state
+        record["recovery_ready"] = bool(self.recovery_ready)
+        record["telemetry_class"] = self.telemetry_class
+        record["writes_permitted"] = bool(self.write_permission.permitted)
+        record["cooling_control_enabled"] = bool(self.settings.cooling_control_enabled)
+        self._last_write_blocked = record
+        self.write_permission.controller_state = self.controller_state
+        if not self.settings.enable_writes:
+            self._drop_stale_write_queue(reason)
         self.log(
             "write blocked "
-            f"op={op} source={source} reason={reason} "
-            f"state={json.dumps(state, sort_keys=True)}"
+            f"result=WRITE_BLOCKED op={op} requested_operation={op} "
+            f"source={source} reason={reason} "
+            f"controller_state={self.controller_state} "
+            f"enable_writes={str(bool(self.settings.enable_writes)).lower()} "
+            f"network_write_sent=false "
+            f"state={json.dumps(record, sort_keys=True)}"
         )
 
     def _deny_write(self, action: str, reason: str) -> None:
@@ -2958,7 +3182,11 @@ class Controller:
     def _device_tuple(self, action: str, fn):
         result = self._call_device(action, fn)
         if result is None:
-            return 0, {"denied": True}
+            body = dict(self._last_write_blocked or {})
+            body.setdefault("denied", True)
+            body.setdefault("network_write_sent", False)
+            body.setdefault("result", "WRITE_BLOCKED")
+            return 0, body
         return result
 
     def _denied_body(self, body) -> bool:
@@ -3027,6 +3255,13 @@ class Controller:
             raw = {"txn_id": "", "phase": "unreadable", "malformed": True}
         self._clear_inflight_marker()
         self.write_permission.disarm("reload", "reload_disarmed")
+        self.write_gate = "ARMED" if self.settings.enable_writes else "DISARMED"
+        if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
+            self.controller_state = "FAULT_LATCHED"
+        else:
+            self.controller_state = "DISARMED"
+            self.observed_miner_mode = "UNVERIFIED"
+        self.write_permission.controller_state = self.controller_state
         self._primary_recovery_started_ts = 0.0
         self._primary_recovery_deadline_ts = 0.0
         self._recovery_started_ts = 0.0
@@ -3473,11 +3708,33 @@ class Controller:
         try:
             code, state = self.b.get_cooling_state()
         except Exception as e:
+            self._note_endpoint(
+                "cooling",
+                ok=False,
+                failure_class="COOLING_UNAVAILABLE",
+                summary=str(e),
+            )
             self.log(f"cooling_state skip: {e}")
             return
         if code != 200:
+            cooling_class = (
+                "BOSMINER_UNAVAILABLE"
+                if code == 412
+                or any(
+                    marker in _summarize_http_body(state).lower()
+                    for marker in _BOSMINER_MARKERS
+                )
+                else "COOLING_UNAVAILABLE"
+            )
+            self._note_endpoint(
+                "cooling",
+                ok=False,
+                failure_class=cooling_class,
+                summary=_summarize_http_body(state) or f"http_{code}",
+            )
             self.log(f"cooling_state http={code} body={_summarize_http_body(state)}")
             return
+        self._note_endpoint("cooling", ok=True)
         tel = parse_cooling_telemetry(state if isinstance(state, dict) else {})
         self._chip_temp_f = tel.get("chip_temp_f")
         self._fan_rpm = tel.get("fan_rpm")
@@ -4313,6 +4570,96 @@ class Controller:
             return False
         return True
 
+    def _note_endpoint(
+        self,
+        name: str,
+        *,
+        ok: bool,
+        failure_class: str = "",
+        summary: str = "",
+    ) -> None:
+        """Record one existing read. Does not start another poll."""
+        slot = self._endpoints.setdefault(
+            name,
+            {
+                "last_success_mono": 0.0,
+                "last_failure_mono": 0.0,
+                "last_failure_class": "",
+                "last_failure_summary": "",
+                "fresh": False,
+            },
+        )
+        now = self._now()
+        if ok:
+            slot["last_success_mono"] = now
+            slot["fresh"] = True
+            slot["last_failure_class"] = ""
+            slot["last_failure_summary"] = ""
+            return
+        slot["fresh"] = False
+        slot["last_failure_mono"] = now
+        slot["last_failure_class"] = failure_class or "UNAVAILABLE"
+        slot["last_failure_summary"] = _redact_summary(summary)
+
+    def _endpoint_fresh(self, name: str) -> bool:
+        return bool((self._endpoints.get(name) or {}).get("fresh"))
+
+    def _read_failure_class(self, code, body) -> str:
+        text = _summarize_http_body(body)
+        return classify_miner_telemetry(
+            ok=False,
+            http_code=int(code) if code is not None else None,
+            error_text=text,
+            malformed="malformed" in (text or "").lower(),
+        )
+
+    def _drop_stale_write_queue(self, reason: str) -> None:
+        """Forget a coalesced cooling profile so a later arm cannot replay it."""
+        if self._pending_profile is None and not self._pending_explicit:
+            return
+        self._pending_profile = None
+        self._pending_explicit = False
+        self._pending_hold_logged = None
+        self._log_txn(f"pending_dropped reason={reason} — no replay")
+
+    def _power_fresh(self) -> bool:
+        return bool(self._required_telemetry_fresh and self.power_w is not None)
+
+    def _boards_fresh(self) -> bool:
+        return bool(
+            self._required_telemetry_fresh
+            and self._endpoint_fresh("boards")
+            and self._endpoint_fresh("details")
+        )
+
+    def _observability_fields(self) -> dict[str, Any]:
+        """Read-only controller plane. Does not poll the miner."""
+        endpoints = {
+            name: {
+                "fresh": bool(slot.get("fresh")),
+                "last_success_mono": slot.get("last_success_mono") or 0.0,
+                "last_failure_mono": slot.get("last_failure_mono") or 0.0,
+                "last_failure_class": slot.get("last_failure_class") or "",
+                "last_failure_summary": slot.get("last_failure_summary") or "",
+            }
+            for name, slot in self._endpoints.items()
+        }
+        return {
+            "api_reachable": bool(self._api_reachable),
+            "bosminer_available": bool(self._bosminer_available),
+            "required_telemetry_fresh": bool(self._required_telemetry_fresh),
+            "health_classification": self.telemetry_class,
+            "endpoints": endpoints,
+            "fault_reason": self.last_error or "",
+            "consecutive_good_polls": int(self._valid_poll_streak),
+            "last_txn_result": self._last_cooling_result or "",
+            "last_verified_boards": self._last_good_boards or "",
+            "write_gate": self.write_gate,
+            "power_fresh": self._power_fresh(),
+            "boards_fresh": self._boards_fresh(),
+            "cooling_fresh": self._endpoint_fresh("cooling"),
+        }
+
     def _note_telemetry_success(self) -> None:
         self._telemetry_fail_streak = 0
         self._telemetry_fault = False
@@ -4874,6 +5221,7 @@ class Controller:
             else self._cooling_desired.target_temperature_c,
             "configured_cooling_mode": self._configured_cooling.get("mode"),
             "configured_target_c": self._configured_cooling.get("target_temperature_c"),
+            **self._observability_fields(),
         }
 
     def _sync_idle_health(self, obs: MinerObservation | None) -> None:
@@ -4912,6 +5260,9 @@ class Controller:
         helpers) instead, and only after cooling_control_enabled is explicit.
         """
         if not self._cooling_control_enabled():
+            self._log_write_blocked(
+                "request_cooling_ceiling", "controller", "cooling_control_disabled"
+            )
             self._log_txn(
                 "request_cooling_ceiling refused — cooling_control_disabled; "
                 "Braiins owns cooling (no pause, no PUT)"
@@ -4935,6 +5286,9 @@ class Controller:
                 return False
             policy = self._policy_denial()
             if policy or self._health_class in TERMINAL_HEALTH:
+                self._log_write_blocked(
+                    "request_cooling_ceiling", "controller", policy or "terminal"
+                )
                 self._log_txn(
                     f"write_denied action=request_cooling reason={policy or 'terminal'}"
                 )
@@ -4959,6 +5313,9 @@ class Controller:
         pause-confirms before PUT when cooling control is explicitly enabled.
         """
         if not self._cooling_control_enabled():
+            self._log_write_blocked(
+                "request_temperature_policy", "controller", "cooling_control_disabled"
+            )
             self._log_txn(
                 "request_temperature_policy refused — cooling_control_disabled; "
                 "Braiins owns cooling (no pause, no PUT)"
@@ -4977,6 +5334,9 @@ class Controller:
                 return False
             policy = self._policy_denial()
             if policy or self._health_class in TERMINAL_HEALTH:
+                self._log_write_blocked(
+                    "request_temperature_policy", "controller", policy or "terminal"
+                )
                 self._log_txn(
                     f"write_denied action=request_temperature_policy reason={policy or 'terminal'}"
                 )
@@ -5585,28 +5945,26 @@ class Controller:
         else:
             self.observed_miner_mode = "UNVERIFIED"
 
+        self.write_gate = "ARMED" if self.settings.enable_writes else "DISARMED"
         if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
             self.controller_state = "FAULT_LATCHED"
-            return
-        if self.actual_mode == "WAITING_FOR_BRAIINS":
+        elif self.actual_mode == "WAITING_FOR_BRAIINS":
             self.controller_state = "WAITING_FOR_BRAIINS"
-            return
-        if self.actual_mode == "APPLYING" or self._cooling_transition_active:
+        elif self.actual_mode == "APPLYING" or self._cooling_transition_active:
             self.controller_state = "APPLYING"
-            return
-        if self.actual_mode == "ERROR":
+        elif self.actual_mode == "ERROR":
             self.controller_state = "ERROR"
-            return
-        if (
+        elif (
             self.observed_miner_mode in {"ONE_BOARD", "TWO_BOARD", "THREE_BOARD"}
             and self.telemetry_class == "RUNNING_HEALTHY"
         ):
             self.controller_state = "RUNNING"
-            return
-        if self.observed_miner_mode in OBSERVED_MINER_MODES:
+        elif self.observed_miner_mode in OBSERVED_MINER_MODES:
             self.controller_state = "OBSERVING"
-            return
-        self.controller_state = "DISARMED"
+        else:
+            self.controller_state = "DISARMED"
+        if self.write_permission is not None:
+            self.write_permission.controller_state = self.controller_state
 
     def _fault_reason_for_verification(self) -> str:
         """Distinguish why verification ended in FAULT_LATCHED."""
@@ -5674,6 +6032,7 @@ class Controller:
         self._health_class = "FAULT_LATCHED"
         self._cooling_transition_active = False
         self._transition_evidence = False
+        self._drop_stale_write_queue("fault_latched")
 
     def _recovery_sample_ok(self, obs: MinerObservation) -> bool:
         """One poll toward recovery readiness. Does not arm writes."""
@@ -5792,6 +6151,17 @@ class Controller:
             self._bosminer_available = False
         elif obs.ok:
             self._bosminer_available = True
+        if obs.ok:
+            self._api_reachable = True
+            self._required_telemetry_fresh = True
+            if self.power_w is not None:
+                self._last_good_power_w = self.power_w
+            if self.boards_str:
+                self._last_good_boards = self.boards_str
+        else:
+            # A failed required read must not mark cooling-PUT freshness FRESH.
+            self._required_telemetry_fresh = False
+            self._api_reachable = self._last_http_code is not None
         self._critical_fault = bool(obs.ok and self._hard_fault(obs))
         if positive:
             self._transition_evidence = True
@@ -5836,12 +6206,25 @@ class Controller:
             self.last_error = f"read_boards_exc:{e}"
             self._last_transport = str(e)
             self._last_http_code = None
+            self._note_endpoint(
+                "boards",
+                ok=False,
+                failure_class="API_UNREACHABLE",
+                summary=str(e),
+            )
             return obs
         if code != 200:
             self.last_error = f"read_boards_http_{code}"
             self._last_transport = _summarize_http_body(body)
             self._last_http_code = int(code) if code is not None else None
+            self._note_endpoint(
+                "boards",
+                ok=False,
+                failure_class=self._read_failure_class(code, body),
+                summary=_summarize_http_body(body) or f"http_{code}",
+            )
             return obs
+        self._note_endpoint("boards", ok=True)
         obs.enabled_ids = [norm_board_id(i) for i in ids if norm_board_id(i)]
         obs.boards_ok = True
         self.boards_str = ",".join(obs.enabled_ids) if obs.enabled_ids else "none"
@@ -5852,12 +6235,25 @@ class Controller:
             self.last_error = f"read_details_exc:{e}"
             self._last_transport = str(e)
             self._last_http_code = None
+            self._note_endpoint(
+                "details",
+                ok=False,
+                failure_class="API_UNREACHABLE",
+                summary=str(e),
+            )
             return obs
         if dcode != 200:
             self.last_error = f"read_details_http_{dcode}"
             self._last_transport = _summarize_http_body(dbody)
             self._last_http_code = int(dcode) if dcode is not None else None
+            self._note_endpoint(
+                "details",
+                ok=False,
+                failure_class=self._read_failure_class(dcode, dbody),
+                summary=_summarize_http_body(dbody) or f"http_{dcode}",
+            )
             return obs
+        self._note_endpoint("details", ok=True)
         if not isinstance(parsed, dict):
             parsed = parse_mining_state({})
         obs.details_ok = True
@@ -6040,6 +6436,9 @@ class Controller:
         mid-hash. Failures restore known-good cooling, pause, and ERROR — no
         legacy fan/auto handoff.
         """
+        if not self.settings.enable_writes:
+            self._log_write_blocked("apply_mode", "controller", "enable_writes_false")
+            return False
         self.log(f"APPLY begin mode={mode}")
         self.actual_mode = "APPLYING"
         self._apply_depth += 1
@@ -6325,14 +6724,28 @@ class Controller:
         if self._telemetry_freshness == "FRESH" and not self._telemetry_fault:
             self._sync_idle_health(getattr(self, "_last_obs", None))
         status = self._status_dict(solar_avg, enable_on)
+        power_fresh = self._power_fresh()
+        boards_fresh = self._boards_fresh()
+        if power_fresh:
+            power_state = self.power_w
+        else:
+            power_state = "unknown"
+            status["power_w"] = None
+        if boards_fresh:
+            boards_state = self.boards_str or "none"
+        else:
+            boards_state = "unverified"
+            status["boards"] = "unverified"
+        status["last_power_w"] = self._last_good_power_w
+        status["last_boards"] = self._last_good_boards
+        status["power_fresh"] = power_fresh
+        status["boards_fresh"] = boards_fresh
         self._write_status_files(status)
         self.health.set_status(status)
 
         last_seen = status["last_seen"]
         error = self.last_error or ""
         fails = status["api_fail_count"]
-        boards = self.boards_str or "unknown"
-        power = "" if self.power_w is None else self.power_w
         hb = {
             "online": "on",
             "last_seen": last_seen,
@@ -6341,8 +6754,8 @@ class Controller:
             "error": error if error else "ok",
             "api_fail_count": fails,
             "last_braiins_ok": self.b.last_ok_iso or "",
-            "power_w": power if power != "" else "",
-            "boards": boards,
+            "power_w": power_state if power_fresh else "",
+            "boards": boards_state,
         }
         mqtt_ok = self.mqtt.publish_heartbeat(hb)
 
@@ -6389,8 +6802,14 @@ class Controller:
                 "observed_miner_mode": self.observed_miner_mode,
                 "controller_state": self.controller_state,
                 "telemetry_class": self.telemetry_class,
+                "health_classification": self.telemetry_class,
                 "actual_mode_is_physical": self.actual_mode in OBSERVED_MINER_MODES,
                 "requested_mode": self.desired_mode,
+                "write_gate": self.write_gate,
+                "api_reachable": bool(self._api_reachable),
+                "bosminer_available": bool(self._bosminer_available),
+                "recovery_ready": bool(self.recovery_ready),
+                "fault_reason": self.last_error or "",
             },
         )
         self.ha.set_state(
@@ -6413,18 +6832,24 @@ class Controller:
         )
         self.ha.set_state(
             ENT_CTRL_POWER,
-            power if power != "" else "unknown",
+            power_state,
             {
                 "friendly_name": "LARD Controller Power",
                 "unit_of_measurement": "W",
                 "device_class": "power",
                 "state_class": "measurement",
+                "fresh": power_fresh,
+                "last_power_w": self._last_good_power_w,
             },
         )
         self.ha.set_state(
             ENT_CTRL_BOARDS,
-            boards,
-            {"friendly_name": "LARD Controller Boards"},
+            boards_state,
+            {
+                "friendly_name": "LARD Controller Boards",
+                "fresh": boards_fresh,
+                "last_boards": self._last_good_boards,
+            },
         )
         self.ha.set_state(
             ENT_CTRL_HEALTH,
@@ -6503,6 +6928,8 @@ class Controller:
         return obs
 
     def tick(self):
+        if not self.settings.enable_writes:
+            self._drop_stale_write_queue("enable_writes_false")
         self.health.touch()
         enable_on = self.ha.state(ENT_ENABLE) == "on"
         solar_avg = self.update_solar_avg()

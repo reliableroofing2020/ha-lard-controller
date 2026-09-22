@@ -142,7 +142,7 @@ Install `ha_packages/lard_cooling_target.yaml` for the Â°F helpers (slider, 100â
 
 ## Mode reconciliation contract
 
-Desired mode and confirmed operational/actual mode are separate. The compatibility sensor `actual_mode` is one of `PAUSED`, `ONE_BOARD`, `TWO_BOARD`, `THREE_BOARD`, `APPLYING`, `ERROR`, `WAITING_FOR_BRAIINS`, `FAULT_LATCHED`. Only the first four are verified physical miner modes (`observed_miner_mode`). `APPLYING`, `WAITING_FOR_BRAIINS`, `FAULT_LATCHED`, and `ERROR` are controller lifecycle (`controller_state`). `WAITING_FOR_BRAIINS` expires on the monotonic evidence deadline. See `docs/phase1-observe-only.md`.
+Desired mode and confirmed operational/actual mode are separate. The compatibility sensor `actual_mode` is one of `PAUSED`, `ONE_BOARD`, `TWO_BOARD`, `THREE_BOARD`, `APPLYING`, `ERROR`, `WAITING_FOR_BRAIINS`, `FAULT_LATCHED`. Only the first four are verified physical miner modes (`observed_miner_mode`). `APPLYING`, `WAITING_FOR_BRAIINS`, `FAULT_LATCHED`, and `ERROR` are controller lifecycle (`controller_state`). `WAITING_FOR_BRAIINS` expires on the monotonic evidence deadline. `enable_writes` false returns `WRITE_BLOCKED` before a miner request is built. A failed required read publishes power as `unknown` and boards as `unverified`. See `docs/phase1-observe-only.md` and `docs/phase1-writer-inventory.md`.
 
 Hashboard topology alone never confirms a non-`PAUSED` mode. Board set `{1}` while Braiins is still `user_pause` / `MINER_STATUS_PAUSED` is **`PAUSED`**, not `ONE_BOARD`. That is what used to skip resume after an add-on restart (`desired == actual`).
 

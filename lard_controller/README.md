@@ -87,7 +87,7 @@ Drop [`../package/lard_controller_watchdog.yaml`](../package/lard_controller_wat
 
 ## Phase 1 (0.1.12 — observe only)
 
-Writes default off. Health classes, the bounded `WAITING_FOR_BRAIINS` state, miner-side transition evidence, the `actual_mode` / `observed_miner_mode` / `controller_state` split, and the cooling-helper migration are in [lard_controller/docs/phase1-observe-only.md](lard_controller/docs/phase1-observe-only.md).
+Writes default off. Health classes, the bounded `WAITING_FOR_BRAIINS` state, miner-side transition evidence, the `actual_mode` / `observed_miner_mode` / `controller_state` split, the `WRITE_BLOCKED` gate, and the cooling-helper migration are in [lard_controller/docs/phase1-observe-only.md](lard_controller/docs/phase1-observe-only.md). In-repo write paths are listed in [lard_controller/docs/phase1-writer-inventory.md](lard_controller/docs/phase1-writer-inventory.md).
 
 ## Cooling (0.1.11 — Braiins owns cooling)
 

@@ -1,0 +1,185 @@
+{
+  "version": "0.1.12",
+  "scope": "in-repo LARD add-on only",
+  "enable_writes_default": false,
+  "note": "Home Assistant automations are not claimed fenced. See ha_paths_template.",
+  "writers": [
+    {
+      "path": "Braiins.pause",
+      "location": "app/controller.py Braiins.pause",
+      "network": "PUT /api/v1/actions/pause",
+      "direct": true,
+      "user_reachable": "only after enable_writes and the HA master gate, via apply_mode",
+      "gate_before_network": "_blocked_write then Controller._authorize_device_write",
+      "disposition": "gated",
+      "status": "active"
+    },
+    {
+      "path": "Braiins.resume",
+      "location": "app/controller.py Braiins.resume",
+      "network": "PUT /api/v1/actions/resume",
+      "direct": true,
+      "user_reachable": "only after enable_writes and the HA master gate, via apply_mode",
+      "gate_before_network": "_blocked_write then Controller._authorize_device_write",
+      "disposition": "gated",
+      "status": "active"
+    },
+    {
+      "path": "Braiins.set_power",
+      "location": "app/controller.py Braiins.set_power",
+      "network": "PUT /api/v1/performance/power-target",
+      "direct": true,
+      "user_reachable": "only after enable_writes and the HA master gate, via apply_mode",
+      "gate_before_network": "_blocked_write before the watt body is built",
+      "disposition": "gated",
+      "status": "active"
+    },
+    {
+      "path": "Braiins.patch_boards",
+      "location": "app/controller.py Braiins.patch_boards",
+      "network": "PATCH /api/v1/miner/hw/hashboards",
+      "direct": true,
+      "user_reachable": "only after enable_writes and the HA master gate, via apply_mode",
+      "gate_before_network": "_blocked_write before the hashboard body is built",
+      "disposition": "gated",
+      "status": "active"
+    },
+    {
+      "path": "Braiins.set_cooling_auto",
+      "location": "app/controller.py Braiins.set_cooling_auto",
+      "network": "PUT /api/v1/cooling/mode",
+      "direct": true,
+      "user_reachable": "cooling_control_enabled and enable_writes, via a cooling transaction",
+      "gate_before_network": "cooling_control_enabled check, then _blocked_write, before the auto body",
+      "disposition": "gated",
+      "status": "active"
+    },
+    {
+      "path": "Braiins.start",
+      "location": "app/controller.py Braiins.start",
+      "network": "PUT /api/v1/actions/start",
+      "direct": true,
+      "user_reachable": "no",
+      "gate_before_network": "BRAIINS_DENY_PATHS inside _call before ensure_auth and before any socket",
+      "disposition": "structurally_denied",
+      "status": "retired"
+    },
+    {
+      "path": "Braiins.restart",
+      "location": "app/controller.py Braiins.restart",
+      "network": "PUT /api/v1/actions/restart",
+      "direct": true,
+      "user_reachable": "no",
+      "gate_before_network": "BRAIINS_DENY_PATHS inside _call before ensure_auth and before any socket",
+      "disposition": "structurally_denied",
+      "status": "retired"
+    },
+    {
+      "path": "Braiins._call reboot/factory-reset",
+      "location": "app/controller.py BRAIINS_DENY_PATHS",
+      "network": "PUT reboot or factory-reset",
+      "direct": true,
+      "user_reachable": "no",
+      "gate_before_network": "BRAIINS_DENY_PATHS before ensure_auth and before any socket",
+      "disposition": "structurally_denied",
+      "status": "retired"
+    },
+    {
+      "path": "Controller._cooling_escalate_start",
+      "location": "app/controller.py",
+      "network": "none",
+      "direct": false,
+      "user_reachable": "no",
+      "gate_before_network": "helper returns false and does not call the client",
+      "disposition": "retired",
+      "status": "retired"
+    },
+    {
+      "path": "Controller._cooling_escalate_restart",
+      "location": "app/controller.py",
+      "network": "none",
+      "direct": false,
+      "user_reachable": "no",
+      "gate_before_network": "helper returns false and does not call the client",
+      "disposition": "retired",
+      "status": "retired"
+    },
+    {
+      "path": "Controller.apply_mode",
+      "location": "app/controller.py Controller.tick / apply_mode",
+      "network": "indirect pause, resume, power-target, hashboard PATCH",
+      "direct": false,
+      "user_reachable": "tick when enable_writes and the HA master gate are both on",
+      "gate_before_network": "tick returns before apply_mode when writes are disallowed; each command re-checks _authorize_device_write",
+      "disposition": "gated",
+      "status": "active"
+    },
+    {
+      "path": "Controller.request_cooling_ceiling",
+      "location": "app/controller.py",
+      "network": "indirect cooling PUT",
+      "direct": false,
+      "user_reachable": "explicit call only; refused while cooling control is off",
+      "gate_before_network": "_cooling_control_enabled, _policy_denial, then _call_device",
+      "disposition": "gated",
+      "status": "active"
+    },
+    {
+      "path": "Controller.request_temperature_policy",
+      "location": "app/controller.py",
+      "network": "indirect cooling PUT",
+      "direct": false,
+      "user_reachable": "explicit call only; refused while cooling control is off",
+      "gate_before_network": "_cooling_control_enabled, _policy_denial, then _call_device",
+      "disposition": "gated",
+      "status": "active"
+    },
+    {
+      "path": "health HTTP server",
+      "location": "app/controller.py start_health_server",
+      "network": "none (GET /health /status / only)",
+      "direct": false,
+      "user_reachable": "read-only",
+      "gate_before_network": "no POST/PUT/PATCH handler",
+      "disposition": "read_only",
+      "status": "active"
+    }
+  ],
+  "ha_paths_template": [
+    {
+      "path": "automation.solar_miner_upstairs_ac",
+      "expected_disposition": "logbook only; must not write input_select.lard_miner_mode_request",
+      "status": "to_be_filled_by_live_inventory"
+    },
+    {
+      "path": "switch.solar_miner_auto_enable",
+      "expected_disposition": "remain off; LARD never turns it on; ON refuses add-on writes",
+      "status": "to_be_filled_by_live_inventory"
+    },
+    {
+      "path": "button.lard_mining_pause / button.lard_mining_resume",
+      "expected_disposition": "not pressed by an agent loop; still callable from HA until live fence",
+      "status": "to_be_filled_by_live_inventory"
+    },
+    {
+      "path": "script.solar_miner_pause / resume / set-target",
+      "expected_disposition": "not scheduled; still a bypass until live fence",
+      "status": "to_be_filled_by_live_inventory"
+    },
+    {
+      "path": "automation.solar_miner_power_governor and other pause/verify automations",
+      "expected_disposition": "stay off",
+      "status": "to_be_filled_by_live_inventory"
+    },
+    {
+      "path": "binary_sensor.lard_competing_writer",
+      "expected_disposition": "ON denies arming; missing entity is not a writer",
+      "status": "to_be_filled_by_live_inventory"
+    },
+    {
+      "path": "direct hashboard PATCH or restore scripts outside this add-on",
+      "expected_disposition": "do not run; no in-repo maintenance bypass",
+      "status": "to_be_filled_by_live_inventory"
+    }
+  ]
+}
