@@ -118,7 +118,7 @@ Concepts borrowed, not code: separate API reachability from bosminer availabilit
 | What you see | What it means | What LARD does |
 | --- | --- | --- |
 | `cooling_state` or `read_boards` HTTP 500 with `Connection refused (os error 111)`, or HTTP 412 "BOSminer is not running" | The REST gateway answered. **bosminer** did not. Phase 0 saw this while hashrate/power collapsed and `read_boards_http_500` was the sticky error | Class `BOSMINER_UNAVAILABLE`. If the controller is verifying (`APPLYING` or `WAITING_FOR_BRAIINS`) and independent evidence is still inside the window, publish bounded `WAITING_FOR_BRAIINS`. When that window ends, or there was no independent evidence, publish `FAULT_LATCHED`. No pause, resume, PATCH, or power write |
-| `telemetry_sustained_unavailable` after repeated generic read failures | The add-on missed required reads and was not inside a cooling transaction | The streak still raises `ERROR` after `telemetry_failures_before_error` (default 3). No corrective write. A later coherent boards+details read can clear that **active** error only. See the 0.1.14 section below |
+| `telemetry_sustained_unavailable` after repeated generic read failures | The add-on missed required reads and was not inside a cooling transaction | The streak still raises `ERROR` after `telemetry_failures_before_error` (default 3). No corrective write. The active error stays until five consecutive coherent boards+details polls (`SUSTAINED_TELEMETRY_RECOVERY_POLLS`, equal to `RECOVERY_READY_POLLS`). One good read does not clear it. See the 0.1.14 section below |
 | `helper_miss entity=input_number.lard_cooling_*_f` | Optional alias is missing. The canonical `*_c` helpers (values in °F) are the source of truth | One line per backoff window. **Not** a miner failure. `api_fail_count` does not climb from these quiet misses while cooling control is off |
 | `sensor.lard_controller_power_w` = 0 while class is `VALID_PAUSED` or `VALID_TRANSITION` | Idle or a named lifecycle | Not a fault |
 
@@ -138,18 +138,23 @@ That outage is also recorded once per episode, and the record is kept after the 
 | `last_fault_count` | How many such episodes have been recorded. Repeat misses inside one episode do not increment it |
 | `current_error` | Same as `last_error`. Empty when nothing is active |
 | `active_fault` | True only while `last_error` is non-empty |
+| `sustained_telemetry_recovery_polls` | Consecutive coherent polls counted toward clearing this latch. 0 after a bad required read |
+| `sustained_telemetry_recovery_required` | Clear threshold. `SUSTAINED_TELEMETRY_RECOVERY_POLLS`, which is `RECOVERY_READY_POLLS` (5). Not `recovery_ready` |
 
-While the outage is active, health is `ERROR`, `current_error` equals `last_fault_reason`, and `sensor.lard_controller_error` is `telemetry_sustained_unavailable`.
+While the outage is active, health is `ERROR`, `current_error` equals `last_fault_reason`, and `sensor.lard_controller_error` is `telemetry_sustained_unavailable`. That stays true through polls 1–4 even when `telemetry_freshness` is `FRESH` and `telemetry_class` is already `RUNNING_HEALTHY`, `VALID_PAUSED`, or `VALID_TRANSITION`.
 
-Recovery runs only when all of these are true on the read the tick already took:
+`SUSTAINED_TELEMETRY_RECOVERY_POLLS` is the sustained-telemetry ERROR clear threshold. It reuses the number 5 from `RECOVERY_READY_POLLS`. It is not the recovery-ready streak and it does not arm writes. A sample counts only when all of these are true, and at most once per `poll_seconds`:
 
-1. `last_error` is exactly `telemetry_sustained_unavailable`.
+1. The active fault is exactly `telemetry_sustained_unavailable` and health is `ERROR`.
 2. Boards and details both succeeded, are not malformed, and the board set is a verified healthy `ONE_BOARD`, `TWO_BOARD`, or `THREE_BOARD` topology. Freshness is `FRESH` and the fail streak is 0.
 3. `telemetry_class` is `RUNNING_HEALTHY`, `VALID_PAUSED`, or `VALID_TRANSITION`. `VALID_TRANSITION` still requires miner lifecycle evidence (preheat, ramping, tuning, and the other documented tokens). The word `applying` does not qualify. Zero watts with only `applying` stays failed closed.
 4. Nothing else is wrong: not `FAULT_LATCHED`, not a hard fault, not an unverified or partial board read, not an auth / API / bosminer failure, not a write failure, not a cooling-transaction terminal (`degraded`, `error`, `interrupted`).
 5. No cooling transaction and no cooling transition is active.
+6. At least `poll_seconds` have passed since the previous counted sample (or since the last reset). A duplicate read inside that interval does not increment and does not reset.
 
-When that holds, `last_error` becomes empty (it is the current error only). Health leaves `ERROR` for `HASHING`, `PAUSED`, or `RECOVERING` using the existing evidence rules. A one-board miner with watts above the idle threshold and hashrate above the startup threshold can be `HASHING` without a three-board minimum. A coherent pause at 0 W is `PAUSED` / `VALID_PAUSED`, not `HASHING`. An evidenced preheat, ramp, or tune is `RECOVERING` / `VALID_TRANSITION`, not `HASHING`. If `cooling_phase` was `ERROR` only because of this latch, it returns to `IDLE`.
+A missing, malformed, stale, or contradictory required observation resets `sustained_telemetry_recovery_polls` to 0. The next count waits another full poll interval. Structural blockers (fault latch, cooling terminal, active cooling transaction) do not increment and do not clear.
+
+The active error clears only on poll 5, when the count reaches `SUSTAINED_TELEMETRY_RECOVERY_POLLS`. Then `last_error` becomes empty (it is the current error only). Health leaves `ERROR` for `HASHING`, `PAUSED`, or `RECOVERING` using the existing evidence rules. A one-board miner with watts above the idle threshold and hashrate above the startup threshold can be `HASHING` without a three-board minimum. A coherent pause at 0 W is `PAUSED` / `VALID_PAUSED`, not `HASHING`. An evidenced preheat, ramp, or tune is `RECOVERING` / `VALID_TRANSITION`, not `HASHING`. If `cooling_phase` was `ERROR` only because of this latch, it returns to `IDLE`. Polls 1–4 keep health at `ERROR`.
 
 `last_fault_*` does not change on recovery. Read health from `sensor.lard_controller_health` and the active error from `last_error` / `current_error` / `active_fault` / `sensor.lard_controller_error`. Do not treat `last_fault_reason` as a live fault. A dashboard line is: current telemetry healthy; prior telemetry outage recorded at `last_fault_timestamp`.
 

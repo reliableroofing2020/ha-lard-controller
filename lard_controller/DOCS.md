@@ -202,14 +202,17 @@ MQTT discovery (when a broker is available) uses availability + last-will so a d
 
 `last_error` is the active error only. `fault_reason`, `current_error`, and `active_fault` on `sensor.lard_controller_actual_mode` and `sensor.lard_controller_health` copy it. `sensor.lard_controller_error` publishes that string, or `ok` when it is empty.
 
-`telemetry_sustained_unavailable` becomes active after repeated required-read misses outside a cooling transaction (`health_class=ERROR`, `cooling_phase=ERROR`). The same episode is stored as history and is not removed when reads recover:
+`telemetry_sustained_unavailable` becomes active after repeated required-read misses outside a cooling transaction (`health_class=ERROR`, `cooling_phase=ERROR`). The same episode is stored as history. The active error stays until `SUSTAINED_TELEMETRY_RECOVERY_POLLS` consecutive coherent polls (the constant equals `RECOVERY_READY_POLLS`, 5), spaced by `poll_seconds`. One good read does not clear it. A bad required read resets the count.
 
 | Field | Role |
 | --- | --- |
-| `sensor.lard_controller_health` state | Current class. `HASHING`, `PAUSED`, or `RECOVERING` after a qualified recovery. Not the historical reason string |
-| `telemetry_freshness` | `FRESH` only after a successful required boards+details note. `UNKNOWN` or `STALE` on misses |
-| `last_error` / `current_error` | Active error. Empty after this recovery |
+| `sensor.lard_controller_health` state | Current class. Stays `ERROR` until poll 5. Then `HASHING`, `PAUSED`, or `RECOVERING`. Not the historical reason string |
+| `telemetry_freshness` | `FRESH` only after a successful required boards+details note. `UNKNOWN` or `STALE` on misses. May be `FRESH` while health is still `ERROR` |
+| `telemetry_class` | Live read class. May be `RUNNING_HEALTHY` while health is still the sustained-read `ERROR` |
+| `last_error` / `current_error` | Active error. Stays `telemetry_sustained_unavailable` until poll 5. Empty after this recovery |
 | `active_fault` | False when `last_error` is empty |
+| `sustained_telemetry_recovery_polls` | Progress toward the clear. Resets to 0 on a bad required read |
+| `sustained_telemetry_recovery_required` | `5` (`SUSTAINED_TELEMETRY_RECOVERY_POLLS`) |
 | `last_fault_reason` | Historical. `telemetry_sustained_unavailable` after that outage |
 | `last_fault_class` | Historical class forced by the outage (`ERROR`) |
 | `last_fault_timestamp` | Wall time the episode was latched |
