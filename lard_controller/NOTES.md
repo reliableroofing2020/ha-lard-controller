@@ -1,3 +1,7 @@
+# Sustained-telemetry recovery (0.1.14)
+
+Addon version **0.1.14**. Diagnostic and recovery-state only. A `telemetry_sustained_unavailable` ERROR latch can clear after a coherent boards+details read. `last_error` is the active error and becomes empty. `last_fault_reason`, `last_fault_class`, `last_fault_timestamp`, and `last_fault_count` keep the outage. Other faults stay latched. Writes stay disarmed. Do not deploy. Do not merge from this note. Do not set `enable_writes`. Do not change cooling, board ladder, or solar policy. Operator detail is in [docs/phase1-observe-only.md](docs/phase1-observe-only.md) and the entity table in [DOCS.md](DOCS.md).
+
 # Observe-only freshness (0.1.13)
 
 Addon version **0.1.13**. Diagnostic fix only. Observe-only ticks note telemetry freshness and idle health from the read they already take. Writes stay disarmed. Do not deploy. Do not merge from this note. Do not set `enable_writes`. Do not change cooling, board ladder, or solar policy.

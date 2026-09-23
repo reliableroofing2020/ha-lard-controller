@@ -118,11 +118,42 @@ Concepts borrowed, not code: separate API reachability from bosminer availabilit
 | What you see | What it means | What LARD does |
 | --- | --- | --- |
 | `cooling_state` or `read_boards` HTTP 500 with `Connection refused (os error 111)`, or HTTP 412 "BOSminer is not running" | The REST gateway answered. **bosminer** did not. Phase 0 saw this while hashrate/power collapsed and `read_boards_http_500` was the sticky error | Class `BOSMINER_UNAVAILABLE`. If the controller is verifying (`APPLYING` or `WAITING_FOR_BRAIINS`) and independent evidence is still inside the window, publish bounded `WAITING_FOR_BRAIINS`. When that window ends, or there was no independent evidence, publish `FAULT_LATCHED`. No pause, resume, PATCH, or power write |
-| `telemetry_sustained_unavailable` after repeated generic read failures | The add-on missed required reads and was not inside a cooling transaction | Existing streak still raises `ERROR` after `telemetry_failures_before_error` (default 3). That path does not issue a corrective write |
+| `telemetry_sustained_unavailable` after repeated generic read failures | The add-on missed required reads and was not inside a cooling transaction | The streak still raises `ERROR` after `telemetry_failures_before_error` (default 3). No corrective write. A later coherent boards+details read can clear that **active** error only. See the 0.1.14 section below |
 | `helper_miss entity=input_number.lard_cooling_*_f` | Optional alias is missing. The canonical `*_c` helpers (values in °F) are the source of truth | One line per backoff window. **Not** a miner failure. `api_fail_count` does not climb from these quiet misses while cooling control is off |
 | `sensor.lard_controller_power_w` = 0 while class is `VALID_PAUSED` or `VALID_TRANSITION` | Idle or a named lifecycle | Not a fault |
 
 Bosminer flap is outside this add-on. Fix bosminer on the miner host before any re-arm. LARD only classifies it.
+
+## Sustained telemetry outage (0.1.14)
+
+`telemetry_sustained_unavailable` means required `GET /api/v1/miner/hw/hashboards` and `GET /api/v1/miner/details` missed `telemetry_failures_before_error` times (default 3) while no cooling transaction was open. The controller sets `sensor.lard_controller_health` to `ERROR`, `cooling_phase` to `ERROR`, and `last_error` to that string. It does not pause, resume, PATCH, or PUT.
+
+That outage is also recorded once per episode, and the record is kept after the miner is readable again:
+
+| Attribute | Meaning |
+| --- | --- |
+| `last_fault_reason` | `telemetry_sustained_unavailable` for this outage. History, not the current health |
+| `last_fault_class` | `ERROR`, the health class the outage forced |
+| `last_fault_timestamp` | Wall-clock time when this episode was first latched. Not a monotonic deadline |
+| `last_fault_count` | How many such episodes have been recorded. Repeat misses inside one episode do not increment it |
+| `current_error` | Same as `last_error`. Empty when nothing is active |
+| `active_fault` | True only while `last_error` is non-empty |
+
+While the outage is active, health is `ERROR`, `current_error` equals `last_fault_reason`, and `sensor.lard_controller_error` is `telemetry_sustained_unavailable`.
+
+Recovery runs only when all of these are true on the read the tick already took:
+
+1. `last_error` is exactly `telemetry_sustained_unavailable`.
+2. Boards and details both succeeded, are not malformed, and the board set is a verified healthy `ONE_BOARD`, `TWO_BOARD`, or `THREE_BOARD` topology. Freshness is `FRESH` and the fail streak is 0.
+3. `telemetry_class` is `RUNNING_HEALTHY`, `VALID_PAUSED`, or `VALID_TRANSITION`. `VALID_TRANSITION` still requires miner lifecycle evidence (preheat, ramping, tuning, and the other documented tokens). The word `applying` does not qualify. Zero watts with only `applying` stays failed closed.
+4. Nothing else is wrong: not `FAULT_LATCHED`, not a hard fault, not an unverified or partial board read, not an auth / API / bosminer failure, not a write failure, not a cooling-transaction terminal (`degraded`, `error`, `interrupted`).
+5. No cooling transaction and no cooling transition is active.
+
+When that holds, `last_error` becomes empty (it is the current error only). Health leaves `ERROR` for `HASHING`, `PAUSED`, or `RECOVERING` using the existing evidence rules. A one-board miner with watts above the idle threshold and hashrate above the startup threshold can be `HASHING` without a three-board minimum. A coherent pause at 0 W is `PAUSED` / `VALID_PAUSED`, not `HASHING`. An evidenced preheat, ramp, or tune is `RECOVERING` / `VALID_TRANSITION`, not `HASHING`. If `cooling_phase` was `ERROR` only because of this latch, it returns to `IDLE`.
+
+`last_fault_*` does not change on recovery. Read health from `sensor.lard_controller_health` and the active error from `last_error` / `current_error` / `active_fault` / `sensor.lard_controller_error`. Do not treat `last_fault_reason` as a live fault. A dashboard line is: current telemetry healthy; prior telemetry outage recorded at `last_fault_timestamp`.
+
+This recovery does not set `enable_writes`, does not turn on `switch.solar_miner_auto_enable`, and does not issue a miner command. `write_gate` stays `DISARMED` while `enable_writes` is false. Reload still starts `DISARMED`. `recovery_ready` still does not arm writes.
 
 ## Cooling helper migration
 

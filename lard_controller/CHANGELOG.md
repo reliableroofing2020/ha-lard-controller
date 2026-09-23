@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.14
+
+- Diagnostics and recovery-state only. After `telemetry_failures_before_error` (default 3) missed required reads, outside a cooling transaction, the controller still publishes `health_class=ERROR`, `cooling_phase=ERROR`, and `last_error=telemetry_sustained_unavailable`. That string is now also stored once per episode as history: `last_fault_reason`, `last_fault_class=ERROR`, `last_fault_timestamp` (wall clock), and `last_fault_count`.
+- A later verified required read (boards + details, coherent 1/2/3 board health, freshness `FRESH`, fail streak 0) may clear that active error only when the live class is `RUNNING_HEALTHY`, `VALID_PAUSED`, or evidence-backed `VALID_TRANSITION`. Idle health then becomes `HASHING`, `PAUSED`, or `RECOVERING` from that evidence. If `cooling_phase` was `ERROR` only because of this latch and no cooling transaction is active, the phase returns to `IDLE`.
+- `last_error` is the current error. After this recovery it is empty. `sensor.lard_controller_error` is `ok`. `current_error` is empty and `active_fault` is false. `last_fault_*` stays so a dashboard can show a prior outage without treating it as the current health. The health sensor state is the live class, not `last_fault_reason`.
+- The same good read does not clear `FAULT_LATCHED`, a hard miner fault, unverified/partial/mismatched boards, auth failure, API or bosminer loss, a write failure, a cooling-transaction terminal, an active cooling transaction, or any other `last_error`. The word `applying` is not transition evidence. Watts alone do not become `HASHING`.
+- Writes stay disarmed. This path does not set `enable_writes`, does not turn on `switch.solar_miner_auto_enable`, and does not pause, resume, PATCH, or PUT. `enable_writes` still defaults false. This does not deploy.
+
 ## 0.1.13
 
 - Observe-only diagnostics. A disarmed tick (`enable_writes` false, or the competing-writer refuse path) still notes telemetry freshness from the observation it already took. A usable boards+details read sets `telemetry_freshness=FRESH` and lets idle health advance (HASHING / RECOVERING / PAUSED) under the existing rules. A miss stays on the failure freshness path and does not invent HASHING. Watts alone do not replace missing required boards or details. Write gates, board ladder, cooling policy, HA lockdown, and solar policy are unchanged. `enable_writes` still defaults false. This does not deploy.
