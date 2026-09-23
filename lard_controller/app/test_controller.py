@@ -2966,7 +2966,7 @@ class TemperatureTargetPolicyTests(unittest.TestCase):
         self.assertEqual(fresh.cooling_dangerous_temperature_c, COOLING_DANGEROUS_C)
         self.assertEqual(fresh.cooling_envelope_min_fan_pct, 0)
         self.assertEqual(fresh.cooling_envelope_max_fan_pct, 100)
-        self.assertEqual(ADDON_VERSION, "0.1.12")
+        self.assertEqual(ADDON_VERSION, "0.1.13")
         self.assertFalse(fresh.cooling_control_enabled)
         self.assertEqual((COOLING_TARGET_C, COOLING_HOT_C, COOLING_DANGEROUS_C), (70, 85, 95))
         self.assertEqual((COOLING_TARGET_F, COOLING_HOT_F, COOLING_DANGEROUS_F), (158, 185, 203))
@@ -3362,7 +3362,7 @@ class BraiinsOwnsCoolingTests(unittest.TestCase):
         self.assertFalse(fresh.cooling_control_enabled)
         self.assertEqual(fresh.cooling_policy, COOLING_POLICY_NATIVE)
         self.assertFalse(fresh.enable_writes)
-        self.assertEqual(ADDON_VERSION, "0.1.12")
+        self.assertEqual(ADDON_VERSION, "0.1.13")
         old_opt = os.environ.get("LARD_OPTIONS")
         old_sec = os.environ.get("LARD_SECRETS")
         try:
@@ -4546,6 +4546,295 @@ class FoundationFinishTests(unittest.TestCase):
         text = (Path(__file__).resolve().parent / "controller.py").read_text()
         self.assertNotIn("platform: braiins_os_plus", text)
         self.assertNotIn("button.lard_mining_pause", text)
+
+
+_BRAIINS_WRITE_METHODS = (
+    "pause",
+    "resume",
+    "start",
+    "restart",
+    "patch_boards",
+    "set_power",
+    "set_cooling",
+    "set_cooling_auto",
+)
+
+
+def spy_braiins_writes(braiins):
+    """Wrap mutate methods. Observe-only ticks must not call them."""
+    spies = {}
+    for name in _BRAIINS_WRITE_METHODS:
+        if not hasattr(braiins, name):
+            continue
+        wrapped = unittest.mock.Mock(wraps=getattr(braiins, name))
+        setattr(braiins, name, wrapped)
+        spies[name] = wrapped
+    return spies
+
+
+def assert_no_braiins_writes(test, braiins, spies):
+    test.assertEqual(braiins.write_names(), [])
+    test.assertEqual(braiins.cooling_puts(), [])
+    for name, spy in spies.items():
+        spy.assert_not_called()
+        test.assertEqual(spy.call_count, 0, name)
+
+
+class ObserveOnlyFreshnessTests(unittest.TestCase):
+    """0.1.12 soak: disarmed ticks left health and freshness at UNKNOWN.
+
+    Production observe-only (enable_writes false, ~62 min, PASS_WITH_NOTES)
+    published RUNNING_HEALTHY / THREE_BOARD / required telemetry fresh while
+    sensor.lard_controller_health and telemetry_freshness stayed UNKNOWN and
+    telemetry_last_success_ts stayed 0. These tests pin the note that was
+    skipped on the early return.
+    """
+
+    def test_disarmed_success_advances_freshness_and_idle_health(self):
+        hashing = running_boards(["1", "2", "3"])
+        hashing.power_w = 1000.0
+        hashing.hashrate = 31.0
+        ctrl = make_controller(hashing, "ONE_BOARD", enable_writes=False)
+        self.assertEqual(ctrl._telemetry_freshness, "UNKNOWN")
+        self.assertEqual(ctrl._telemetry_last_success_ts, 0.0)
+        self.assertEqual(ctrl._health_class, "UNKNOWN")
+        self.assertEqual(ctrl._telemetry_fail_streak, 0)
+        spies = spy_braiins_writes(hashing)
+        ctrl.tick()
+        self.assertEqual(ctrl.desired_mode, "ONE_BOARD")
+        self.assertEqual(ctrl.observed_miner_mode, "THREE_BOARD")
+        self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self.assertTrue(ctrl._required_telemetry_fresh)
+        self.assertTrue(ctrl._endpoint_fresh("boards"))
+        self.assertTrue(ctrl._endpoint_fresh("details"))
+        self.assertTrue(ctrl._last_obs.board_health_verified)
+        self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+        self.assertGreater(ctrl._telemetry_last_success_ts, 0.0)
+        self.assertEqual(ctrl._telemetry_fail_streak, 0)
+        self.assertFalse(ctrl._telemetry_fault)
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_health"], "HASHING")
+        health = ctrl.ha._attrs["sensor.lard_controller_health"]
+        self.assertEqual(health["telemetry_freshness"], "FRESH")
+        self.assertGreater(health["telemetry_last_success_ts"], 0.0)
+        self.assertEqual(health["telemetry_fail_streak"], 0)
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertIn("enable_writes_false", ctrl.reason)
+        assert_no_braiins_writes(self, hashing, spies)
+
+        paused = paused_one_board()
+        paused_ctrl = make_controller(paused, "PAUSED", enable_writes=False)
+        paused_spies = spy_braiins_writes(paused)
+        paused_ctrl.tick()
+        self.assertEqual(paused_ctrl._telemetry_freshness, "FRESH")
+        self.assertGreater(paused_ctrl._telemetry_last_success_ts, 0.0)
+        self.assertEqual(paused_ctrl._health_class, "PAUSED")
+        self.assertEqual(paused_ctrl.telemetry_class, "VALID_PAUSED")
+        self.assertEqual(paused_ctrl.ha._states["sensor.lard_controller_health"], "PAUSED")
+        assert_no_braiins_writes(self, paused, paused_spies)
+
+        recovering = running_boards(["1"])
+        recovering.power_w = 400.0
+        recovering.hashrate = 0.0
+        rec_ctrl = make_controller(recovering, "ONE_BOARD", enable_writes=False)
+        rec_spies = spy_braiins_writes(recovering)
+        rec_ctrl.tick()
+        self.assertEqual(rec_ctrl._telemetry_freshness, "FRESH")
+        self.assertEqual(rec_ctrl._health_class, "RECOVERING")
+        self.assertNotEqual(rec_ctrl._health_class, "HASHING")
+        self.assertEqual(rec_ctrl.ha._states["sensor.lard_controller_health"], "RECOVERING")
+        assert_no_braiins_writes(self, recovering, rec_spies)
+
+    def test_disarmed_boards_http_500_uses_failure_freshness_and_writes_nothing(self):
+        miner = running_boards(["1", "2", "3"])
+        miner.power_w = 1130.0
+        miner.hashrate = 43.3
+        miner.boards_http = 500
+        miner.boards_error_body = {"message": "timeout"}
+        ctrl = make_controller(miner, "THREE_BOARD", enable_writes=False)
+        spies = spy_braiins_writes(miner)
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "API_UNREACHABLE")
+        self.assertEqual(ctrl._telemetry_freshness, "UNKNOWN")
+        self.assertNotEqual(ctrl._telemetry_freshness, "FRESH")
+        self.assertEqual(ctrl._telemetry_last_success_ts, 0.0)
+        self.assertEqual(ctrl._telemetry_fail_streak, 1)
+        self.assertFalse(ctrl._telemetry_fault)
+        self.assertNotEqual(ctrl._health_class, "HASHING")
+        self.assertEqual(ctrl._health_class, "UNKNOWN")
+        self.assertFalse(ctrl._required_telemetry_fresh)
+        self.assertFalse(ctrl._endpoint_fresh("boards"))
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_health"], "UNKNOWN")
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_power_w"], "unknown")
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_boards"], "unverified")
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        assert_no_braiins_writes(self, miner, spies)
+
+        ctrl.tick()
+        self.assertEqual(ctrl._telemetry_fail_streak, 2)
+        self.assertEqual(ctrl._telemetry_freshness, "UNKNOWN")
+        self.assertNotEqual(ctrl._health_class, "HASHING")
+        self.assertNotEqual(ctrl.actual_mode, "ERROR")
+        assert_no_braiins_writes(self, miner, spies)
+
+        ctrl.tick()
+        self.assertEqual(ctrl._telemetry_fail_streak, 3)
+        self.assertTrue(ctrl._telemetry_fault)
+        self.assertEqual(ctrl._telemetry_freshness, "UNKNOWN")
+        self.assertEqual(ctrl._health_class, "ERROR")
+        self.assertEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(ctrl.last_error, "telemetry_sustained_unavailable")
+        self.assertNotEqual(ctrl.ha._states["sensor.lard_controller_health"], "HASHING")
+        assert_no_braiins_writes(self, miner, spies)
+
+        down = running_boards(["1"])
+        down.power_w = 1000.0
+        down.hashrate = 30.0
+
+        def _unavailable():
+            raise OSError("timed out")
+
+        down.enabled_ids = _unavailable  # type: ignore[method-assign]
+        down_ctrl = make_controller(down, "ONE_BOARD", enable_writes=False)
+        down_spies = spy_braiins_writes(down)
+        down_ctrl.tick()
+        self.assertEqual(down_ctrl.telemetry_class, "API_UNREACHABLE")
+        self.assertEqual(down_ctrl._telemetry_freshness, "UNKNOWN")
+        self.assertNotEqual(down_ctrl._health_class, "HASHING")
+        self.assertFalse(down_ctrl._required_telemetry_fresh)
+        assert_no_braiins_writes(self, down, down_spies)
+
+    def test_disarmed_malformed_required_field_is_not_healthy(self):
+        miner = running_boards(["1", "2", "3"])
+        miner.power_w = 1100.0
+        miner.hashrate = 40.0
+        miner.boards_http = 500
+        miner.boards_error_body = {"message": "hashboards malformed"}
+        ctrl = make_controller(miner, "THREE_BOARD", enable_writes=False)
+        spies = spy_braiins_writes(miner)
+        ctrl.tick()
+        self.assertEqual(ctrl.telemetry_class, "REQUIRED_TELEMETRY_MALFORMED")
+        self.assertEqual(ctrl._telemetry_freshness, "UNKNOWN")
+        self.assertNotEqual(ctrl._telemetry_freshness, "FRESH")
+        self.assertEqual(ctrl._telemetry_last_success_ts, 0.0)
+        self.assertNotEqual(ctrl._health_class, "HASHING")
+        self.assertNotIn(ctrl._health_class, {"HASHING", "RECOVERING", "PAUSED"})
+        self.assertFalse(ctrl._required_telemetry_fresh)
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_power_w"], "unknown")
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_boards"], "unverified")
+        assert_no_braiins_writes(self, miner, spies)
+
+        missing = running_boards(["1"])
+        missing.power_w = 935.0
+        missing.hashrate = 31.0
+
+        def enabled_ids():
+            raise RuntimeError("required hashboards field malformed")
+
+        missing.enabled_ids = enabled_ids  # type: ignore[method-assign]
+        missing_ctrl = make_controller(missing, "ONE_BOARD", enable_writes=False)
+        missing_spies = spy_braiins_writes(missing)
+        missing_ctrl.tick()
+        self.assertEqual(missing_ctrl.telemetry_class, "REQUIRED_TELEMETRY_MALFORMED")
+        self.assertEqual(missing_ctrl._telemetry_freshness, "UNKNOWN")
+        self.assertNotEqual(missing_ctrl._health_class, "HASHING")
+        self.assertFalse(missing_ctrl._required_telemetry_fresh)
+        self.assertNotEqual(missing_ctrl.ha._states["sensor.lard_controller_health"], "HASHING")
+        assert_no_braiins_writes(self, missing, missing_spies)
+
+    def test_armed_tick_still_notes_success_and_failure(self):
+        ok_miner = running_boards(["1"])
+        ok_miner.power_w = 400.0
+        ok_miner.hashrate = 20.0
+        ctrl = make_controller(ok_miner, "ONE_BOARD", enable_writes=True)
+        ctrl.settings.cooling_control_enabled = False
+        ctrl.settings.auto_fan_ceiling_enabled = False
+        ctrl.tick()
+        self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+        self.assertGreater(ctrl._telemetry_last_success_ts, 0.0)
+        self.assertEqual(ctrl._telemetry_fail_streak, 0)
+        self.assertFalse(ctrl._telemetry_fault)
+        self.assertEqual(ctrl._health_class, "HASHING")
+
+        bad = running_boards(["1"])
+        bad.power_w = 400.0
+        bad.hashrate = 20.0
+        bad.boards_http = 500
+        ctrl_bad = make_controller(bad, "ONE_BOARD", enable_writes=True)
+        ctrl_bad.tick()
+        self.assertEqual(ctrl_bad._telemetry_freshness, "UNKNOWN")
+        self.assertEqual(ctrl_bad._telemetry_last_success_ts, 0.0)
+        self.assertEqual(ctrl_bad._telemetry_fail_streak, 1)
+        self.assertNotEqual(ctrl_bad._health_class, "HASHING")
+        self.assertNotEqual(ctrl_bad.actual_mode, "ERROR")
+        self.assertEqual(bad.write_names(), [])
+        ctrl_bad.tick()
+        self.assertEqual(ctrl_bad._telemetry_fail_streak, 2)
+        self.assertEqual(ctrl_bad._telemetry_freshness, "UNKNOWN")
+        self.assertEqual(ctrl_bad._health_class, "UNKNOWN")
+        ctrl_bad.tick()
+        self.assertEqual(ctrl_bad._telemetry_fail_streak, 3)
+        self.assertEqual(ctrl_bad._telemetry_freshness, "UNKNOWN")
+        self.assertTrue(ctrl_bad._telemetry_fault)
+        self.assertEqual(ctrl_bad._health_class, "ERROR")
+        self.assertEqual(ctrl_bad.actual_mode, "ERROR")
+        self.assertEqual(ctrl_bad.last_error, "telemetry_sustained_unavailable")
+        self.assertEqual(bad.write_names(), [])
+
+    def test_hashing_watts_do_not_force_healthy_without_required_boards(self):
+        unverified = running_boards(["1", "2", "3"])
+        unverified.power_w = 1130.0
+        unverified.hashrate = 43.3
+        unverified.omit_board_telemetry = True
+        ctrl = make_controller(unverified, "THREE_BOARD", enable_writes=False)
+        spies = spy_braiins_writes(unverified)
+        ctrl.tick()
+        obs = ctrl._last_obs
+        self.assertIsNotNone(obs)
+        self.assertGreater(float(obs.power_w), 100.0)
+        self.assertFalse(obs.board_health_verified)
+        self.assertFalse(obs.boards_healthy)
+        self.assertTrue(obs.ok)
+        self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+        self.assertNotEqual(ctrl._health_class, "HASHING")
+        self.assertEqual(ctrl._health_class, "RECOVERING")
+        self.assertNotEqual(ctrl.ha._states["sensor.lard_controller_health"], "HASHING")
+        assert_no_braiins_writes(self, unverified, spies)
+
+        watts_only = running_boards(["1", "2", "3"])
+        watts_only.power_w = 1130.0
+        watts_only.hashrate = 43.3
+        watts_only.boards_http = 500
+        watts_ctrl = make_controller(watts_only, "THREE_BOARD", enable_writes=False)
+        watts_spies = spy_braiins_writes(watts_only)
+        watts_ctrl.tick()
+        self.assertEqual(watts_only.power_w, 1130.0)
+        self.assertFalse(watts_ctrl._required_telemetry_fresh)
+        self.assertNotEqual(watts_ctrl._telemetry_freshness, "FRESH")
+        self.assertNotEqual(watts_ctrl._health_class, "HASHING")
+        self.assertNotEqual(watts_ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self.assertEqual(watts_ctrl.ha._states["sensor.lard_controller_power_w"], "unknown")
+        self.assertEqual(watts_ctrl.ha._states["sensor.lard_controller_boards"], "unverified")
+        assert_no_braiins_writes(self, watts_only, watts_spies)
+
+    def test_competing_writer_observe_notes_freshness_without_writes(self):
+        miner = running_boards(["1", "2", "3"])
+        miner.power_w = 1000.0
+        miner.hashrate = 30.0
+        ctrl = make_controller(miner, "THREE_BOARD", enable_writes=True)
+        ctrl.ha._states[ENT_COMPETING_WRITER] = "on"
+        spies = spy_braiins_writes(miner)
+        ctrl.tick()
+        self.assertEqual(ctrl.last_error, "refusing_writes_competing_writer")
+        self.assertIn("competing_writer", ctrl.reason)
+        self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+        self.assertGreater(ctrl._telemetry_last_success_ts, 0.0)
+        self.assertEqual(ctrl._telemetry_fail_streak, 0)
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertFalse(ctrl.write_permission.permitted)
+        assert_no_braiins_writes(self, miner, spies)
 
 
 if __name__ == "__main__":

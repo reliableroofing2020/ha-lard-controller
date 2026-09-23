@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.13
+
+- Observe-only diagnostics. A disarmed tick (`enable_writes` false, or the competing-writer refuse path) still notes telemetry freshness from the observation it already took. A usable boards+details read sets `telemetry_freshness=FRESH` and lets idle health advance (HASHING / RECOVERING / PAUSED) under the existing rules. A miss stays on the failure freshness path and does not invent HASHING. Watts alone do not replace missing required boards or details. Write gates, board ladder, cooling policy, HA lockdown, and solar policy are unchanged. `enable_writes` still defaults false. This does not deploy.
+
 ## 0.1.12
 
 - Observe-only Phase 1. `enable_writes` still defaults **false**. A process write gate starts disarmed on startup and on reload. Pause, resume, power-target, hashboard PATCH, and cooling PUT return before any HTTP body is built while that gate is disarmed. Structured log: `write blocked` with `op`, `source`, `reason`, and `state`. Recovery readiness does not arm the gate.

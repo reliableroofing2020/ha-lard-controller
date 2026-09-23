@@ -174,7 +174,7 @@ COOLING_STABILIZE_S = 5
 COOLING_RESUME_SETTLE_S = 20
 # Kept so 0.1.6 imports stay valid. 0.1.7 does not loop ResumeMining on 500.
 COOLING_RESUME_BACKOFF_S = (5, 10, 20)
-ADDON_VERSION = "0.1.12"
+ADDON_VERSION = "0.1.13"
 # Optional cooling-helper misses. Monotonic. One diagnostic per window.
 HELPER_MISS_BACKOFF_START_S = 30.0
 HELPER_MISS_BACKOFF_MAX_S = 600.0
@@ -4660,6 +4660,26 @@ class Controller:
             "cooling_fresh": self._endpoint_fresh("cooling"),
         }
 
+    def _clear_transient_read_error(self) -> None:
+        """Drop a bare read_* miss. Keep a compound verification reason."""
+        err = self.last_error or ""
+        if err.startswith("read_") and "|" not in err:
+            self.last_error = ""
+
+    def _telemetry_failure_holds_phase(self) -> bool:
+        """A missed read must not cancel a cooling txn or a verification latch.
+
+        WAITING_FOR_BRAIINS still expires on its own monotonic deadline.
+        Sustained misses do not rewrite that state into ERROR.
+        """
+        if self._cooling_txn_active or self._fault_latched:
+            return True
+        if self.actual_mode in {"FAULT_LATCHED", "WAITING_FOR_BRAIINS"}:
+            return True
+        if self.controller_state in {"FAULT_LATCHED", "WAITING_FOR_BRAIINS"}:
+            return True
+        return False
+
     def _note_telemetry_success(self) -> None:
         self._telemetry_fail_streak = 0
         self._telemetry_fault = False
@@ -4670,8 +4690,7 @@ class Controller:
             self._last_good_power_w = self.power_w
         if self.boards_str:
             self._last_good_boards = self.boards_str
-        if (self.last_error or "").startswith("read_"):
-            self.last_error = ""
+        self._clear_transient_read_error()
 
     def _note_telemetry_failure(self, where: str) -> None:
         """First misses are UNKNOWN/STALE. They never cancel an in-flight cooling txn."""
@@ -4694,7 +4713,7 @@ class Controller:
                 where=where,
                 attempt=self._telemetry_fail_streak,
             )
-            if self._cooling_txn_active:
+            if self._telemetry_failure_holds_phase():
                 self._log_txn(
                     "telemetry sustained during txn — do not cancel or overwrite txn phase"
                 )
@@ -4710,12 +4729,24 @@ class Controller:
             freshness=self._telemetry_freshness,
             attempt=self._telemetry_fail_streak,
         )
-        if (self.last_error or "").startswith("read_"):
-            self.last_error = ""
-        if self._cooling_txn_active:
+        self._clear_transient_read_error()
+        if self._telemetry_failure_holds_phase():
             return
-        if self._health_class not in {"DEGRADED_NEEDS_ATTENTION", "ERROR"}:
+        if self._health_class not in {"DEGRADED_NEEDS_ATTENTION", "ERROR", "FAULT_LATCHED"}:
             self._health_class = "UNKNOWN"
+
+    def _note_tick_observation(self, obs: MinerObservation | None, where: str) -> None:
+        """Freshness note for one tick read. Armed and observe-only share this.
+
+        Success is ``obs.ok``: required boards and details came back usable.
+        Watts, hashrate, or an unverified board-health payload are not that
+        read. A miss notes failure and does not mark freshness FRESH.
+        ``publish`` advances idle health only after a FRESH note.
+        """
+        if obs is not None and obs.ok:
+            self._note_telemetry_success()
+            return
+        self._note_telemetry_failure(where)
 
     def _poll_interval(self) -> float:
         return max(1.0, float(self.settings.transition_poll_interval_seconds or TRANSITION_POLL_S))
@@ -6963,10 +6994,13 @@ class Controller:
                 self.reason = f"{reason}|master_gate_off"
             elif not self.settings.enable_writes:
                 self.reason = f"{reason}|enable_writes_false"
+            obs = None
             try:
-                self.read_actual_from_miner()
+                obs = self.read_actual_from_miner()
             except Exception as e:
                 self.log(f"observe miner failed: {e}")
+                obs = None
+            self._note_tick_observation(obs, "observe_only")
             self.publish(solar_avg, enable_on)
             return
 
@@ -6985,10 +7019,13 @@ class Controller:
             self._log_write_blocked("arm", "tick", "competing_writer")
             if native:
                 self._absorb_temperature_policy_while_disarmed()
+            obs = None
             try:
-                self.read_actual_from_miner()
+                obs = self.read_actual_from_miner()
             except Exception as e:
                 self.log(f"observe miner failed: {e}")
+                obs = None
+            self._note_tick_observation(obs, "competing_writer")
             self.publish(solar_avg, enable_on)
             return
 
@@ -7013,14 +7050,12 @@ class Controller:
             obs = MinerObservation()
 
         self._miner_prev_ok = bool(obs.ok)
-
+        # A missed read is UNKNOWN/STALE until the consecutive-failure threshold.
+        # It must not ERROR on the first miss or issue a corrective command.
+        self._note_tick_observation(obs, "tick")
         if not obs.ok:
-            # A missed read is UNKNOWN/STALE until the consecutive-failure threshold.
-            # It must not ERROR on the first miss or issue a corrective command.
-            self._note_telemetry_failure("tick")
             self.publish(solar_avg, True)
             return
-        self._note_telemetry_success()
 
         if self._health_class == "ERROR" or self._cooling_terminal_kind == "error":
             if self._pending_profile is not None:

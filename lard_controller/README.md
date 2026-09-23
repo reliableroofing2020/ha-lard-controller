@@ -9,7 +9,7 @@ Supervisor owns start / stop / restart. This is not an Advanced SSH `nohup` job 
 | | |
 | --- | --- |
 | Slug | `lard_controller` |
-| Version | `0.1.12` |
+| Version | `0.1.13` |
 | Miner | Braiins OS+ REST @ `http://192.168.1.113` (API ~1.8.0) |
 | Network | `host_network: true` |
 | Health | `http://<ha-host>:8099/health` (Supervisor watchdog) |
