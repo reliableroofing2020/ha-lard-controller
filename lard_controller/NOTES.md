@@ -1,3 +1,7 @@
+# Observe-only freshness (0.1.13)
+
+Addon version **0.1.13**. Diagnostic fix only. Observe-only ticks note telemetry freshness and idle health from the read they already take. Writes stay disarmed. Do not deploy. Do not merge from this note. Do not set `enable_writes`. Do not change cooling, board ladder, or solar policy.
+
 # Phase 1 observe-only (0.1.12)
 
 Addon version **0.1.12**. Writes stay disarmed. Operator note, the `WRITE_BLOCKED` record, bosminer-vs-telemetry troubleshooting, the bounded `WAITING_FOR_BRAIINS` rule, which miner fields count as `VALID_TRANSITION`, the `actual_mode` migration, freshness, cooling-helper migration, the observe-only checklist, rollback, and the Home Assistant disposition runbook are in [docs/phase1-observe-only.md](docs/phase1-observe-only.md). The in-repo writer list and the live `braiins_os_plus` bypasses are in [docs/phase1-writer-inventory.md](docs/phase1-writer-inventory.md). Those bypasses block observe-only deployment until they are disabled or hidden. Aleixps is concepts only; do not install it. Do not deploy this from the repo task. Do not set `enable_writes`. Do not edit live HA config. Do not merge until a final independent review. `recovery_ready` is not armed.
