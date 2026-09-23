@@ -60,6 +60,8 @@ from controller import (
     Logger,
     MinerObservation,
     Settings,
+    SUSTAINED_TELEMETRY_ERROR,
+    SUSTAINED_TELEMETRY_RECOVERY_POLLS,
     load_settings,
     clamp_fan_max_pct,
     metric_trend_rising,
@@ -2966,7 +2968,7 @@ class TemperatureTargetPolicyTests(unittest.TestCase):
         self.assertEqual(fresh.cooling_dangerous_temperature_c, COOLING_DANGEROUS_C)
         self.assertEqual(fresh.cooling_envelope_min_fan_pct, 0)
         self.assertEqual(fresh.cooling_envelope_max_fan_pct, 100)
-        self.assertEqual(ADDON_VERSION, "0.1.13")
+        self.assertEqual(ADDON_VERSION, "0.1.14")
         self.assertFalse(fresh.cooling_control_enabled)
         self.assertEqual((COOLING_TARGET_C, COOLING_HOT_C, COOLING_DANGEROUS_C), (70, 85, 95))
         self.assertEqual((COOLING_TARGET_F, COOLING_HOT_F, COOLING_DANGEROUS_F), (158, 185, 203))
@@ -3362,7 +3364,7 @@ class BraiinsOwnsCoolingTests(unittest.TestCase):
         self.assertFalse(fresh.cooling_control_enabled)
         self.assertEqual(fresh.cooling_policy, COOLING_POLICY_NATIVE)
         self.assertFalse(fresh.enable_writes)
-        self.assertEqual(ADDON_VERSION, "0.1.13")
+        self.assertEqual(ADDON_VERSION, "0.1.14")
         old_opt = os.environ.get("LARD_OPTIONS")
         old_sec = os.environ.get("LARD_SECRETS")
         try:
@@ -4834,6 +4836,638 @@ class ObserveOnlyFreshnessTests(unittest.TestCase):
         self.assertEqual(ctrl._telemetry_fail_streak, 0)
         self.assertEqual(ctrl._health_class, "HASHING")
         self.assertFalse(ctrl.write_permission.permitted)
+        assert_no_braiins_writes(self, miner, spies)
+
+
+class SustainedTelemetryRecoveryTests(unittest.TestCase):
+    """0.1.14: sustained-read ERROR clears only after five coherent polls.
+
+    The five samples are spaced by poll_seconds. History stays in last_fault_*.
+    Other faults stay put. No Braiins write is built. Fake monotonic clock only.
+    """
+
+    def _ctrl(self, miner, mode="ONE_BOARD", enable_writes=False):
+        ctrl = make_controller(miner, mode, enable_writes=enable_writes)
+        ctrl.settings.cooling_control_enabled = False
+        ctrl.settings.auto_fan_ceiling_enabled = False
+        ctrl._wall = ctrl._now  # type: ignore[method-assign]
+        return ctrl
+
+    def _step(self, ctrl):
+        """One ordinary poll interval, then one tick. One recovery count max."""
+        ctrl._clock.sleep(float(ctrl.settings.poll_seconds))
+        ctrl.tick()
+
+    def _steps(self, ctrl, n):
+        for _ in range(n):
+            self._step(ctrl)
+
+    def _sustain(self, ctrl, miner):
+        miner.boards_http = 500
+        miner.boards_error_body = {"message": "timeout"}
+        for _ in range(3):
+            ctrl.tick()
+        self.assertEqual(ctrl._health_class, "ERROR")
+        self.assertEqual(ctrl.actual_mode, "ERROR")
+        self.assertEqual(ctrl._cooling_phase, "ERROR")
+        self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(ctrl._last_fault_reason, SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(ctrl._last_fault_class, "ERROR")
+        self.assertEqual(ctrl._last_fault_count, 1)
+        self.assertGreater(ctrl._last_fault_timestamp, 0.0)
+        self.assertTrue(ctrl._sustained_fault_open)
+        health = ctrl.ha._attrs["sensor.lard_controller_health"]
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_health"], "ERROR")
+        self.assertEqual(health["current_error"], SUSTAINED_TELEMETRY_ERROR)
+        self.assertTrue(health["active_fault"])
+        self.assertEqual(health["last_fault_reason"], SUSTAINED_TELEMETRY_ERROR)
+        ctrl.tick()
+        self.assertEqual(ctrl._last_fault_count, 1)
+        self.assertEqual(ctrl._health_class, "ERROR")
+
+    def _restore_hashing(self, miner, power_w, hashrate):
+        miner.boards_http = 200
+        miner.boards_error_body = None
+        miner.omit_board_telemetry = False
+        miner.incomplete_boards = False
+        miner.hashboards_malformed = False
+        miner.boards_healthy = True
+        miner.running = True
+        miner.paused = False
+        miner.user_paused = False
+        miner.phase = "running"
+        miner.status = "normal"
+        miner.pause_reason = ""
+        miner.power_w = power_w
+        miner.hashrate = hashrate
+
+    def _assert_progress(self, ctrl, polls: int):
+        self.assertEqual(SUSTAINED_TELEMETRY_RECOVERY_POLLS, 5)
+        self.assertEqual(ctrl._health_class, "ERROR")
+        self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(ctrl._cooling_phase, "ERROR")
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, polls)
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_health"], "ERROR")
+        self.assertEqual(
+            ctrl.ha._states["sensor.lard_controller_error"], SUSTAINED_TELEMETRY_ERROR
+        )
+        health = ctrl.ha._attrs["sensor.lard_controller_health"]
+        actual = ctrl.ha._attrs["sensor.lard_controller_actual_mode"]
+        self.assertEqual(health["sustained_telemetry_recovery_polls"], polls)
+        self.assertEqual(health["sustained_telemetry_recovery_required"], 5)
+        self.assertEqual(actual["sustained_telemetry_recovery_polls"], polls)
+        self.assertEqual(actual["sustained_telemetry_recovery_required"], 5)
+        self.assertEqual(health["current_error"], SUSTAINED_TELEMETRY_ERROR)
+        self.assertTrue(health["active_fault"])
+        self.assertEqual(health["last_fault_reason"], SUSTAINED_TELEMETRY_ERROR)
+        self.assertNotEqual(ctrl.ha._states["sensor.lard_controller_health"], "HASHING")
+
+    def test_outage_then_coherent_read_clears_active_error_and_keeps_history(self):
+        miner = running_boards(["1", "2", "3"])
+        miner.power_w = 1100.0
+        miner.hashrate = 40.0
+        ctrl = self._ctrl(miner, "THREE_BOARD")
+        spies = spy_braiins_writes(miner)
+        self.assertFalse(ctrl.settings.enable_writes)
+        self._sustain(ctrl, miner)
+        latched_at = ctrl._last_fault_timestamp
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 0)
+        self._restore_hashing(miner, 1100.0, 40.0)
+        for n in range(1, SUSTAINED_TELEMETRY_RECOVERY_POLLS):
+            self._step(ctrl)
+            self._assert_progress(ctrl, n)
+            self.assertEqual(ctrl._telemetry_fail_streak, 0)
+            self.assertFalse(ctrl._telemetry_fault)
+            self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+            self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+            if n == 2:
+                ctrl.tick()
+                self._assert_progress(ctrl, 2)
+                self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self._step(ctrl)
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, SUSTAINED_TELEMETRY_RECOVERY_POLLS)
+        self.assertEqual(ctrl._telemetry_fail_streak, 0)
+        self.assertFalse(ctrl._telemetry_fault)
+        self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+        self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertNotEqual(ctrl._health_class, "ERROR")
+        self.assertEqual(ctrl._cooling_phase, "IDLE")
+        self.assertEqual(ctrl.last_error, "")
+        self.assertEqual(ctrl._last_fault_reason, SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(ctrl._last_fault_class, "ERROR")
+        self.assertEqual(ctrl._last_fault_timestamp, latched_at)
+        self.assertEqual(ctrl._last_fault_count, 1)
+        self.assertFalse(ctrl._sustained_fault_open)
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertEqual(ctrl.ha._states[ENT_OLD_AUTO], "off")
+        health = ctrl.ha._attrs["sensor.lard_controller_health"]
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_health"], "HASHING")
+        self.assertNotEqual(
+            ctrl.ha._states["sensor.lard_controller_health"], health["last_fault_reason"]
+        )
+        self.assertEqual(health["current_error"], "")
+        self.assertFalse(health["active_fault"])
+        self.assertEqual(health["last_fault_reason"], SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(health["sustained_telemetry_recovery_polls"], 5)
+        self.assertEqual(health["sustained_telemetry_recovery_required"], 5)
+        self.assertEqual(health["telemetry_freshness"], "FRESH")
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_error"], "ok")
+        self.assertNotEqual(
+            ctrl.ha._states["sensor.lard_controller_error"], SUSTAINED_TELEMETRY_ERROR
+        )
+        actual = ctrl.ha._attrs["sensor.lard_controller_actual_mode"]
+        self.assertEqual(actual["fault_reason"], "")
+        self.assertEqual(actual["current_error"], "")
+        self.assertEqual(actual["last_fault_reason"], SUSTAINED_TELEMETRY_ERROR)
+        self.assertFalse(actual["active_fault"])
+        status = json.loads((ctrl.settings.data_dir / "status.json").read_text())
+        self.assertEqual(status["last_error"], "")
+        self.assertEqual(status["current_error"], "")
+        self.assertEqual(status["last_fault_reason"], SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(status["health_class"], "HASHING")
+        self.assertEqual(status["sustained_telemetry_recovery_polls"], 5)
+        self.assertEqual(status["sustained_telemetry_recovery_required"], 5)
+        assert_no_braiins_writes(self, miner, spies)
+
+    def test_bad_poll_resets_count_and_requires_five_again(self):
+        miner = running_boards(["1", "2", "3"])
+        miner.power_w = 1000.0
+        miner.hashrate = 30.0
+        ctrl = self._ctrl(miner, "THREE_BOARD")
+        spies = spy_braiins_writes(miner)
+        self._sustain(ctrl, miner)
+        self._restore_hashing(miner, 1000.0, 30.0)
+        self._steps(ctrl, 3)
+        self._assert_progress(ctrl, 3)
+
+        miner.boards_http = 500
+        miner.boards_error_body = {"message": "timeout"}
+        self._step(ctrl)
+        self.assertEqual(ctrl._telemetry_freshness, "STALE")
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 0)
+        self.assertEqual(ctrl._health_class, "ERROR")
+        self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        self._assert_progress(ctrl, 0)
+
+        self._restore_hashing(miner, 1000.0, 30.0)
+        self._steps(ctrl, 2)
+        self._assert_progress(ctrl, 2)
+        miner.hashboards_malformed = True
+        miner.boards_http = 500
+        miner.boards_error_body = {"message": "hashboards malformed"}
+        self._step(ctrl)
+        self.assertEqual(ctrl.telemetry_class, "REQUIRED_TELEMETRY_MALFORMED")
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 0)
+        self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(ctrl._health_class, "ERROR")
+
+        self._restore_hashing(miner, 1000.0, 30.0)
+        self._steps(ctrl, 2)
+        self._assert_progress(ctrl, 2)
+        miner.enabled = ["1", "3"]
+        self._step(ctrl)
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 0)
+        self.assertEqual(ctrl._health_class, "ERROR")
+        self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        self.assertNotEqual(ctrl._health_class, "HASHING")
+
+        miner.enabled = ["1", "2", "3"]
+        self._restore_hashing(miner, 1000.0, 30.0)
+        self._steps(ctrl, 4)
+        self._assert_progress(ctrl, 4)
+        self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+        self._step(ctrl)
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertEqual(ctrl.last_error, "")
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 5)
+        self.assertEqual(ctrl._last_fault_reason, SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        assert_no_braiins_writes(self, miner, spies)
+
+    def test_recovery_does_not_clear_independent_faults(self):
+        cases = (
+            "fault_latched",
+            "board_mismatch",
+            "empty_boards",
+            "partial_boards",
+            "unverified_boards",
+            "malformed_boards",
+            "auth_failure",
+            "bosminer_unavailable",
+            "write_failure",
+            "cooling_terminal",
+            "cooling_terminal_same_string",
+            "active_cooling_txn",
+            "hard_fault_text",
+            "hard_fault_live",
+            "degraded",
+        )
+        for name in cases:
+            with self.subTest(name=name):
+                self._assert_fault_sticks(name)
+
+    def _assert_fault_sticks(self, name: str):
+        miner = running_boards(["1", "2", "3"])
+        miner.power_w = 1000.0
+        miner.hashrate = 30.0
+        ctrl = self._ctrl(miner, "THREE_BOARD")
+        spies = spy_braiins_writes(miner)
+        if name not in {"write_failure", "cooling_terminal", "cooling_terminal_same_string", "degraded"}:
+            self._sustain(ctrl, miner)
+        else:
+            ctrl._health_class = "ERROR"
+            ctrl._cooling_phase = "ERROR"
+            ctrl.actual_mode = "ERROR"
+        if name == "fault_latched":
+            ctrl._enter_fault_latched("board_verification_timeout_or_mismatch")
+            held_error = ctrl.last_error
+            self._restore_hashing(miner, 1000.0, 30.0)
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "FAULT_LATCHED")
+            self.assertTrue(ctrl._fault_latched)
+            self.assertEqual(ctrl.last_error, held_error)
+            self.assertNotEqual(ctrl._health_class, "HASHING")
+        elif name == "board_mismatch":
+            miner.enabled = ["1", "3"]
+            self._restore_hashing(miner, 1000.0, 30.0)
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+            self.assertNotEqual(ctrl._health_class, "HASHING")
+        elif name == "empty_boards":
+            miner.enabled = []
+            self._restore_hashing(miner, 1000.0, 30.0)
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        elif name == "partial_boards":
+            miner.incomplete_boards = True
+            self._restore_hashing(miner, 1000.0, 30.0)
+            miner.incomplete_boards = True
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+            self.assertFalse(ctrl._last_obs.boards_healthy)
+        elif name == "unverified_boards":
+            self._restore_hashing(miner, 1130.0, 43.0)
+            miner.omit_board_telemetry = True
+            ctrl.tick()
+            self.assertGreater(float(ctrl._last_obs.power_w), 100.0)
+            self.assertFalse(ctrl._last_obs.board_health_verified)
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+            self.assertNotEqual(ctrl._health_class, "HASHING")
+        elif name == "malformed_boards":
+            miner.boards_http = 500
+            miner.boards_error_body = {"message": "hashboards malformed"}
+            ctrl.tick()
+            self.assertEqual(ctrl.telemetry_class, "REQUIRED_TELEMETRY_MALFORMED")
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertNotEqual(ctrl._health_class, "HASHING")
+        elif name == "auth_failure":
+            miner.boards_http = 401
+            miner.boards_error_body = {"message": "Missing or invalid authentication token"}
+            ctrl.tick()
+            self.assertEqual(ctrl.telemetry_class, "AUTHENTICATION_FAILED")
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertNotEqual(ctrl._telemetry_freshness, "FRESH")
+        elif name == "bosminer_unavailable":
+            miner.boards_http = 500
+            miner.boards_error_body = {
+                "message": "BOSminer API connection error: Connection refused (os error 111)"
+            }
+            ctrl.tick()
+            self.assertEqual(ctrl.telemetry_class, "BOSMINER_UNAVAILABLE")
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertNotEqual(ctrl._health_class, "HASHING")
+        elif name == "write_failure":
+            ctrl.last_error = "pause_http_500"
+            ctrl._cooling_terminal_kind = ""
+            self._restore_hashing(miner, 1000.0, 30.0)
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl._cooling_phase, "ERROR")
+            self.assertEqual(ctrl.last_error, "pause_http_500")
+        elif name == "cooling_terminal":
+            ctrl.last_error = "cooling_confirm_http_400"
+            ctrl._cooling_terminal_kind = "error"
+            self._restore_hashing(miner, 1000.0, 30.0)
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl._cooling_phase, "ERROR")
+            self.assertEqual(ctrl.last_error, "cooling_confirm_http_400")
+            self.assertEqual(ctrl._cooling_terminal_kind, "error")
+        elif name == "cooling_terminal_same_string":
+            ctrl.last_error = SUSTAINED_TELEMETRY_ERROR
+            ctrl._cooling_terminal_kind = "error"
+            self._restore_hashing(miner, 1000.0, 30.0)
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl._cooling_phase, "ERROR")
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        elif name == "active_cooling_txn":
+            ctrl._cooling_txn_active = True
+            ctrl._cooling_phase = "ERROR"
+            self._restore_hashing(miner, 1000.0, 30.0)
+            ctrl.tick()
+            self.assertTrue(ctrl._cooling_txn_active)
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl._cooling_phase, "ERROR")
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        elif name == "hard_fault_text":
+            ctrl.last_error = "hard_fault:hardware_fault"
+            ctrl._cooling_terminal_kind = "error"
+            self._restore_hashing(miner, 1000.0, 30.0)
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl.last_error, "hard_fault:hardware_fault")
+        elif name == "hard_fault_live":
+            self._restore_hashing(miner, 0.0, 0.0)
+            miner._enter_hard_fault()
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+            self.assertNotEqual(ctrl._health_class, "HASHING")
+            self.assertNotEqual(ctrl._health_class, "PAUSED")
+            self.assertNotEqual(ctrl.telemetry_class, "VALID_PAUSED")
+            self.assertNotEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        elif name == "degraded":
+            ctrl._health_class = "DEGRADED_NEEDS_ATTENTION"
+            ctrl.last_error = "degraded_needs_attention:recovery_exhausted"
+            ctrl._cooling_terminal_kind = "degraded"
+            self._restore_hashing(miner, 1000.0, 30.0)
+            ctrl.tick()
+            self.assertEqual(ctrl._health_class, "DEGRADED_NEEDS_ATTENTION")
+            self.assertEqual(ctrl.last_error, "degraded_needs_attention:recovery_exhausted")
+        self._steps(ctrl, SUSTAINED_TELEMETRY_RECOVERY_POLLS)
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 0)
+        self.assertNotEqual(ctrl._health_class, "HASHING")
+        self.assertNotEqual(ctrl._health_class, "PAUSED")
+        self.assertNotEqual(ctrl._health_class, "RECOVERING")
+        if name == "fault_latched":
+            self.assertEqual(ctrl._health_class, "FAULT_LATCHED")
+            self.assertTrue(ctrl._fault_latched)
+            self.assertEqual(ctrl.last_error, held_error)
+        elif name == "write_failure":
+            self.assertEqual(ctrl.last_error, "pause_http_500")
+            self.assertEqual(ctrl._health_class, "ERROR")
+        elif name == "cooling_terminal":
+            self.assertEqual(ctrl.last_error, "cooling_confirm_http_400")
+            self.assertEqual(ctrl._cooling_terminal_kind, "error")
+            self.assertEqual(ctrl._health_class, "ERROR")
+        elif name == "cooling_terminal_same_string":
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+            self.assertEqual(ctrl._cooling_phase, "ERROR")
+            self.assertEqual(ctrl._health_class, "ERROR")
+        elif name == "active_cooling_txn":
+            self.assertTrue(ctrl._cooling_txn_active)
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+            self.assertEqual(ctrl._cooling_phase, "ERROR")
+            self.assertEqual(ctrl._health_class, "ERROR")
+        elif name == "hard_fault_text":
+            self.assertEqual(ctrl.last_error, "hard_fault:hardware_fault")
+            self.assertEqual(ctrl._health_class, "ERROR")
+        elif name == "degraded":
+            self.assertEqual(ctrl._health_class, "DEGRADED_NEEDS_ATTENTION")
+            self.assertEqual(ctrl.last_error, "degraded_needs_attention:recovery_exhausted")
+        else:
+            self.assertEqual(ctrl._health_class, "ERROR")
+            self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        assert_no_braiins_writes(self, miner, spies)
+
+    def test_paused_recovery_is_not_hashing(self):
+        miner = paused_one_board()
+        ctrl = self._ctrl(miner, "PAUSED")
+        spies = spy_braiins_writes(miner)
+        self._sustain(ctrl, miner)
+        latched_at = ctrl._last_fault_timestamp
+        miner.boards_http = 200
+        miner.power_w = 0.0
+        miner.hashrate = 0.0
+        for n in range(1, SUSTAINED_TELEMETRY_RECOVERY_POLLS):
+            self._step(ctrl)
+            self._assert_progress(ctrl, n)
+            self.assertEqual(ctrl.telemetry_class, "VALID_PAUSED")
+            self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+            self.assertEqual(ctrl._telemetry_fail_streak, 0)
+            self.assertNotEqual(ctrl._health_class, "PAUSED")
+            self.assertNotEqual(ctrl._health_class, "HASHING")
+        self._step(ctrl)
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 5)
+        self.assertEqual(ctrl.telemetry_class, "VALID_PAUSED")
+        self.assertEqual(ctrl._health_class, "PAUSED")
+        self.assertNotEqual(ctrl._health_class, "HASHING")
+        self.assertNotEqual(ctrl._health_class, "ERROR")
+        self.assertEqual(ctrl._cooling_phase, "IDLE")
+        self.assertEqual(ctrl.last_error, "")
+        self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+        self.assertEqual(ctrl._telemetry_fail_streak, 0)
+        self.assertEqual(ctrl._last_fault_reason, SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(ctrl._last_fault_timestamp, latched_at)
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_health"], "PAUSED")
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        assert_no_braiins_writes(self, miner, spies)
+
+    def test_low_power_one_board_recovers_to_hashing(self):
+        miner = running_boards(["1"])
+        miner.power_w = 40.0
+        miner.hashrate = 1.2
+        ctrl = self._ctrl(miner, "ONE_BOARD")
+        spies = spy_braiins_writes(miner)
+        self._sustain(ctrl, miner)
+        latched_at = ctrl._last_fault_timestamp
+        self._restore_hashing(miner, 40.0, 1.2)
+        self.assertEqual(list(miner.enabled), ["1"])
+        for n in range(1, SUSTAINED_TELEMETRY_RECOVERY_POLLS):
+            self._step(ctrl)
+            self._assert_progress(ctrl, n)
+            self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+            self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+            self.assertEqual(ctrl.observed_miner_mode, "ONE_BOARD")
+            self.assertNotEqual(ctrl._health_class, "HASHING")
+        self._step(ctrl)
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 5)
+        self.assertEqual(ctrl.telemetry_class, "RUNNING_HEALTHY")
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertEqual(ctrl.observed_miner_mode, "ONE_BOARD")
+        self.assertNotEqual(ctrl.observed_miner_mode, "THREE_BOARD")
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_boards"], "1")
+        self.assertNotEqual(ctrl.ha._states["sensor.lard_controller_boards"], "1,2,3")
+        self.assertLess(float(ctrl.power_w), 200.0)
+        self.assertGreater(float(ctrl.power_w), 10.0)
+        self.assertEqual(ctrl.last_error, "")
+        self.assertEqual(ctrl._cooling_phase, "IDLE")
+        self.assertEqual(ctrl._last_fault_reason, SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(ctrl._last_fault_timestamp, latched_at)
+        self.assertEqual(ctrl._last_fault_count, 1)
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        assert_no_braiins_writes(self, miner, spies)
+
+    def test_transition_evidence_recovers_to_recovering_not_hashing(self):
+        for phase in ("preheating", "ramping", "tuning"):
+            with self.subTest(phase=phase):
+                miner = running_boards(["1"])
+                miner.power_w = 0.0
+                miner.hashrate = 0.0
+                ctrl = self._ctrl(miner, "ONE_BOARD")
+                spies = spy_braiins_writes(miner)
+                self._sustain(ctrl, miner)
+                miner.boards_http = 200
+                miner.running = False
+                miner.paused = False
+                miner.user_paused = False
+                miner.phase = phase
+                miner.status = phase
+                miner.pause_reason = phase
+                miner.power_w = 0.0
+                miner.hashrate = 0.0
+                for n in range(1, SUSTAINED_TELEMETRY_RECOVERY_POLLS):
+                    self._step(ctrl)
+                    self._assert_progress(ctrl, n)
+                    self.assertEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+                    self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+                    self.assertNotEqual(ctrl._health_class, "RECOVERING")
+                    self.assertNotEqual(ctrl._health_class, "HASHING")
+                self._step(ctrl)
+                self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 5)
+                self.assertEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+                self.assertEqual(ctrl._health_class, "RECOVERING")
+                self.assertNotEqual(ctrl._health_class, "HASHING")
+                self.assertNotEqual(ctrl._health_class, "ERROR")
+                self.assertEqual(ctrl._cooling_phase, "IDLE")
+                self.assertEqual(ctrl.last_error, "")
+                self.assertEqual(ctrl._telemetry_freshness, "FRESH")
+                self.assertEqual(ctrl._last_fault_reason, SUSTAINED_TELEMETRY_ERROR)
+                self.assertGreater(ctrl._last_fault_timestamp, 0.0)
+                assert_no_braiins_writes(self, miner, spies)
+
+        label = running_boards(["1"])
+        label.power_w = 0.0
+        label.hashrate = 0.0
+        ctrl = self._ctrl(label, "ONE_BOARD")
+        spies = spy_braiins_writes(label)
+        self._sustain(ctrl, label)
+        label.boards_http = 200
+        label.running = False
+        label.paused = False
+        label.user_paused = False
+        label.phase = "applying"
+        label.status = "applying"
+        label.pause_reason = ""
+        label.power_w = 0.0
+        label.hashrate = 0.0
+        self._steps(ctrl, SUSTAINED_TELEMETRY_RECOVERY_POLLS)
+        self.assertNotEqual(ctrl.telemetry_class, "VALID_TRANSITION")
+        self.assertEqual(ctrl._health_class, "ERROR")
+        self.assertEqual(ctrl.last_error, SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(ctrl._sustained_telemetry_recovery_polls, 0)
+        self.assertNotEqual(ctrl._health_class, "RECOVERING")
+        self.assertNotEqual(ctrl._health_class, "HASHING")
+        assert_no_braiins_writes(self, label, spies)
+
+    def test_reload_stays_disarmed_and_recovery_does_not_arm(self):
+        miner = running_boards(["1"])
+        miner.power_w = 400.0
+        miner.hashrate = 20.0
+        ctrl = self._ctrl(miner, "ONE_BOARD")
+        spies = spy_braiins_writes(miner)
+        self.assertEqual(ctrl.reconcile_after_reload(), "clean")
+        self.assertEqual(ctrl.controller_state, "DISARMED")
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertFalse(ctrl.settings.enable_writes)
+        self._sustain(ctrl, miner)
+        self._restore_hashing(miner, 400.0, 20.0)
+        self._steps(ctrl, 4)
+        self._assert_progress(ctrl, 4)
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        self.assertFalse(ctrl.write_permission.permitted)
+        self._step(ctrl)
+        self.assertEqual(ctrl._health_class, "HASHING")
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        self.assertFalse(ctrl.settings.enable_writes)
+        self.assertFalse(ctrl.write_permission.permitted)
+        self.assertEqual(ctrl.ha._states[ENT_OLD_AUTO], "off")
+        self.assertNotIn((ENT_OLD_AUTO, "on"), ctrl.ha.writes)
+        self.assertFalse(ctrl.settings.cooling_control_enabled)
+        self.assertFalse(ctrl.settings.auto_fan_ceiling_enabled)
+        self.assertEqual(ctrl.reconcile_after_reload(), "clean")
+        self.assertEqual(ctrl.controller_state, "DISARMED")
+        self.assertEqual(ctrl.write_gate, "DISARMED")
+        self.assertFalse(ctrl.write_permission.permitted)
+        assert_no_braiins_writes(self, miner, spies)
+
+        armed = running_boards(["1"])
+        armed.power_w = 400.0
+        armed.hashrate = 20.0
+        armed_ctrl = self._ctrl(armed, "ONE_BOARD", enable_writes=True)
+        armed_spies = spy_braiins_writes(armed)
+        self.assertTrue(armed_ctrl.settings.enable_writes)
+        self._sustain(armed_ctrl, armed)
+        self._restore_hashing(armed, 400.0, 20.0)
+        self._steps(armed_ctrl, 4)
+        self._assert_progress(armed_ctrl, 4)
+        self._step(armed_ctrl)
+        self.assertEqual(armed_ctrl._health_class, "HASHING")
+        self.assertTrue(armed_ctrl.settings.enable_writes)
+        self.assertFalse(armed_ctrl.write_permission.permitted)
+        self.assertEqual(armed_ctrl.ha._states[ENT_OLD_AUTO], "off")
+        assert_no_braiins_writes(self, armed, armed_spies)
+
+    def test_published_health_is_not_the_historical_fault(self):
+        miner = running_boards(["1", "2", "3"])
+        miner.power_w = 900.0
+        miner.hashrate = 28.0
+        ctrl = self._ctrl(miner, "THREE_BOARD")
+        spies = spy_braiins_writes(miner)
+        self._sustain(ctrl, miner)
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_health"], "ERROR")
+        self.assertEqual(
+            ctrl.ha._states["sensor.lard_controller_error"], SUSTAINED_TELEMETRY_ERROR
+        )
+        during = ctrl.ha._attrs["sensor.lard_controller_health"]
+        self.assertEqual(during["current_error"], during["last_fault_reason"])
+        self.assertTrue(during["active_fault"])
+        self.assertEqual(during["sustained_telemetry_recovery_polls"], 0)
+        self.assertEqual(during["sustained_telemetry_recovery_required"], 5)
+        self._restore_hashing(miner, 900.0, 28.0)
+        self._steps(ctrl, 3)
+        mid = ctrl.ha._attrs["sensor.lard_controller_health"]
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_health"], "ERROR")
+        self.assertEqual(mid["current_error"], SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(mid["last_fault_reason"], SUSTAINED_TELEMETRY_ERROR)
+        self.assertEqual(mid["current_error"], mid["last_fault_reason"])
+        self.assertTrue(mid["active_fault"])
+        self.assertEqual(mid["sustained_telemetry_recovery_polls"], 3)
+        self.assertEqual(mid["sustained_telemetry_recovery_required"], 5)
+        self.assertEqual(mid["telemetry_freshness"], "FRESH")
+        self.assertEqual(mid["telemetry_class"], "RUNNING_HEALTHY")
+        self.assertEqual(
+            ctrl.ha._states["sensor.lard_controller_error"], SUSTAINED_TELEMETRY_ERROR
+        )
+        self._steps(ctrl, 2)
+        state = ctrl.ha._states["sensor.lard_controller_health"]
+        attrs = ctrl.ha._attrs["sensor.lard_controller_health"]
+        self.assertEqual(state, "HASHING")
+        self.assertEqual(attrs["last_fault_reason"], SUSTAINED_TELEMETRY_ERROR)
+        self.assertNotEqual(state, attrs["last_fault_reason"])
+        self.assertNotEqual(state, "ERROR")
+        self.assertEqual(attrs["current_error"], "")
+        self.assertFalse(attrs["active_fault"])
+        self.assertEqual(attrs["last_fault_class"], "ERROR")
+        self.assertEqual(attrs["sustained_telemetry_recovery_polls"], 5)
+        self.assertEqual(attrs["sustained_telemetry_recovery_required"], 5)
+        self.assertNotEqual(attrs["current_error"], attrs["last_fault_reason"])
+        self.assertEqual(ctrl.ha._states["sensor.lard_controller_error"], "ok")
+        self.assertNotIn(
+            SUSTAINED_TELEMETRY_ERROR,
+            (state, attrs["current_error"], ctrl.ha._states["sensor.lard_controller_error"]),
+        )
+        self.assertEqual(ctrl.write_gate, "DISARMED")
         assert_no_braiins_writes(self, miner, spies)
 
 

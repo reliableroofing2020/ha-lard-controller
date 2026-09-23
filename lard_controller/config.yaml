@@ -1,5 +1,5 @@
 name: LARD Controller
-version: "0.1.13"
+version: "0.1.14"
 slug: lard_controller
 description: >
   Supervises the LARD board-priority Braiins actuator. Observe-and-publish

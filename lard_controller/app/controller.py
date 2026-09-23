@@ -174,12 +174,17 @@ COOLING_STABILIZE_S = 5
 COOLING_RESUME_SETTLE_S = 20
 # Kept so 0.1.6 imports stay valid. 0.1.7 does not loop ResumeMining on 500.
 COOLING_RESUME_BACKOFF_S = (5, 10, 20)
-ADDON_VERSION = "0.1.13"
+ADDON_VERSION = "0.1.14"
 # Optional cooling-helper misses. Monotonic. One diagnostic per window.
 HELPER_MISS_BACKOFF_START_S = 30.0
 HELPER_MISS_BACKOFF_MAX_S = 600.0
 # Recovery readiness is advisory. It never sets the write gate.
 RECOVERY_READY_POLLS = 5
+# Consecutive coherent polls required before an active
+# telemetry_sustained_unavailable ERROR may clear. Same count as
+# RECOVERY_READY_POLLS. Spaced by poll_seconds (one count per ordinary
+# tick). This counter does not arm writes and is not recovery_ready.
+SUSTAINED_TELEMETRY_RECOVERY_POLLS = RECOVERY_READY_POLLS
 # Cooling policy. These names only matter when cooling_control_enabled is
 # explicitly true. Default is false: Braiins OS owns cooling, and neither
 # policy schedules a cooling transaction.
@@ -273,6 +278,16 @@ HEALTH_CLASSES = (
     "ERROR",
 )
 TERMINAL_HEALTH = frozenset({"DEGRADED_NEEDS_ATTENTION", "ERROR", "INTERRUPTED_MANUAL_REVIEW"})
+# Active error string set only by the idle sustained-read path.
+# Recovery clears last_error. The outage stays in last_fault_*.
+SUSTAINED_TELEMETRY_ERROR = "telemetry_sustained_unavailable"
+# Coherent miner classes that may replace that latch. UNKNOWN, a bare
+# "applying" label, and every failure class are not in this set.
+RECOVERY_TELEMETRY_CLASSES = frozenset(
+    {"RUNNING_HEALTHY", "VALID_PAUSED", "VALID_TRANSITION"}
+)
+# Closed cooling/config outcomes. A later good read must not clear these.
+COOLING_FAULT_TERMINALS = frozenset({"degraded", "error", "interrupted"})
 # In-flight cooling txn marker. Monotonic deadlines are NOT stored here.
 INFLIGHT_TXN_NAME = "cooling_txn_inflight.json"
 # Independent miner-side lifecycle tokens for VALID_TRANSITION and for
@@ -2790,6 +2805,16 @@ class Controller:
         self._telemetry_fail_streak = 0
         self._telemetry_fault = False
         self._telemetry_last_success_ts = 0.0
+        # Historical sustained-read outage. Not the current error.
+        # last_error is cleared on recovery; these fields stay.
+        self._last_fault_reason = ""
+        self._last_fault_class = ""
+        self._last_fault_timestamp = 0.0
+        self._last_fault_count = 0
+        self._sustained_fault_open = False
+        self._sustained_telemetry_recovery_pending = False
+        self._sustained_telemetry_recovery_polls = 0
+        self._sustained_telemetry_recovery_mono = 0.0
         self._last_good_power_w = None
         self._last_good_boards = ""
         self._last_obs: MinerObservation | None = None
@@ -4691,9 +4716,237 @@ class Controller:
         if self.boards_str:
             self._last_good_boards = self.boards_str
         self._clear_transient_read_error()
+        # One coherent sample may count toward clearing the sustained-read
+        # latch. The error stays until SUSTAINED_TELEMETRY_RECOVERY_POLLS.
+        self._account_sustained_telemetry_recovery()
+
+    def _remember_sustained_telemetry_fault(self) -> None:
+        """Record the outage once per episode. Recovery does not erase it."""
+        if (
+            self._sustained_fault_open
+            and self._last_fault_reason == SUSTAINED_TELEMETRY_ERROR
+        ):
+            return
+        self._last_fault_count += 1
+        self._last_fault_reason = SUSTAINED_TELEMETRY_ERROR
+        self._last_fault_class = "ERROR"
+        self._last_fault_timestamp = float(self._wall())
+        self._sustained_fault_open = True
+
+    def _coherent_board_state(self, obs: MinerObservation) -> bool:
+        """Required boards are present, verified, and a known 1/2/3 topology.
+
+        Empty, partial, stale, unverified, or non-contiguous sets are not
+        coherent. Watts are not a substitute.
+        """
+        if not obs.board_health_verified or obs.board_stale or not obs.boards_healthy:
+            return False
+        if obs.safety_fault:
+            return False
+        ids = frozenset(norm_board_id(i) for i in obs.enabled_ids if norm_board_id(i))
+        if not ids:
+            return False
+        mode = ""
+        for name in ("ONE_BOARD", "TWO_BOARD", "THREE_BOARD"):
+            if ids == frozenset(BOARD_MAP[name]):
+                mode = name
+                break
+        if not mode:
+            return False
+        return self._expected_boards_proven(obs, mode)
+
+    def _sustained_telemetry_latch_active(self) -> bool:
+        """Active error is this outage. Other ERROR strings are not."""
+        if (self.last_error or "") != SUSTAINED_TELEMETRY_ERROR:
+            return False
+        if self._health_class != "ERROR":
+            return False
+        if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
+            return False
+        return True
+
+    def _sustained_telemetry_structurally_blocked(self) -> bool:
+        """Cooling/config ownership. Do not count or clear across these."""
+        if self._cooling_txn_active or self._cooling_transition_active or self._apply_depth:
+            return True
+        if self._reload_hold:
+            return True
+        if self._cooling_terminal_kind in COOLING_FAULT_TERMINALS:
+            return True
+        return False
+
+    def _sustained_telemetry_sample_coherent(self) -> bool:
+        """This poll is a verified recovery sample. Not a structural blocker check."""
+        obs = getattr(self, "_last_obs", None)
+        if (
+            self._telemetry_freshness != "FRESH"
+            or self._telemetry_fail_streak != 0
+            or self._telemetry_fault
+        ):
+            return False
+        if not self._auth_ok or not self._bosminer_available or not self._api_reachable:
+            return False
+        if not self._required_telemetry_fresh:
+            return False
+        if not self._endpoint_fresh("boards") or not self._endpoint_fresh("details"):
+            return False
+        if obs is None or not obs.ok or not obs.boards_ok or not obs.details_ok:
+            return False
+        if self._hard_fault(obs) or self._critical_fault:
+            return False
+        if self.telemetry_class not in RECOVERY_TELEMETRY_CLASSES:
+            return False
+        if not self._coherent_board_state(obs):
+            return False
+        if self.telemetry_class == "VALID_PAUSED" and not self._paused_confirmed(obs):
+            return False
+        if self.telemetry_class == "VALID_TRANSITION" and not self._positive_lifecycle(obs):
+            return False
+        if self.telemetry_class == "RUNNING_HEALTHY" and not obs.running:
+            return False
+        return True
+
+    def _sustained_telemetry_recovery_allowed(self) -> bool:
+        """True only on the poll that may clear the sustained-read ERROR.
+
+        The sticky cause must be exactly ``telemetry_sustained_unavailable``.
+        Required boards and details must be fresh and coherent. The live class
+        must be RUNNING_HEALTHY, VALID_PAUSED, or evidence-backed
+        VALID_TRANSITION. Hard faults, FAULT_LATCHED, auth/API/bosminer loss,
+        write or cooling terminals, and an active cooling or config transaction
+        block recovery. The coherent-poll count must already be
+        ``SUSTAINED_TELEMETRY_RECOVERY_POLLS``. This does not arm writes.
+        """
+        return (
+            self._sustained_telemetry_latch_active()
+            and not self._sustained_telemetry_structurally_blocked()
+            and self._sustained_telemetry_sample_coherent()
+            and self._sustained_telemetry_recovery_polls >= SUSTAINED_TELEMETRY_RECOVERY_POLLS
+        )
+
+    def _sustained_telemetry_poll_interval(self) -> float:
+        """Ordinary loop spacing. One recovery count per this interval."""
+        return max(1.0, float(self.settings.poll_seconds or 1))
+
+    def _sustained_telemetry_spacing_elapsed(self) -> bool:
+        last = float(self._sustained_telemetry_recovery_mono or 0.0)
+        if last <= 0.0:
+            return True
+        return (float(self._now()) - last) >= self._sustained_telemetry_poll_interval()
+
+    def _reset_sustained_telemetry_recovery_polls(self) -> None:
+        """A bad required read starts the five-poll streak over."""
+        self._sustained_telemetry_recovery_polls = 0
+        self._sustained_telemetry_recovery_mono = float(self._now())
+        self._sustained_telemetry_recovery_pending = False
+
+    def _restore_open_sustained_telemetry_error(self) -> None:
+        """Keep the active sustained-read error until the five-poll clear.
+
+        A miss overwrites ``last_error`` with ``read_*`` and the transient
+        clearer drops that. While this episode is still open, put the
+        sustained-unavailable string back. A different fault string, a
+        cooling terminal, or a fault latch is left alone.
+        """
+        if not self._sustained_fault_open or self._health_class != "ERROR":
+            return
+        if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
+            return
+        if self._sustained_telemetry_structurally_blocked():
+            return
+        err = self.last_error or ""
+        if err == SUSTAINED_TELEMETRY_ERROR:
+            return
+        if err and not (err.startswith("read_") and "|" not in err):
+            return
+        self.last_error = SUSTAINED_TELEMETRY_ERROR
+
+    def _account_sustained_telemetry_recovery(self) -> None:
+        """Count at most one coherent poll per ``poll_seconds``.
+
+        Missing, malformed, stale, or contradictory samples reset the count.
+        Structural blockers do not increment and do not clear. The active
+        error stays until the count reaches ``SUSTAINED_TELEMETRY_RECOVERY_POLLS``.
+        """
+        self._sustained_telemetry_recovery_pending = False
+        if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
+            self._reset_sustained_telemetry_recovery_polls()
+            return
+        if not self._sustained_telemetry_latch_active():
+            return
+        if self._sustained_telemetry_structurally_blocked():
+            return
+        if not self._sustained_telemetry_sample_coherent():
+            self._reset_sustained_telemetry_recovery_polls()
+            return
+        if not self._sustained_telemetry_spacing_elapsed():
+            return
+        self._sustained_telemetry_recovery_polls += 1
+        self._sustained_telemetry_recovery_mono = float(self._now())
+        if self._sustained_telemetry_recovery_polls >= SUSTAINED_TELEMETRY_RECOVERY_POLLS:
+            self._sustained_telemetry_recovery_pending = True
+
+    def _mode_for_enabled_boards(self, obs: MinerObservation) -> str:
+        ids = frozenset(norm_board_id(i) for i in obs.enabled_ids if norm_board_id(i))
+        for name in ("ONE_BOARD", "TWO_BOARD", "THREE_BOARD"):
+            if ids == frozenset(BOARD_MAP[name]):
+                return name
+        if self.actual_mode in BOARD_MAP and self.actual_mode != "PAUSED":
+            return self.actual_mode
+        return "ONE_BOARD"
+
+    def _recovered_idle_health(self, obs: MinerObservation) -> tuple[str, str] | None:
+        """Health and phase after a sustained-read latch, from this observation.
+
+        VALID_TRANSITION is miner lifecycle evidence only. The controller word
+        ``applying`` is not that evidence and does not produce RECOVERING.
+        """
+        if self.telemetry_class == "VALID_TRANSITION" and self._positive_lifecycle(obs):
+            return ("RECOVERING", "IDLE")
+        if self.telemetry_class == "VALID_PAUSED" and self._paused_confirmed(obs):
+            return ("PAUSED", "IDLE")
+        if self.telemetry_class == "RUNNING_HEALTHY" and obs.running:
+            sample = self._mode_for_enabled_boards(obs)
+            if self._hashing_sample_ok(obs, sample):
+                return ("HASHING", "IDLE")
+            return ("RECOVERING", "IDLE")
+        return None
+
+    def _finish_sustained_telemetry_recovery(self, obs: MinerObservation | None) -> bool:
+        """Clear the active sustained-read error and publish idle health.
+
+        Returns False without changing last_error, health, or phase when the
+        observation is not a verified recovery. Does not arm writes or send
+        a miner command.
+        """
+        if obs is None or not self._sustained_telemetry_recovery_allowed():
+            return False
+        recovered = self._recovered_idle_health(obs)
+        if recovered is None:
+            return False
+        health, idle_phase = recovered
+        self.last_error = ""
+        self._sustained_fault_open = False
+        if self.actual_mode == "ERROR":
+            inferred = self.infer_actual_mode(obs)
+            if inferred and inferred != "ERROR":
+                self.actual_mode = inferred
+                if inferred in RANK:
+                    self.confirmed_operational = inferred
+        self._health_class = health
+        if (
+            idle_phase
+            and self._cooling_phase == "ERROR"
+            and not self._cooling_txn_active
+            and not self._cooling_transition_active
+        ):
+            self._cooling_phase = idle_phase
+        self._sync_mode_contract(obs)
+        return True
 
     def _note_telemetry_failure(self, where: str) -> None:
         """First misses are UNKNOWN/STALE. They never cancel an in-flight cooling txn."""
+        self._reset_sustained_telemetry_recovery_polls()
         self._telemetry_fail_streak += 1
         if self._telemetry_last_success_ts:
             self._telemetry_freshness = "STALE"
@@ -4721,7 +4974,9 @@ class Controller:
                 self._health_class = "ERROR"
                 self.actual_mode = "ERROR"
                 self._cooling_phase = "ERROR"
-                self.last_error = "telemetry_sustained_unavailable"
+                self.last_error = SUSTAINED_TELEMETRY_ERROR
+                self._remember_sustained_telemetry_fault()
+            self._restore_open_sustained_telemetry_error()
             return
         self._emit(
             "lard_telemetry_unknown",
@@ -4730,6 +4985,7 @@ class Controller:
             attempt=self._telemetry_fail_streak,
         )
         self._clear_transient_read_error()
+        self._restore_open_sustained_telemetry_error()
         if self._telemetry_failure_holds_phase():
             return
         if self._health_class not in {"DEGRADED_NEEDS_ATTENTION", "ERROR", "FAULT_LATCHED"}:
@@ -5224,6 +5480,17 @@ class Controller:
             "board_health_reason": str(getattr(self._last_obs, "board_health_reason", "") or ""),
             "telemetry_fail_streak": self._telemetry_fail_streak,
             "telemetry_last_success_ts": self._telemetry_last_success_ts,
+            # current_error / active_fault follow last_error (the active fault).
+            # last_fault_* is the retained sustained-read history and is not
+            # the health sensor state.
+            "current_error": self.last_error or "",
+            "active_fault": bool(self.last_error),
+            "last_fault_reason": self._last_fault_reason,
+            "last_fault_timestamp": self._last_fault_timestamp,
+            "last_fault_class": self._last_fault_class,
+            "last_fault_count": int(self._last_fault_count),
+            "sustained_telemetry_recovery_polls": int(self._sustained_telemetry_recovery_polls),
+            "sustained_telemetry_recovery_required": int(SUSTAINED_TELEMETRY_RECOVERY_POLLS),
             "auto_fan_ceiling_enabled": bool(self.settings.auto_fan_ceiling_enabled),
             "cooling_writes_only_when_paused": bool(self.settings.cooling_writes_only_when_paused),
             "cooling_policy": self.settings.cooling_policy,
@@ -5257,9 +5524,18 @@ class Controller:
 
     def _sync_idle_health(self, obs: MinerObservation | None) -> None:
         if self._cooling_txn_active or self._cooling_transition_active:
+            self._sustained_telemetry_recovery_pending = False
             return
         if self._fault_latched or self.actual_mode == "FAULT_LATCHED":
+            self._sustained_telemetry_recovery_pending = False
             self._health_class = "FAULT_LATCHED"
+            return
+        if self._sustained_telemetry_recovery_pending:
+            self._sustained_telemetry_recovery_pending = False
+            # Only the sustained-read latch is eligible. A failed check leaves
+            # ERROR, last_error, and phase untouched. Other terminals never
+            # set this flag and stay on the early return below.
+            self._finish_sustained_telemetry_recovery(obs)
             return
         if self._health_class in {"DEGRADED_NEEDS_ATTENTION", "ERROR", "FAULT_LATCHED"}:
             return
@@ -6841,6 +7117,16 @@ class Controller:
                 "bosminer_available": bool(self._bosminer_available),
                 "recovery_ready": bool(self.recovery_ready),
                 "fault_reason": self.last_error or "",
+                "current_error": cool["current_error"],
+                "active_fault": cool["active_fault"],
+                "last_fault_reason": cool["last_fault_reason"],
+                "last_fault_timestamp": cool["last_fault_timestamp"],
+                "last_fault_class": cool["last_fault_class"],
+                "last_fault_count": cool["last_fault_count"],
+                "sustained_telemetry_recovery_polls": cool["sustained_telemetry_recovery_polls"],
+                "sustained_telemetry_recovery_required": cool[
+                    "sustained_telemetry_recovery_required"
+                ],
             },
         )
         self.ha.set_state(

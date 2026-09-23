@@ -189,14 +189,39 @@ Dual write gates (`enable_writes` + HA master boolean) and the old-auto refuse p
 | `sensor.lard_controller_last_seen` | UTC ISO-8601 of last publish |
 | `sensor.lard_controller_requested_mode` | Mode the actuator wants |
 | `sensor.lard_controller_actual_mode` | Compatibility mode. Physical only for `PAUSED` / `ONE_BOARD` / `TWO_BOARD` / `THREE_BOARD`. Controller lifecycle otherwise. Attribute `observed_miner_mode` is the physical mode |
-| `sensor.lard_controller_error` | Last error or `ok` |
+| `sensor.lard_controller_error` | Current error, or `ok` when `last_error` is empty. A recovered telemetry outage is `ok` here; the outage text is not left in this sensor |
 | `sensor.lard_controller_api_fail_count` | HA + Braiins transport failures |
 | `sensor.lard_controller_last_braiins_ok` | UTC ISO of last Braiins HTTP 200 |
 | `sensor.lard_controller_power_w` | Approx watts from miner stats |
 | `sensor.lard_controller_boards` | e.g. `1,2` or `none` |
-| `sensor.lard_controller_health` | `HASHING` / `PAUSED` / `APPLYING` / `RECOVERING` / `UNKNOWN` / `DEGRADED_NEEDS_ATTENTION` / `ERROR` |
+| `sensor.lard_controller_health` | Current class: `HASHING` / `PAUSED` / `APPLYING` / `RECOVERING` / `UNKNOWN` / `DEGRADED_NEEDS_ATTENTION` / `ERROR`. This state is not `last_fault_reason` |
 
 MQTT discovery (when a broker is available) uses availability + last-will so a dead container goes unavailable. REST entities do **not** expire by themselves — the package template `binary_sensor.lard_controller_fresh` treats `last_seen` older than 120 s as stale.
+
+### Current health vs a prior telemetry outage
+
+`last_error` is the active error only. `fault_reason`, `current_error`, and `active_fault` on `sensor.lard_controller_actual_mode` and `sensor.lard_controller_health` copy it. `sensor.lard_controller_error` publishes that string, or `ok` when it is empty.
+
+`telemetry_sustained_unavailable` becomes active after repeated required-read misses outside a cooling transaction (`health_class=ERROR`, `cooling_phase=ERROR`). The same episode is stored as history. The active error stays until `SUSTAINED_TELEMETRY_RECOVERY_POLLS` consecutive coherent polls (the constant equals `RECOVERY_READY_POLLS`, 5), spaced by `poll_seconds`. One good read does not clear it. A bad required read resets the count.
+
+| Field | Role |
+| --- | --- |
+| `sensor.lard_controller_health` state | Current class. Stays `ERROR` until poll 5. Then `HASHING`, `PAUSED`, or `RECOVERING`. Not the historical reason string |
+| `telemetry_freshness` | `FRESH` only after a successful required boards+details note. `UNKNOWN` or `STALE` on misses. May be `FRESH` while health is still `ERROR` |
+| `telemetry_class` | Live read class. May be `RUNNING_HEALTHY` while health is still the sustained-read `ERROR` |
+| `last_error` / `current_error` | Active error. Stays `telemetry_sustained_unavailable` until poll 5. Empty after this recovery |
+| `active_fault` | False when `last_error` is empty |
+| `sustained_telemetry_recovery_polls` | Progress toward the clear. Resets to 0 on a bad required read |
+| `sustained_telemetry_recovery_required` | `5` (`SUSTAINED_TELEMETRY_RECOVERY_POLLS`) |
+| `last_fault_reason` | Historical. `telemetry_sustained_unavailable` after that outage |
+| `last_fault_class` | Historical class forced by the outage (`ERROR`) |
+| `last_fault_timestamp` | Wall time the episode was latched |
+| `last_fault_count` | Episode count |
+| `write_gate` | `DISARMED` while `enable_writes` is false. Recovery does not arm it |
+
+`/data/status.json` and `/share/lard_controller_status.json` include the same `current_error`, `active_fault`, and `last_fault_*` fields. A line that is safe to show: current telemetry healthy; prior telemetry outage recorded at `last_fault_timestamp`.
+
+Recovery does not run for `FAULT_LATCHED`, hard faults, unverified or mismatched boards, auth or bosminer loss, write failures, cooling-transaction failures, or an open cooling transaction. It does not change `enable_writes`, Solar Miner Auto, or any Braiins write. Detail is in [docs/phase1-observe-only.md](docs/phase1-observe-only.md).
 
 ## Single-writer migration
 
